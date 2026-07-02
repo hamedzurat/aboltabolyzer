@@ -59,7 +59,7 @@ def preprocess_dataset(input_path, is_test=False):
 
 
 def main():
-    console.print(Panel("[bold yellow]🧹 Preprocessing Phase[/bold yellow]", border_style="yellow"))
+    console.print(Panel("[bold yellow]Preprocessing Phase[/bold yellow]", border_style="yellow"))
 
     import tomllib
 
@@ -81,7 +81,7 @@ def main():
     test_df.to_csv(out_test_path, index=False)
     console.print(f"[green]✔ Saved preprocessed test data to {out_test_path}[/green]")
 
-    console.print("\n[bold green]★ Preprocessing Completed Successfully![/bold green]\n")
+    console.print("\n[bold green]Preprocessing Completed Successfully![/bold green]\n")
 
 
 if __name__ == "__main__":

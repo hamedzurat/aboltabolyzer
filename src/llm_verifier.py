@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import pickle
 import re
@@ -7,12 +8,11 @@ import tomllib
 import numpy as np
 import pandas as pd
 import torch
+import transformers
+from huggingface_hub.utils import disable_progress_bars
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
-import logging
-import transformers
-from huggingface_hub.utils import disable_progress_bars
 from transformers import AutoModelForMultimodalLM, AutoProcessor, BitsAndBytesConfig
 
 from src.config_utils import resolve_section

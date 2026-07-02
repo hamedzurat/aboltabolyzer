@@ -1,9 +1,12 @@
 import gc
+import logging
 import os
 import tomllib
 
 import pandas as pd
 import torch
+import transformers
+from huggingface_hub.utils import disable_progress_bars
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
@@ -13,10 +16,6 @@ from src.config_utils import fail_on_model_error
 from src.llm_verifier import GemmaVerifier
 from src.rag import BanglaRAG
 from src.xlmr_encoder import predict_test
-
-import logging
-import transformers
-from huggingface_hub.utils import disable_progress_bars
 
 # Suppress Hugging Face warnings/load reports for a cleaner UI
 transformers.utils.logging.set_verbosity_error()
@@ -36,7 +35,7 @@ def build_rag_query(row, query_mode):
 def main():
     console.print(
         Panel(
-            "[bold yellow]🔮 Test Set Inference & Prediction Pipeline[/bold yellow]",
+            "[bold yellow]Test Set Inference & Prediction Pipeline[/bold yellow]",
             border_style="bold yellow",
         )
     )

@@ -75,10 +75,20 @@ class ScoreBlender:
         preds = (p_train >= self.threshold).astype(int)
         overall_f1 = f1_score(y_true, preds, average="macro")
         f1_class_0 = f1_score(y_true, preds, pos_label=0)
-        print(
-            "Meta-Classifier Fitted. "
-            f"Train Macro-F1 (in-sample): {overall_f1:.4f}, "
-            f"F1(0): {f1_class_0:.4f}, threshold: {self.threshold:.3f}"
+        from rich.console import Console
+        from rich.panel import Panel
+
+        console = Console()
+        console.print(
+            Panel(
+                f"[bold cyan]Model type:[/]      RandomForestClassifier (n_estimators=50, max_depth=3)\n"
+                f"[bold cyan]Optimal threshold:[/] [bold yellow]{self.threshold:.3f}[/] (Optimized for: {threshold_metric})\n"
+                f"[bold cyan]Train Macro-F1:[/]   [bold green]{overall_f1:.4f}[/] (in-sample)\n"
+                f"[bold cyan]Train F1(0):[/]       [bold red]{f1_class_0:.4f}[/]",
+                title="[bold green]✔ Meta-Classifier Blender Fitted[/bold green]",
+                border_style="green",
+                expand=False,
+            )
         )
         return overall_f1
 

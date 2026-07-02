@@ -172,7 +172,7 @@ def main():
     rag = BanglaRAG()
     if args.build_index:
         console.print(
-            Panel("[bold yellow]🔍 Dense RAG Indexer Phase[/bold yellow]", border_style="yellow")
+            Panel("[bold yellow]Dense RAG Indexer Phase[/bold yellow]", border_style="yellow")
         )
         rag.build_index()
     elif args.query:
