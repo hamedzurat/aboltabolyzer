@@ -10,7 +10,13 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    get_cosine_schedule_with_warmup,
+)
+
+from src.config_utils import resolve_section
 
 console = Console()
 
@@ -28,10 +34,7 @@ class BanglaDataset(Dataset):
         prompts = df["prompt_bn"].astype(str).tolist()
         responses = df["response_bn"].astype(str).tolist()
 
-        self.inputs = [
-            (ctx, f"{p} </s> {r}")
-            for ctx, p, r in zip(contexts, prompts, responses)
-        ]
+        self.inputs = [(ctx, f"{p} </s> {r}") for ctx, p, r in zip(contexts, prompts, responses)]
         if has_labels:
             self.labels = df["label"].astype(int).tolist()
 
@@ -78,28 +81,44 @@ def get_model(model_name, lora_r, lora_alpha, lora_dropout, device):
     return model
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, progress, task_id, scheduler=None):
+def train_epoch(
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    progress,
+    task_id,
+    scheduler=None,
+    grad_accum_steps=1,
+    use_amp=True,
+):
     model.train()
     total_loss = 0
     total_steps = len(dataloader)
+    optimizer.zero_grad()
 
-    for batch in dataloader:
-        optimizer.zero_grad()
-
+    for step, batch in enumerate(dataloader, start=1):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device).unsqueeze(1)
 
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
+        amp_enabled = use_amp and device.type == "cuda"
+        with torch.autocast(device_type="cuda", enabled=amp_enabled):
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+            loss = criterion(logits, labels)
+            scaled_loss = loss / grad_accum_steps
 
-        loss = criterion(logits, labels)
-        loss.backward()
+        scaled_loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+        should_step = step % grad_accum_steps == 0 or step == total_steps
+        if should_step:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            optimizer.zero_grad()
         total_loss += loss.item()
 
         progress.advance(task_id)
@@ -137,10 +156,16 @@ def evaluate(model, dataloader, device):
 
 def train_cross_validation(train_df, config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    xlmr_config = resolve_section(config, "xlmr")
     console.print(f"[bold cyan]Selected training hardware device:[/bold cyan] {device}")
+    console.print(
+        "[bold cyan]XLM-R settings:[/bold cyan] "
+        f"model={xlmr_config['model_name']}, max_length={xlmr_config['max_length']}, "
+        f"batch_size={xlmr_config['batch_size']}, grad_accum={xlmr_config['grad_accum_steps']}"
+    )
 
     with Console().status("Loading XLM-R Tokenizer...", spinner="dots"):
-        tokenizer = AutoTokenizer.from_pretrained(config["xlmr"]["model_name"])
+        tokenizer = AutoTokenizer.from_pretrained(xlmr_config["model_name"])
 
     skf = StratifiedKFold(n_splits=config["num_folds"], shuffle=True, random_state=config["seed"])
     oof_preds = np.zeros(len(train_df))
@@ -158,34 +183,35 @@ def train_cross_validation(train_df, config):
         fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
         fold_val_df = train_df.iloc[val_idx].reset_index(drop=True)
 
-        train_dataset = BanglaDataset(fold_train_df, tokenizer, config["xlmr"]["max_length"])
-        val_dataset = BanglaDataset(fold_val_df, tokenizer, config["xlmr"]["max_length"])
+        train_dataset = BanglaDataset(fold_train_df, tokenizer, xlmr_config["max_length"])
+        val_dataset = BanglaDataset(fold_val_df, tokenizer, xlmr_config["max_length"])
 
-        train_loader = DataLoader(
-            train_dataset, batch_size=config["xlmr"]["batch_size"], shuffle=True
-        )
-        val_loader = DataLoader(val_dataset, batch_size=config["xlmr"]["batch_size"], shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=xlmr_config["batch_size"], shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=xlmr_config["batch_size"], shuffle=False)
 
         with Console().status(
             "Initializing base model with LoRA configuration...", spinner="aesthetic"
         ):
             model = get_model(
-                config["xlmr"]["model_name"],
-                config["xlmr"]["lora_r"],
-                config["xlmr"]["lora_alpha"],
-                config["xlmr"]["lora_dropout"],
+                xlmr_config["model_name"],
+                xlmr_config["lora_r"],
+                xlmr_config["lora_alpha"],
+                xlmr_config["lora_dropout"],
                 device,
             )
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
-            lr=float(config["xlmr"]["lr"]),
-            weight_decay=config["xlmr"]["weight_decay"],
+            lr=float(xlmr_config["lr"]),
+            weight_decay=xlmr_config["weight_decay"],
         )
         criterion = torch.nn.BCEWithLogitsLoss()
 
-        epochs = config["xlmr"]["epochs"]
-        total_steps = epochs * len(train_loader)
+        epochs = xlmr_config["epochs"]
+        grad_accum_steps = max(1, int(xlmr_config.get("grad_accum_steps", 1)))
+        total_steps = epochs * max(
+            1, (len(train_loader) + grad_accum_steps - 1) // grad_accum_steps
+        )
         warmup_steps = max(1, total_steps // 10)
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
@@ -209,8 +235,16 @@ def train_cross_validation(train_df, config):
                     description=f"Epoch {epoch + 1}/{epochs} training...", total=steps_per_epoch
                 )
                 train_loss = train_epoch(
-                    model, train_loader, optimizer, criterion, device, progress, epoch_task,
+                    model,
+                    train_loader,
+                    optimizer,
+                    criterion,
+                    device,
+                    progress,
+                    epoch_task,
                     scheduler=scheduler,
+                    grad_accum_steps=grad_accum_steps,
+                    use_amp=bool(xlmr_config.get("use_amp", True)),
                 )
 
             val_macro_f1, val_f1_0, val_probs = evaluate(model, val_loader, device)
@@ -231,7 +265,7 @@ def train_cross_validation(train_df, config):
             else:
                 patience_counter += 1
 
-            if patience_counter >= config["xlmr"]["early_stopping_patience"]:
+            if patience_counter >= xlmr_config["early_stopping_patience"]:
                 console.print(f"[bold red]Early stopping triggered at epoch {epoch + 1}[/bold red]")
                 break
 
@@ -257,10 +291,11 @@ def train_cross_validation(train_df, config):
 
 def predict_test(test_df, config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(config["xlmr"]["model_name"])
+    xlmr_config = resolve_section(config, "xlmr")
+    tokenizer = AutoTokenizer.from_pretrained(xlmr_config["model_name"])
 
-    test_dataset = BanglaDataset(test_df, tokenizer, config["xlmr"]["max_length"], has_labels=False)
-    test_loader = DataLoader(test_dataset, batch_size=config["xlmr"]["batch_size"], shuffle=False)
+    test_dataset = BanglaDataset(test_df, tokenizer, xlmr_config["max_length"], has_labels=False)
+    test_loader = DataLoader(test_dataset, batch_size=xlmr_config["batch_size"], shuffle=False)
 
     all_fold_preds = []
     num_folds = config["num_folds"]
@@ -278,10 +313,10 @@ def predict_test(test_df, config):
         for fold in range(num_folds):
             progress.update(fold_task, description=f"Predicting Fold {fold + 1}/{num_folds}...")
             model = get_model(
-                config["xlmr"]["model_name"],
-                config["xlmr"]["lora_r"],
-                config["xlmr"]["lora_alpha"],
-                config["xlmr"]["lora_dropout"],
+                xlmr_config["model_name"],
+                xlmr_config["lora_r"],
+                xlmr_config["lora_alpha"],
+                xlmr_config["lora_dropout"],
                 device,
             )
 
@@ -313,6 +348,8 @@ def predict_test(test_df, config):
 
     mean_preds = np.mean(all_fold_preds, axis=0)
     test_df["p_xlmr"] = mean_preds
-    test_df.to_csv(os.path.join(config["data"]["processed_dir"], "preds_test_xlmr.csv"), index=False)
+    test_df.to_csv(
+        os.path.join(config["data"]["processed_dir"], "preds_test_xlmr.csv"), index=False
+    )
     console.print("[green]✔ Cross-encoder test set inference complete and saved.[/green]")
     return mean_preds

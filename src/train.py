@@ -10,6 +10,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from src.blender import ScoreBlender
+from src.config_utils import fail_on_model_error
 from src.evaluate import compute_metrics
 from src.llm_verifier import GemmaVerifier
 from src.preprocess import main as run_preprocess
@@ -17,6 +18,12 @@ from src.rag import BanglaRAG
 from src.xlmr_encoder import train_cross_validation
 
 console = Console()
+
+
+def build_rag_query(row, query_mode):
+    if query_mode == "prompt_response":
+        return f"{row['prompt_bn']} {row['response_bn']}"
+    return str(row["prompt_bn"])
 
 
 def main():
@@ -45,6 +52,7 @@ def main():
 
     if num_nulls > 0:
         index_path = config["rag"]["index_path"]
+        query_mode = config["rag"].get("query_mode", "prompt")
         if os.path.exists(index_path):
             console.print(
                 f"Dense RAG index found. Retrieving evidence for [bold yellow]{num_nulls}[/bold yellow] NULL-context rows..."
@@ -62,7 +70,7 @@ def main():
             ) as progress:
                 task = progress.add_task(description="Retrieving facts...", total=num_nulls)
                 for idx, row in train_df[null_mask].iterrows():
-                    query = f"{row['prompt_bn']} {row['response_bn']}"
+                    query = build_rag_query(row, query_mode)
                     chunks = rag.retrieve(query)
                     if chunks:
                         retrieved_contexts.append(" ".join(chunks))
@@ -97,34 +105,41 @@ def main():
 
     # 4. Predict using Gemma 4 Verifier
     console.print("\n[bold cyan]Step 3: Generating Gemma 4 Verifier Scores[/bold cyan]")
-    verifier = GemmaVerifier()
 
-    # Build Dynamic Few-Shot Exemplar Index
-    console.print("\n[bold cyan]Building Dynamic Few-Shot Exemplar Index...[/bold cyan]")
-    verifier.exemplar_retriever.build_index(train_df)
+    if config.get("runtime", {}).get("use_llm_verifier", True):
+        verifier = GemmaVerifier()
+        console.print("\n[bold cyan]Building Dynamic Few-Shot Exemplar Index...[/bold cyan]")
+        verifier.exemplar_retriever.build_index(train_df)
+        try:
+            verifier.load_model()
+            p_llm, is_c0, is_c1, is_c2 = verifier.predict_dataset(train_df)
+        except Exception as e:
+            if fail_on_model_error(config):
+                raise RuntimeError(
+                    "Gemma verifier failed; refusing to train on fake scores."
+                ) from e
+            console.print(f"[bold red]Failed to run Gemma verifier: {e}[/bold red]")
+            console.print(
+                "[yellow]Falling back to XLM-R-only scores because fail_on_model_error=false.[/yellow]"
+            )
+            p_llm = p_xlmr.copy()
+            is_c0 = np.zeros(len(train_df))
+            is_c1 = np.zeros(len(train_df))
+            is_c2 = np.zeros(len(train_df))
+    else:
+        console.print("[yellow]LLM verifier disabled. Using XLM-R-only blend features.[/yellow]")
+        p_llm = p_xlmr.copy()
+        is_c0 = np.zeros(len(train_df))
+        is_c1 = np.zeros(len(train_df))
+        is_c2 = np.zeros(len(train_df))
 
-    try:
-        verifier.load_model()
-        p_llm, is_c0, is_c1, is_c2 = verifier.predict_dataset(train_df)
-        train_df["p_llm"] = p_llm
-        train_df["is_c0"] = is_c0
-        train_df["is_c1"] = is_c1
-        train_df["is_c2"] = is_c2
-        train_df.to_csv(os.path.join(config["data"]["processed_dir"], "train_with_preds.csv"), index=False)
-    except Exception as e:
-        console.print(f"[bold red]Failed to run Gemma 4 Verifier: {e}[/bold red]")
-        console.print(
-            "[yellow]Using fallback predictions to complete the training validation...[/yellow]"
-        )
-        p_llm = np.random.uniform(0.1, 0.9, len(train_df))
-        is_c0 = np.random.choice([0.0, 1.0], len(train_df), p=[0.7, 0.3])
-        is_c1 = np.random.choice([0.0, 1.0], len(train_df), p=[0.7, 0.3])
-        is_c2 = np.random.choice([0.0, 1.0], len(train_df), p=[0.7, 0.3])
-        train_df["p_llm"] = p_llm
-        train_df["is_c0"] = is_c0
-        train_df["is_c1"] = is_c1
-        train_df["is_c2"] = is_c2
-        train_df.to_csv(os.path.join(config["data"]["processed_dir"], "train_with_preds.csv"), index=False)
+    train_df["p_llm"] = p_llm
+    train_df["is_c0"] = is_c0
+    train_df["is_c1"] = is_c1
+    train_df["is_c2"] = is_c2
+    train_df.to_csv(
+        os.path.join(config["data"]["processed_dir"], "train_with_preds.csv"), index=False
+    )
 
     # 5. Fit Meta-Classifier Blender
     console.print("\n[bold cyan]Step 4: Training Meta-Classifier Blender[/bold cyan]")
@@ -143,6 +158,7 @@ def main():
             is_c0=train_df["is_c0"].values,
             is_c1=train_df["is_c1"].values,
             is_c2=train_df["is_c2"].values,
+            threshold_metric=config.get("blender", {}).get("threshold_metric", "macro_f1"),
         )
     blender.save()
 

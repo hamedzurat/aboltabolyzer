@@ -3,6 +3,13 @@
 seed = 42
 num_folds = 5
 
+[runtime]
+# Use "8gb" on your own RTX 5060 8GB for debugging, and "16gb" on the larger
+# desktop for final folds. Profile values override matching sections below.
+hardware_profile = "8gb"
+fail_on_model_error = true
+use_llm_verifier = true
+
 [data]
 sample_path = "dataset/sample_dataset.json"
 test_path = "dataset/.3_testset.csv"
@@ -17,11 +24,16 @@ model_name = "BAAI/bge-m3"
 top_k = 5
 max_evidence_tokens = 512
 similarity_threshold = 0.5
+# "prompt" is safer for hallucination detection. "prompt_response" can retrieve
+# evidence related to a false answer and should be treated as an experiment.
+query_mode = "prompt"
 
 [xlmr]
 model_name = "FacebookAI/xlm-roberta-large"
 max_length = 512
 batch_size = 16
+grad_accum_steps = 1
+use_amp = true
 epochs = 10
 lr = 2e-5
 weight_decay = 0.01
@@ -34,4 +46,27 @@ early_stopping_patience = 3
 model_name = "google/gemma-4-E4B-it"
 load_in_4bit = true
 confidence_threshold = 0.15  # gate threshold: trigger think-pass if |p_llm - 0.5| < threshold
+max_think_tokens = 256
+
+[blender]
+threshold_metric = "macro_f1"
+
+[hardware_profiles.8gb.xlmr]
+model_name = "FacebookAI/xlm-roberta-base"
+max_length = 384
+batch_size = 2
+grad_accum_steps = 8
+use_amp = true
+
+[hardware_profiles.8gb.gemma]
+max_think_tokens = 128
+
+[hardware_profiles.16gb.xlmr]
+model_name = "FacebookAI/xlm-roberta-large"
+max_length = 512
+batch_size = 4
+grad_accum_steps = 4
+use_amp = true
+
+[hardware_profiles.16gb.gemma]
 max_think_tokens = 256

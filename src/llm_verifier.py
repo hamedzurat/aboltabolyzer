@@ -12,6 +12,8 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from transformers import AutoModelForMultimodalLM, AutoProcessor, BitsAndBytesConfig
 
+from src.config_utils import resolve_section
+
 console = Console()
 
 
@@ -103,11 +105,12 @@ class GemmaVerifier:
     def __init__(self, config_path="configs/config.toml"):
         with open(config_path, "rb") as f:
             self.config = tomllib.load(f)
+        gemma_config = resolve_section(self.config, "gemma")
 
-        self.model_name = self.config["gemma"]["model_name"]
-        self.load_in_4bit = self.config["gemma"]["load_in_4bit"]
-        self.conf_threshold = self.config["gemma"]["confidence_threshold"]
-        self.max_think_tokens = self.config["gemma"]["max_think_tokens"]
+        self.model_name = gemma_config["model_name"]
+        self.load_in_4bit = gemma_config["load_in_4bit"]
+        self.conf_threshold = gemma_config["confidence_threshold"]
+        self.max_think_tokens = gemma_config["max_think_tokens"]
         self.debug_log_path = "logs/debug_llm_verifier.jsonl"
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"

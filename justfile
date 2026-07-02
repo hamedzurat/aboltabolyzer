@@ -6,6 +6,32 @@ default:
 sync:
     uv sync
 
+# Download the active-profile XLM-R model and RAG embedding model into models/hf/
+download-models:
+    uv run python scripts/download_models.py
+
+# Download models for both 8GB and 16GB profiles, plus the RAG embedding model
+download-models-all:
+    uv run python scripts/download_models.py --all-profiles
+
+# Download Gemma too. This may require Hugging Face gated-model access.
+download-models-gemma:
+    uv run python scripts/download_models.py --all-profiles --include-gemma
+
+# Download and chunk Bengali Wikipedia into corpus/wiki_bn.jsonl
+download-corpus:
+    uv run python scripts/download_corpus.py
+
+# Small corpus download for smoke testing the RAG path without pulling the full wiki
+download-corpus-small:
+    uv run python scripts/download_corpus.py --max-articles 200
+
+# Download corpus and build the dense RAG index
+prepare-rag: download-corpus build-index
+
+# Download all non-gated assets needed for normal experiments
+prepare-assets: download-models-all download-corpus build-index
+
 # Run data cleaning and preprocessing
 preprocess:
     uv run python src/preprocess.py
@@ -37,5 +63,4 @@ format:
 # Export project dependencies to standard requirements.txt file
 export:
     uv export --format requirements-txt -o requirements.txt
-
 

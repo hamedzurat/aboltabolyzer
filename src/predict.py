@@ -2,7 +2,6 @@ import gc
 import os
 import tomllib
 
-import numpy as np
 import pandas as pd
 import torch
 from rich.console import Console
@@ -10,11 +9,18 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from src.blender import ScoreBlender
+from src.config_utils import fail_on_model_error
 from src.llm_verifier import GemmaVerifier
 from src.rag import BanglaRAG
 from src.xlmr_encoder import predict_test
 
 console = Console()
+
+
+def build_rag_query(row, query_mode):
+    if query_mode == "prompt_response":
+        return f"{row['prompt_bn']} {row['response_bn']}"
+    return str(row["prompt_bn"])
 
 
 def main():
@@ -45,6 +51,7 @@ def main():
 
     if num_nulls > 0:
         index_path = config["rag"]["index_path"]
+        query_mode = config["rag"].get("query_mode", "prompt")
         if os.path.exists(index_path):
             console.print(
                 f"Dense RAG index found. Retrieving evidence for [bold yellow]{num_nulls}[/bold yellow] test rows..."
@@ -62,7 +69,7 @@ def main():
             ) as progress:
                 task = progress.add_task(description="Retrieving facts...", total=num_nulls)
                 for idx, row in test_df[null_mask].iterrows():
-                    query = f"{row['prompt_bn']} {row['response_bn']}"
+                    query = build_rag_query(row, query_mode)
                     chunks = rag.retrieve(query)
                     if chunks:
                         retrieved_contexts.append(" ".join(chunks))
@@ -95,23 +102,36 @@ def main():
     # 4. Predict with Gemma 4 Verifier
     console.print("\n[bold cyan]Step 3: Gemma 4 Verifier Inference[/bold cyan]")
     verifier = GemmaVerifier()
-    try:
-        verifier.load_model()
-        p_llm, is_c0, is_c1, is_c2 = verifier.predict_dataset(test_df)
-    except Exception as e:
-        console.print(f"[bold red]Failed to run Gemma 4 Verifier on test set: {e}[/bold red]")
-        console.print("[yellow]Using fallback predictions...[/yellow]")
-        p_llm = np.random.uniform(0.1, 0.9, len(test_df))
-        is_c0 = np.random.choice([0.0, 1.0], len(test_df), p=[0.7, 0.3])
-        is_c1 = np.random.choice([0.0, 1.0], len(test_df), p=[0.7, 0.3])
-        is_c2 = np.random.choice([0.0, 1.0], len(test_df), p=[0.7, 0.3])
+    if config.get("runtime", {}).get("use_llm_verifier", True):
+        try:
+            verifier.load_model()
+            p_llm, is_c0, is_c1, is_c2 = verifier.predict_dataset(test_df)
+        except Exception as e:
+            if fail_on_model_error(config):
+                raise RuntimeError("Gemma verifier failed; refusing to submit fake scores.") from e
+            console.print(f"[bold red]Failed to run Gemma verifier on test set: {e}[/bold red]")
+            console.print(
+                "[yellow]Falling back to XLM-R-only scores because fail_on_model_error=false.[/yellow]"
+            )
+            p_llm = p_xlmr.copy()
+            is_c0 = pd.Series(0.0, index=test_df.index).values
+            is_c1 = pd.Series(0.0, index=test_df.index).values
+            is_c2 = pd.Series(0.0, index=test_df.index).values
+    else:
+        console.print("[yellow]LLM verifier disabled. Using XLM-R-only blend features.[/yellow]")
+        p_llm = p_xlmr.copy()
+        is_c0 = pd.Series(0.0, index=test_df.index).values
+        is_c1 = pd.Series(0.0, index=test_df.index).values
+        is_c2 = pd.Series(0.0, index=test_df.index).values
 
     test_df["p_xlmr"] = p_xlmr
     test_df["p_llm"] = p_llm
     test_df["is_c0"] = is_c0
     test_df["is_c1"] = is_c1
     test_df["is_c2"] = is_c2
-    test_df.to_csv(os.path.join(config["data"]["processed_dir"], "test_with_preds.csv"), index=False)
+    test_df.to_csv(
+        os.path.join(config["data"]["processed_dir"], "test_with_preds.csv"), index=False
+    )
 
     # 5. Load blender parameters
     blender = ScoreBlender()
@@ -140,7 +160,7 @@ def main():
 
     submission_df = pd.DataFrame(
         {
-            "id": test_df["id"] if "id" in test_df.columns else range(1, len(preds) + 1),
+            "id": test_df["id"] if "id" in test_df.columns else range(len(preds)),
             "label": preds,
         }
     )
