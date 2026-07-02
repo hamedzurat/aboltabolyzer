@@ -1,4 +1,6 @@
 # List all available commands
+export PYTHONPATH := "."
+
 default:
     @just --list
 
