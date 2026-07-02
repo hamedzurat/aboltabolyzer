@@ -55,12 +55,16 @@ class ExemplarRetriever:
                         device = "cuda"
                         print("[ExemplarRetriever] Ample VRAM detected. Loading BGE-M3 on GPU.")
                     else:
-                        print(f"[ExemplarRetriever] Limited VRAM ({free_mem / (1024**3):.2f} GB free). Loading BGE-M3 on CPU to reserve space for LLM.")
+                        print(
+                            f"[ExemplarRetriever] Limited VRAM ({free_mem / (1024**3):.2f} GB free). Loading BGE-M3 on CPU to reserve space for LLM."
+                        )
                 except Exception:
                     pass
             else:
-                print("[ExemplarRetriever] 8GB profile active. Loading BGE-M3 on CPU to reserve GPU space for LLM.")
-            
+                print(
+                    "[ExemplarRetriever] 8GB profile active. Loading BGE-M3 on CPU to reserve GPU space for LLM."
+                )
+
             self.model = SentenceTransformer(resolved_path, device=device)
 
     def build_index(self, df):
@@ -140,6 +144,7 @@ class GemmaVerifier:
         self.load_in_4bit = gemma_config["load_in_4bit"]
         self.conf_threshold = gemma_config["confidence_threshold"]
         self.max_think_tokens = gemma_config["max_think_tokens"]
+        self.device_map_config = gemma_config.get("device_map", "auto")
         self.debug_log_path = "logs/debug_llm_verifier.jsonl"
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -189,12 +194,15 @@ class GemmaVerifier:
                 bnb_4bit_quant_type="nf4",
             )
 
-        device_map = None
+        device_map = self.device_map_config
         if torch.cuda.is_available():
-            try:
-                device_map = {"": torch.cuda.current_device()}
-            except Exception:
-                device_map = "auto"
+            if device_map in ("cuda:0", "cuda", "cuda_force"):
+                try:
+                    device_map = {"": torch.cuda.current_device()}
+                except Exception:
+                    device_map = "auto"
+        else:
+            device_map = None
 
         with Console().status(
             "Loading weights (this may take a few minutes)...", spinner="bouncingBar"

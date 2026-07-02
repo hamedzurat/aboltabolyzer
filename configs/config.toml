@@ -47,6 +47,7 @@ model_name = "google/gemma-4-E4B-it"
 load_in_4bit = true
 confidence_threshold = 0.15  # gate threshold: trigger think-pass if |p_llm - 0.5| < threshold
 max_think_tokens = 256
+device_map = "auto"
 
 [blender]
 threshold_metric = "macro_f1"
@@ -60,6 +61,7 @@ use_amp = true
 
 [hardware_profiles.8gb.gemma]
 max_think_tokens = 128
+device_map = "cuda"
 
 [hardware_profiles.16gb.xlmr]
 model_name = "FacebookAI/xlm-roberta-large"
