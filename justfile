@@ -1,6 +1,7 @@
 # List all available commands
 export PYTHONPATH := "."
 export HF_HUB_ENABLE_HF_TRANSFER := "1"
+export PYTORCH_CUDA_ALLOC_CONF := "expandable_segments:True"
 
 default:
     @just --list

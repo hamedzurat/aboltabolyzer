@@ -3,6 +3,8 @@ import logging
 import os
 import tomllib
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import numpy as np
 import pandas as pd
 import torch
