@@ -44,28 +44,7 @@ class ExemplarRetriever:
             from src.config_utils import resolve_model_path
 
             resolved_path = resolve_model_path(self.model_name)
-            # Dynamically select device based on hardware profile and free VRAM
-            device = "cpu"
-            profile = self.config.get("runtime", {}).get("hardware_profile", "16gb")
-            if profile != "8gb" and torch.cuda.is_available():
-                try:
-                    free_mem, total_mem = torch.cuda.mem_get_info()
-                    # Need at least 6.0 GB of free memory to comfortably hold both BGE-M3 and Gemma-4-E4B-it
-                    if free_mem >= 6 * 1024 * 1024 * 1024:
-                        device = "cuda"
-                        print("[ExemplarRetriever] Ample VRAM detected. Loading BGE-M3 on GPU.")
-                    else:
-                        print(
-                            f"[ExemplarRetriever] Limited VRAM ({free_mem / (1024**3):.2f} GB free). Loading BGE-M3 on CPU to reserve space for LLM."
-                        )
-                except Exception:
-                    pass
-            else:
-                print(
-                    "[ExemplarRetriever] 8GB profile active. Loading BGE-M3 on CPU to reserve GPU space for LLM."
-                )
-
-            self.model = SentenceTransformer(resolved_path, device=device)
+            self.model = SentenceTransformer(resolved_path)
 
     def build_index(self, df):
         """Encodes and saves the training dataframe rows as exemplars."""
@@ -144,7 +123,6 @@ class GemmaVerifier:
         self.load_in_4bit = gemma_config["load_in_4bit"]
         self.conf_threshold = gemma_config["confidence_threshold"]
         self.max_think_tokens = gemma_config["max_think_tokens"]
-        self.device_map_config = gemma_config.get("device_map", "auto")
         self.debug_log_path = "logs/debug_llm_verifier.jsonl"
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -194,45 +172,13 @@ class GemmaVerifier:
                 bnb_4bit_quant_type="nf4",
             )
 
-        device_map = self.device_map_config
-        if torch.cuda.is_available():
-            if device_map in ("cuda:0", "cuda", "cuda_force"):
-                try:
-                    from transformers import AutoConfig
-
-                    model_config = AutoConfig.from_pretrained(resolved_name)
-                    # If multimodal (e.g. gemma4), offload non-quantized vision/audio towers to CPU
-                    if getattr(model_config, "model_type", None) in (
-                        "gemma4",
-                        "paligemma",
-                        "llava",
-                    ):
-                        device_id = torch.cuda.current_device()
-                        device_map = {
-                            "model.vision_tower": "cpu",
-                            "model.audio_tower": "cpu",
-                            "model.embed_vision": "cpu",
-                            "model.embed_audio": "cpu",
-                            "model.language_model": device_id,
-                            "lm_head": device_id,
-                        }
-                        print(
-                            "[GemmaVerifier] 8GB VRAM optimization: Offloading vision/audio towers to CPU."
-                        )
-                    else:
-                        device_map = {"": torch.cuda.current_device()}
-                except Exception:
-                    device_map = {"": torch.cuda.current_device()}
-        else:
-            device_map = None
-
         with Console().status(
             "Loading weights (this may take a few minutes)...", spinner="bouncingBar"
         ):
             self.model = AutoModelForMultimodalLM.from_pretrained(
                 resolved_name,
                 quantization_config=quant_config,
-                device_map=device_map,
+                device_map="auto" if torch.cuda.is_available() else None,
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             )
             self.model.eval()
