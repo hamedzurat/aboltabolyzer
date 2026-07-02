@@ -65,7 +65,10 @@ class BanglaDataset(Dataset):
 
 
 def get_model(model_name, lora_r, lora_alpha, lora_dropout, device):
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1)
+    from src.config_utils import resolve_model_path
+
+    resolved_name = resolve_model_path(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(resolved_name, num_labels=1)
 
     peft_config = LoraConfig(
         task_type=TaskType.SEQ_CLS,
@@ -165,7 +168,10 @@ def train_cross_validation(train_df, config):
     )
 
     with Console().status("Loading XLM-R Tokenizer...", spinner="dots"):
-        tokenizer = AutoTokenizer.from_pretrained(xlmr_config["model_name"])
+        from src.config_utils import resolve_model_path
+
+        resolved_tokenizer_name = resolve_model_path(xlmr_config["model_name"])
+        tokenizer = AutoTokenizer.from_pretrained(resolved_tokenizer_name)
 
     skf = StratifiedKFold(n_splits=config["num_folds"], shuffle=True, random_state=config["seed"])
     oof_preds = np.zeros(len(train_df))
@@ -292,7 +298,10 @@ def train_cross_validation(train_df, config):
 def predict_test(test_df, config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     xlmr_config = resolve_section(config, "xlmr")
-    tokenizer = AutoTokenizer.from_pretrained(xlmr_config["model_name"])
+    from src.config_utils import resolve_model_path
+
+    resolved_tokenizer_name = resolve_model_path(xlmr_config["model_name"])
+    tokenizer = AutoTokenizer.from_pretrained(resolved_tokenizer_name)
 
     test_dataset = BanglaDataset(test_df, tokenizer, xlmr_config["max_length"], has_labels=False)
     test_loader = DataLoader(test_dataset, batch_size=xlmr_config["batch_size"], shuffle=False)

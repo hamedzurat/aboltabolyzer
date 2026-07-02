@@ -32,7 +32,10 @@ class ExemplarRetriever:
         if self.model is None:
             from sentence_transformers import SentenceTransformer
 
-            self.model = SentenceTransformer(self.model_name)
+            from src.config_utils import resolve_model_path
+
+            resolved_path = resolve_model_path(self.model_name)
+            self.model = SentenceTransformer(resolved_path)
 
     def build_index(self, df):
         """Encodes and saves the training dataframe rows as exemplars."""
@@ -124,10 +127,13 @@ class GemmaVerifier:
         self.exemplar_retriever = ExemplarRetriever(self.config)
 
     def load_model(self):
+        from src.config_utils import resolve_model_path
+
+        resolved_name = resolve_model_path(self.model_name)
         console.print(f"[bold cyan]Loading Gemma 4 verifier model:[/bold cyan] {self.model_name}")
 
         with Console().status("Initializing processor...", spinner="aesthetic"):
-            self.processor = AutoProcessor.from_pretrained(self.model_name)
+            self.processor = AutoProcessor.from_pretrained(resolved_name)
             self.tokenizer = self.processor.tokenizer
 
             f_variants = ["F", " F", "faithful", " Faithful"]
@@ -161,7 +167,7 @@ class GemmaVerifier:
             "Loading weights (this may take a few minutes)...", spinner="bouncingBar"
         ):
             self.model = AutoModelForMultimodalLM.from_pretrained(
-                self.model_name,
+                resolved_name,
                 quantization_config=quant_config,
                 device_map="auto" if torch.cuda.is_available() else None,
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,

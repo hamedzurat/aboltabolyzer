@@ -1,5 +1,6 @@
 # List all available commands
 export PYTHONPATH := "."
+export HF_HUB_ENABLE_HF_TRANSFER := "1"
 
 default:
     @just --list

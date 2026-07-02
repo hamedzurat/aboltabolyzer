@@ -36,8 +36,11 @@ class BanglaRAG:
 
     def load_model(self):
         if self.model is None:
+            from src.config_utils import resolve_model_path
+
+            resolved_path = resolve_model_path(self.model_name)
             with Console().status("Loading SentenceTransformer model...", spinner="aesthetic"):
-                self.model = SentenceTransformer(self.model_name)
+                self.model = SentenceTransformer(resolved_path)
 
     def load_corpus(self):
         passages = []
