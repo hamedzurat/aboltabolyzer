@@ -44,7 +44,22 @@ class ExemplarRetriever:
             from src.config_utils import resolve_model_path
 
             resolved_path = resolve_model_path(self.model_name)
-            self.model = SentenceTransformer(resolved_path)
+            
+            # Dynamically select device based on free VRAM
+            device = "cpu"
+            if torch.cuda.is_available():
+                try:
+                    free_mem, total_mem = torch.cuda.mem_get_info()
+                    # Need at least 6.0 GB of free memory to comfortably hold both BGE-M3 and Gemma-4-E4B-it
+                    if free_mem >= 6 * 1024 * 1024 * 1024:
+                        device = "cuda"
+                        print("[ExemplarRetriever] Ample VRAM detected. Loading BGE-M3 on GPU.")
+                    else:
+                        print(f"[ExemplarRetriever] Limited VRAM ({free_mem / (1024**3):.2f} GB free). Loading BGE-M3 on CPU to reserve space for LLM.")
+                except Exception:
+                    pass
+            
+            self.model = SentenceTransformer(resolved_path, device=device)
 
     def build_index(self, df):
         """Encodes and saves the training dataframe rows as exemplars."""
