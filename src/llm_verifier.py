@@ -198,9 +198,31 @@ class GemmaVerifier:
         if torch.cuda.is_available():
             if device_map in ("cuda:0", "cuda", "cuda_force"):
                 try:
-                    device_map = {"": torch.cuda.current_device()}
+                    from transformers import AutoConfig
+
+                    model_config = AutoConfig.from_pretrained(resolved_name)
+                    # If multimodal (e.g. gemma4), offload non-quantized vision/audio towers to CPU
+                    if getattr(model_config, "model_type", None) in (
+                        "gemma4",
+                        "paligemma",
+                        "llava",
+                    ):
+                        device_id = torch.cuda.current_device()
+                        device_map = {
+                            "model.vision_tower": "cpu",
+                            "model.audio_tower": "cpu",
+                            "model.embed_vision": "cpu",
+                            "model.embed_audio": "cpu",
+                            "model.language_model": device_id,
+                            "lm_head": device_id,
+                        }
+                        print(
+                            "[GemmaVerifier] 8GB VRAM optimization: Offloading vision/audio towers to CPU."
+                        )
+                    else:
+                        device_map = {"": torch.cuda.current_device()}
                 except Exception:
-                    device_map = "auto"
+                    device_map = {"": torch.cuda.current_device()}
         else:
             device_map = None
 
