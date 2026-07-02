@@ -19,9 +19,12 @@ from src.xlmr_encoder import train_cross_validation
 
 import logging
 import transformers
+from huggingface_hub.utils import disable_progress_bars
 
 # Suppress Hugging Face warnings/load reports for a cleaner UI
 transformers.utils.logging.set_verbosity_error()
+transformers.utils.logging.disable_progress_bar()
+disable_progress_bars()
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 console = Console()

@@ -12,12 +12,15 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 import logging
 import transformers
+from huggingface_hub.utils import disable_progress_bars
 from transformers import AutoModelForMultimodalLM, AutoProcessor, BitsAndBytesConfig
 
 from src.config_utils import resolve_section
 
 # Suppress Hugging Face warnings/load reports for a cleaner UI
 transformers.utils.logging.set_verbosity_error()
+transformers.utils.logging.disable_progress_bar()
+disable_progress_bars()
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 console = Console()
