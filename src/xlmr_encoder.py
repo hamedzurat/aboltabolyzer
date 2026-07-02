@@ -30,9 +30,10 @@ class BanglaDataset(Dataset):
         self.inputs = []
         self.labels = []
 
-        contexts = df["context"].astype(str).tolist()
-        prompts = df["prompt_bn"].astype(str).tolist()
-        responses = df["response_bn"].astype(str).tolist()
+        import pandas as pd
+        contexts = [str(x) if not pd.isna(x) else "[NULL]" for x in df["context"]]
+        prompts = [str(x) if not pd.isna(x) else "" for x in df["prompt_bn"]]
+        responses = [str(x) if not pd.isna(x) else "" for x in df["response_bn"]]
 
         self.inputs = [(ctx, f"{p} </s> {r}") for ctx, p, r in zip(contexts, prompts, responses)]
         if has_labels:
