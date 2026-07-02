@@ -34,8 +34,8 @@ max_length = 512
 batch_size = 16
 grad_accum_steps = 1
 use_amp = true
-epochs = 10
-lr = 2e-5
+epochs = 15
+lr = 8e-5
 weight_decay = 0.01
 lora_r = 8
 lora_alpha = 16
@@ -55,7 +55,7 @@ threshold_metric = "macro_f1"
 model_name = "FacebookAI/xlm-roberta-base"
 max_length = 384
 batch_size = 2
-grad_accum_steps = 8
+grad_accum_steps = 4
 use_amp = true
 
 [hardware_profiles.8gb.gemma]
