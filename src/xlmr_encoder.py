@@ -1,0 +1,308 @@
+import gc
+import os
+
+import numpy as np
+import torch
+from peft import LoraConfig, TaskType, get_peft_model
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from sklearn.metrics import f1_score
+from sklearn.model_selection import StratifiedKFold
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+console = Console()
+
+
+class BanglaDataset(Dataset):
+    def __init__(self, df, tokenizer, max_length, has_labels=True):
+        self.df = df
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.has_labels = has_labels
+
+        self.inputs = []
+        self.labels = []
+
+        for idx, row in df.iterrows():
+            context = str(row["context"])
+            prompt = str(row["prompt_bn"])
+            response = str(row["response_bn"])
+
+            text = context
+            text_pair = f"{prompt} </s> {response}"
+
+            self.inputs.append((text, text_pair))
+            if has_labels:
+                self.labels.append(int(row["label"]))
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        text, text_pair = self.inputs[idx]
+        encoding = self.tokenizer(
+            text,
+            text_pair,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        item = {
+            "input_ids": encoding["input_ids"].flatten(),
+            "attention_mask": encoding["attention_mask"].flatten(),
+        }
+
+        if self.has_labels:
+            item["labels"] = torch.tensor(self.labels[idx], dtype=torch.float)
+
+        return item
+
+
+def get_model(model_name, lora_r, lora_alpha, lora_dropout, device):
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=1)
+
+    peft_config = LoraConfig(
+        task_type=TaskType.SEQ_CLS,
+        inference_mode=False,
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=["query", "value"],
+    )
+
+    model = get_peft_model(model, peft_config)
+    model.to(device)
+    return model
+
+
+def train_epoch(model, dataloader, optimizer, criterion, device, progress, task_id):
+    model.train()
+    total_loss = 0
+    total_steps = len(dataloader)
+
+    for batch in dataloader:
+        optimizer.zero_grad()
+
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device).unsqueeze(1)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits
+
+        loss = criterion(logits, labels)
+        loss.backward()
+
+        optimizer.step()
+        total_loss += loss.item()
+
+        progress.advance(task_id)
+
+    return total_loss / total_steps
+
+
+def evaluate(model, dataloader, device):
+    model.eval()
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].numpy()
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits.squeeze(1)
+            probs = torch.sigmoid(logits).cpu().numpy()
+
+            all_preds.extend(probs)
+            all_labels.extend(labels)
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    preds_binary = (all_preds >= 0.5).astype(int)
+    macro_f1 = f1_score(all_labels, preds_binary, average="macro")
+    f1_class_0 = f1_score(all_labels, preds_binary, pos_label=0)
+
+    return macro_f1, f1_class_0, all_preds
+
+
+def train_cross_validation(train_df, config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    console.print(f"[bold cyan]Selected training hardware device:[/bold cyan] {device}")
+
+    with Console().status("Loading XLM-R Tokenizer...", spinner="dots"):
+        tokenizer = AutoTokenizer.from_pretrained(config["xlmr"]["model_name"])
+
+    skf = StratifiedKFold(n_splits=config["num_folds"], shuffle=True, random_state=config["seed"])
+    oof_preds = np.zeros(len(train_df))
+
+    os.makedirs("models/xlmr", exist_ok=True)
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(train_df, train_df["label"])):
+        console.print(
+            Panel(
+                f"[bold yellow]Training Fold {fold + 1}/{config['num_folds']}[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+
+        fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
+        fold_val_df = train_df.iloc[val_idx].reset_index(drop=True)
+
+        train_dataset = BanglaDataset(fold_train_df, tokenizer, config["xlmr"]["max_length"])
+        val_dataset = BanglaDataset(fold_val_df, tokenizer, config["xlmr"]["max_length"])
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=config["xlmr"]["batch_size"], shuffle=True
+        )
+        val_loader = DataLoader(val_dataset, batch_size=config["xlmr"]["batch_size"], shuffle=False)
+
+        with Console().status(
+            "Initializing base model with LoRA configuration...", spinner="aesthetic"
+        ):
+            model = get_model(
+                config["xlmr"]["model_name"],
+                config["xlmr"]["lora_r"],
+                config["xlmr"]["lora_alpha"],
+                config["xlmr"]["lora_dropout"],
+                device,
+            )
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(config["xlmr"]["lr"]),
+            weight_decay=config["xlmr"]["weight_decay"],
+        )
+        criterion = torch.nn.BCEWithLogitsLoss()
+
+        best_val_f1 = 0
+        best_fold_preds = None
+        patience_counter = 0
+
+        epochs = config["xlmr"]["epochs"]
+        for epoch in range(epochs):
+            steps_per_epoch = len(train_loader)
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                transient=True,
+            ) as progress:
+                epoch_task = progress.add_task(
+                    description=f"Epoch {epoch + 1}/{epochs} training...", total=steps_per_epoch
+                )
+                train_loss = train_epoch(
+                    model, train_loader, optimizer, criterion, device, progress, epoch_task
+                )
+
+            val_macro_f1, val_f1_0, val_probs = evaluate(model, val_loader, device)
+
+            # Print epoch report
+            console.print(
+                f"[bold cyan]Epoch {epoch + 1:02d}[/bold cyan] | "
+                f"Loss: [bold white]{train_loss:.4f}[/bold white] | "
+                f"Val Macro-F1: [bold green]{val_macro_f1:.4f}[/bold green] | "
+                f"Val F1(0): [bold green]{val_f1_0:.4f}[/bold green]"
+            )
+
+            if val_macro_f1 > best_val_f1:
+                best_val_f1 = val_macro_f1
+                best_fold_preds = val_probs
+                patience_counter = 0
+                torch.save(model.state_dict(), f"models/xlmr/best_fold_{fold}.pt")
+            else:
+                patience_counter += 1
+
+            if patience_counter >= config["xlmr"]["early_stopping_patience"]:
+                console.print(f"[bold red]Early stopping triggered at epoch {epoch + 1}[/bold red]")
+                break
+
+        oof_preds[val_idx] = best_fold_preds
+
+        # Cleanup memory
+        del model
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    train_df["p_xlmr"] = oof_preds
+    train_df.to_csv("dataset/processed/oof_xlmr.csv", index=False)
+
+    overall_f1 = f1_score(train_df["label"], (oof_preds >= 0.5).astype(int), average="macro")
+    console.print(
+        Panel(
+            f"[bold green]✔ XLM-R CV Completed! Overall OOF Macro-F1: {overall_f1:.4f}[/bold green]",
+            border_style="green",
+        )
+    )
+    return oof_preds
+
+
+def predict_test(test_df, config):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(config["xlmr"]["model_name"])
+
+    test_dataset = BanglaDataset(test_df, tokenizer, config["xlmr"]["max_length"], has_labels=False)
+    test_loader = DataLoader(test_dataset, batch_size=config["xlmr"]["batch_size"], shuffle=False)
+
+    all_fold_preds = []
+    num_folds = config["num_folds"]
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+    ) as progress:
+        fold_task = progress.add_task(
+            description="Running cross-encoder ensemble inference...", total=num_folds
+        )
+
+        for fold in range(num_folds):
+            progress.update(fold_task, description=f"Predicting Fold {fold + 1}/{num_folds}...")
+            model = get_model(
+                config["xlmr"]["model_name"],
+                config["xlmr"]["lora_r"],
+                config["xlmr"]["lora_alpha"],
+                config["xlmr"]["lora_dropout"],
+                device,
+            )
+
+            state_dict_path = f"models/xlmr/best_fold_{fold}.pt"
+            if os.path.exists(state_dict_path):
+                model.load_state_dict(torch.load(state_dict_path, map_location=device))
+
+            model.eval()
+            fold_preds = []
+
+            with torch.no_grad():
+                for batch in test_loader:
+                    input_ids = batch["input_ids"].to(device)
+                    attention_mask = batch["attention_mask"].to(device)
+
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    logits = outputs.logits.squeeze(1)
+                    probs = torch.sigmoid(logits).cpu().numpy()
+                    fold_preds.extend(probs)
+
+            all_fold_preds.append(fold_preds)
+
+            del model
+            torch.cuda.empty_cache()
+            gc.collect()
+            progress.advance(fold_task)
+
+    mean_preds = np.mean(all_fold_preds, axis=0)
+    test_df["p_xlmr"] = mean_preds
+    test_df.to_csv("dataset/processed/preds_test_xlmr.csv", index=False)
+    console.print("[green]✔ Cross-encoder test set inference complete and saved.[/green]")
+    return mean_preds

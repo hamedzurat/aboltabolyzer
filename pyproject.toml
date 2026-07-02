@@ -1,0 +1,39 @@
+[project]
+name = "aboltabolyzer"
+version = "0.1.0"
+description = "Bangla Hallucination Detection System"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.2.0",
+    "transformers>=4.40.0",
+    "datasets>=2.18.0",
+    "peft>=0.10.0",
+    "bitsandbytes>=0.43.0",
+    "sentence-transformers>=2.6.0",
+    "rank-bm25>=0.2.2",
+    "scikit-learn>=1.4.0",
+    "pandas>=2.2.0",
+    "tqdm>=4.66.0",
+    "huggingface-hub>=0.22.0",
+    "pytest>=8.0.0",
+    "questionary>=2.0.0",
+    "rich>=13.7.0",
+    "ruff>=0.3.0"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"] # Ignore line length violations (since some prompt strings are long)
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pyright]
+extraPaths = ["."]
+

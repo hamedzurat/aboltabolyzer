@@ -1,0 +1,37 @@
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Model checkpoints and weights
+models/
+*.pt
+*.bin
+*.pth
+*.safetensors
+
+# Data and index files
+dataset/processed/
+dataset/train_with_evidence.csv
+dataset/train_with_preds.csv
+dataset/test_with_evidence.csv
+dataset/test_with_preds.csv
+corpus/
+indexes/
+submissions/*.csv
+!submissions/sample_submission.csv
+
+# IDEs & OS files
+.idea/
+.DS_Store
+.ipynb_checkpoints/
+
+# Caches
+.pytest_cache/
+.ruff_cache/
+.cache/

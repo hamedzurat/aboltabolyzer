@@ -1,0 +1,44 @@
+# Configuration parameters for Bangla Hallucination Detection
+
+seed = 42
+num_folds = 5
+
+[data]
+sample_path = "dataset/sample_dataset.json"
+test_path = "dataset/.3_testset.csv"
+processed_dir = "dataset/processed"
+submission_output_path = "submissions/submission.csv"
+
+[rag]
+corpus_dir = "corpus"
+index_path = "indexes/dense_index.pkl"
+exemplar_index_path = "indexes/exemplar_index.pkl"
+model_name = "BAAI/bge-m3"
+top_k = 5
+max_evidence_tokens = 512
+similarity_threshold = 0.5
+
+[xlmr]
+model_name = "FacebookAI/xlm-roberta-large"
+max_length = 512
+batch_size = 16
+epochs = 10
+lr = 2e-5
+weight_decay = 0.01
+lora_r = 8
+lora_alpha = 16
+lora_dropout = 0.1
+label_smoothing = 0.05
+early_stopping_patience = 3
+
+[gemma]
+model_name = "google/gemma-4-E4B-it"
+load_in_4bit = true
+confidence_threshold = 0.15  # gate threshold: trigger think-pass if |p_llm - 0.5| < threshold
+max_think_tokens = 256
+
+[blending]
+alpha_step = 0.05
+threshold_step = 0.01
+metric = "macro"  # Options: "macro" (macro F1) or "class_0" (F1 of the hallucinated class)
+
