@@ -1,8 +1,10 @@
+import gc
 import os
 import tomllib
 
 import numpy as np
 import pandas as pd
+import torch
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
@@ -85,10 +87,6 @@ def main():
     p_xlmr = predict_test(test_df, config)
 
     # Clean up GPU memory after Cross-Encoder prediction
-    import gc
-
-    import torch
-
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -113,7 +111,7 @@ def main():
     test_df["is_c0"] = is_c0
     test_df["is_c1"] = is_c1
     test_df["is_c2"] = is_c2
-    test_df.to_csv("dataset/processed/test_with_preds.csv", index=False)
+    test_df.to_csv(os.path.join(config["data"]["processed_dir"], "test_with_preds.csv"), index=False)
 
     # 5. Load blender parameters
     blender = ScoreBlender()

@@ -10,14 +10,13 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_cosine_schedule_with_warmup
 
 console = Console()
 
 
 class BanglaDataset(Dataset):
     def __init__(self, df, tokenizer, max_length, has_labels=True):
-        self.df = df
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.has_labels = has_labels
@@ -25,17 +24,16 @@ class BanglaDataset(Dataset):
         self.inputs = []
         self.labels = []
 
-        for idx, row in df.iterrows():
-            context = str(row["context"])
-            prompt = str(row["prompt_bn"])
-            response = str(row["response_bn"])
+        contexts = df["context"].astype(str).tolist()
+        prompts = df["prompt_bn"].astype(str).tolist()
+        responses = df["response_bn"].astype(str).tolist()
 
-            text = context
-            text_pair = f"{prompt} </s> {response}"
-
-            self.inputs.append((text, text_pair))
-            if has_labels:
-                self.labels.append(int(row["label"]))
+        self.inputs = [
+            (ctx, f"{p} </s> {r}")
+            for ctx, p, r in zip(contexts, prompts, responses)
+        ]
+        if has_labels:
+            self.labels = df["label"].astype(int).tolist()
 
     def __len__(self):
         return len(self.inputs)
@@ -80,7 +78,7 @@ def get_model(model_name, lora_r, lora_alpha, lora_dropout, device):
     return model
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, progress, task_id):
+def train_epoch(model, dataloader, optimizer, criterion, device, progress, task_id, scheduler=None):
     model.train()
     total_loss = 0
     total_steps = len(dataloader)
@@ -98,7 +96,10 @@ def train_epoch(model, dataloader, optimizer, criterion, device, progress, task_
         loss = criterion(logits, labels)
         loss.backward()
 
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         total_loss += loss.item()
 
         progress.advance(task_id)
@@ -115,7 +116,7 @@ def evaluate(model, dataloader, device):
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].numpy()
+            labels = batch["labels"].cpu().numpy()
 
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits.squeeze(1)
@@ -183,11 +184,17 @@ def train_cross_validation(train_df, config):
         )
         criterion = torch.nn.BCEWithLogitsLoss()
 
+        epochs = config["xlmr"]["epochs"]
+        total_steps = epochs * len(train_loader)
+        warmup_steps = max(1, total_steps // 10)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+        )
+
         best_val_f1 = 0
         best_fold_preds = None
         patience_counter = 0
 
-        epochs = config["xlmr"]["epochs"]
         for epoch in range(epochs):
             steps_per_epoch = len(train_loader)
 
@@ -202,7 +209,8 @@ def train_cross_validation(train_df, config):
                     description=f"Epoch {epoch + 1}/{epochs} training...", total=steps_per_epoch
                 )
                 train_loss = train_epoch(
-                    model, train_loader, optimizer, criterion, device, progress, epoch_task
+                    model, train_loader, optimizer, criterion, device, progress, epoch_task,
+                    scheduler=scheduler,
                 )
 
             val_macro_f1, val_f1_0, val_probs = evaluate(model, val_loader, device)
@@ -235,7 +243,7 @@ def train_cross_validation(train_df, config):
         gc.collect()
 
     train_df["p_xlmr"] = oof_preds
-    train_df.to_csv("dataset/processed/oof_xlmr.csv", index=False)
+    train_df.to_csv(os.path.join(config["data"]["processed_dir"], "oof_xlmr.csv"), index=False)
 
     overall_f1 = f1_score(train_df["label"], (oof_preds >= 0.5).astype(int), average="macro")
     console.print(
@@ -279,7 +287,9 @@ def predict_test(test_df, config):
 
             state_dict_path = f"models/xlmr/best_fold_{fold}.pt"
             if os.path.exists(state_dict_path):
-                model.load_state_dict(torch.load(state_dict_path, map_location=device))
+                model.load_state_dict(
+                    torch.load(state_dict_path, map_location=device, weights_only=True)
+                )
 
             model.eval()
             fold_preds = []
@@ -303,6 +313,6 @@ def predict_test(test_df, config):
 
     mean_preds = np.mean(all_fold_preds, axis=0)
     test_df["p_xlmr"] = mean_preds
-    test_df.to_csv("dataset/processed/preds_test_xlmr.csv", index=False)
+    test_df.to_csv(os.path.join(config["data"]["processed_dir"], "preds_test_xlmr.csv"), index=False)
     console.print("[green]✔ Cross-encoder test set inference complete and saved.[/green]")
     return mean_preds

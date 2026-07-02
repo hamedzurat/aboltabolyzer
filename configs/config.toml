@@ -28,7 +28,6 @@ weight_decay = 0.01
 lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.1
-label_smoothing = 0.05
 early_stopping_patience = 3
 
 [gemma]
@@ -36,9 +35,3 @@ model_name = "google/gemma-4-E4B-it"
 load_in_4bit = true
 confidence_threshold = 0.15  # gate threshold: trigger think-pass if |p_llm - 0.5| < threshold
 max_think_tokens = 256
-
-[blending]
-alpha_step = 0.05
-threshold_step = 0.01
-metric = "macro"  # Options: "macro" (macro F1) or "class_0" (F1 of the hallucinated class)
-

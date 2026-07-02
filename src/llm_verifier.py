@@ -1,6 +1,7 @@
 import json
 import os
 import pickle
+import re
 import tomllib
 
 import numpy as np
@@ -301,6 +302,7 @@ class GemmaVerifier:
         uncertainty = abs(p_llm - 0.5)
         triggered_think = False
         p_llm_no_think = p_llm
+        generated_text = ""  # initialised here so the log block is always safe
 
         if uncertainty < self.conf_threshold:
             triggered_think = True
@@ -315,7 +317,7 @@ class GemmaVerifier:
                 f"<evidence>\n{evidence}\n</evidence>\n"
                 f"প্রশ্ন: {prompt_bn}\n"
                 f"উত্তর: {response_bn}\n"
-                f"বিচার করো এবং নিজের ভাষায় ব্যাখ্যা কর। শেষে অবশ্যই 'বিচার: F' অথবা 'বিচার: H' লিখবে।"
+                f"বিচার করো এবং নিজের ভাষায় ব্যাখ্যা কর। শেষে অবশ্যই 'verdict: Faithful' অথবা 'verdict: Hallucinated' লিখবে।"
             )
 
             think_messages = [{"role": "user", "content": think_user_content}]
@@ -339,16 +341,17 @@ class GemmaVerifier:
             generated_tokens = gen_outputs[0][input_len:]
             generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
-            text_cleaned = generated_text.upper()
-
-            if "বিচার: F" in text_cleaned or "বিচার:F" in text_cleaned:
-                p_llm = 1.0
-            elif "বিচার: H" in text_cleaned or "বিচার:H" in text_cleaned:
-                p_llm = 0.0
-            elif text_cleaned.rstrip().endswith("F"):
-                p_llm = 1.0
-            elif text_cleaned.rstrip().endswith("H"):
-                p_llm = 0.0
+            # Parse the full-word verdict from the CoT output.
+            # We instruct the model to write "verdict: Faithful" or "verdict: Hallucinated",
+            # which are far less likely to appear accidentally inside Bengali prose than
+            # single characters F / H.
+            verdict_match = re.search(
+                r"verdict\s*:\s*(Faithful|Hallucinated)",
+                generated_text,
+                re.IGNORECASE,
+            )
+            if verdict_match:
+                p_llm = 1.0 if verdict_match.group(1).lower() == "faithful" else 0.0
 
         # Log debug data
         if triggered_think:
@@ -393,7 +396,7 @@ class GemmaVerifier:
         ) as progress:
             task = progress.add_task(description="Running Gemma Verifier...", total=total_rows)
 
-            for idx, row in df.iterrows():
+            for row_num, (idx, row) in enumerate(df.iterrows(), start=1):
                 evidence = str(row["context"])
                 prompt = str(row["prompt_bn"])
                 response = str(row["response_bn"])
@@ -411,7 +414,7 @@ class GemmaVerifier:
 
                 progress.update(
                     task,
-                    description=f"Processed {idx + 1}/{total_rows} (Gate triggers: {think_count})",
+                    description=f"Processed {row_num}/{total_rows} (Gate triggers: {think_count})",
                 )
                 progress.advance(task)
 

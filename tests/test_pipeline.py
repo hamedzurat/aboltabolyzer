@@ -57,8 +57,6 @@ def test_score_blender():
         is_c0=is_c0,
         is_c1=is_c1,
         is_c2=is_c2,
-        alpha_step=0.2,
-        threshold_step=0.1,
     )
 
     assert best_f1 > 0.9
@@ -80,7 +78,7 @@ def test_score_blender_edge_cases():
     has_context_all = np.array([True, True, True])
     blender = ScoreBlender()
     best_f1 = blender.fit(
-        y_true, p_xlmr, p_llm, has_context=has_context_all, alpha_step=0.2, threshold_step=0.1
+        y_true, p_xlmr, p_llm, has_context=has_context_all
     )
     assert best_f1 > 0.9
     assert blender.is_fitted is True
@@ -89,7 +87,7 @@ def test_score_blender_edge_cases():
     has_context_none = np.array([False, False, False])
     blender2 = ScoreBlender()
     best_f1_none = blender2.fit(
-        y_true, p_xlmr, p_llm, has_context=has_context_none, alpha_step=0.2, threshold_step=0.1
+        y_true, p_xlmr, p_llm, has_context=has_context_none
     )
     assert best_f1_none > 0.9
     assert blender2.is_fitted is True

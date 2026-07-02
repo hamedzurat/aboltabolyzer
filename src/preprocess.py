@@ -6,7 +6,6 @@ import unicodedata
 import pandas as pd
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
 console = Console()
 
@@ -45,17 +44,11 @@ def preprocess_dataset(input_path, is_test=False):
 
     total_rows = len(df)
 
-    with Progress(
-        SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True
-    ) as progress:
-        task = progress.add_task(description=f"Cleaning {total_rows} rows...", total=total_rows)
-
-        # We can clean columns in vectorized form, but let's show visual feedback
+    with console.status(f"Cleaning {total_rows} rows...", spinner="dots"):
         df["context"] = df["context"].apply(clean_text)
         df["prompt_bn"] = df["prompt_bn"].apply(clean_text)
         df["response_bn"] = df["response_bn"].apply(clean_text)
-
-        progress.advance(task, total_rows)
+    console.print(f"  [green]✔ {total_rows} rows cleaned.[/green]")
 
     df["has_context"] = df["context"] != "[NULL]"
 

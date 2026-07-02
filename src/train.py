@@ -1,8 +1,10 @@
+import gc
 import os
 import tomllib
 
 import numpy as np
 import pandas as pd
+import torch
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
@@ -88,10 +90,6 @@ def main():
     p_xlmr = train_cross_validation(train_df, config)
 
     # Clean up GPU memory after Cross-Encoder training
-    import gc
-
-    import torch
-
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -112,7 +110,7 @@ def main():
         train_df["is_c0"] = is_c0
         train_df["is_c1"] = is_c1
         train_df["is_c2"] = is_c2
-        train_df.to_csv("dataset/processed/train_with_preds.csv", index=False)
+        train_df.to_csv(os.path.join(config["data"]["processed_dir"], "train_with_preds.csv"), index=False)
     except Exception as e:
         console.print(f"[bold red]Failed to run Gemma 4 Verifier: {e}[/bold red]")
         console.print(
@@ -126,7 +124,7 @@ def main():
         train_df["is_c0"] = is_c0
         train_df["is_c1"] = is_c1
         train_df["is_c2"] = is_c2
-        train_df.to_csv("dataset/processed/train_with_preds.csv", index=False)
+        train_df.to_csv(os.path.join(config["data"]["processed_dir"], "train_with_preds.csv"), index=False)
 
     # 5. Fit Meta-Classifier Blender
     console.print("\n[bold cyan]Step 4: Training Meta-Classifier Blender[/bold cyan]")

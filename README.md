@@ -46,7 +46,7 @@ graph TD
     Pllm --> Gate{"Is |p_llm - 0.5| < threshold?"}
     Gate -->|No| PllmFinal["p_llm_final = p_llm"]
     Gate -->|Yes| CoT["Gemma 4 CoT Thinking Pass: Few-shot ICL + Explain & Predict F/H"]
-    CoT --> Parse[Parse F/H from Reasoning text]
+    CoT --> Parse[Parse 'verdict: Faithful/Hallucinated' from Reasoning text]
     Parse --> PllmFinal
 
     PXLM --> MetaClassifier["Meta-Classifier: RandomForestClassifier fitted on (p_xlmr, p_llm, has_context, is_c0, is_c1, is_c2)"]
@@ -100,7 +100,7 @@ RAG is triggered for NULL-context rows to fetch evidence context. Save these in 
     ```bash
     huggingface-cli download google/gemma-4-E4B-it --local-dir models/gemma-4-E4B-it
     ```
-- **XLM-RoBERTa (FacebookAI/xlm-roberta-base)**:
+- **XLM-RoBERTa Large (FacebookAI/xlm-roberta-large)**:
   - Auto-downloaded by the transformers library at runtime.
 
 ---
@@ -136,10 +136,10 @@ just build-index
 Processes the training fold data. For each fold:
 
 1. Ground NULL-context rows using RAG evidence.
-2. Fine-tune `FacebookAI/xlm-roberta-base` using LoRA sequence classification adapter.
-3. Compute out-of-fold predictions.
-4. Run `google/gemma-4-E4B-it` verifier zero-shot with logit extraction.
-5. Grid search the optimal blend weights and decision thresholds separately for context-present and context-null rows.
+2. Fine-tune `FacebookAI/xlm-roberta-large` using LoRA sequence classification adapter with a cosine LR schedule and early stopping.
+3. Compute out-of-fold (OOF) predictions.
+4. Run `google/gemma-4-E4B-it` verifier with dynamic few-shot exemplars and cultural-band classification via logit extraction.
+5. Fit a `RandomForestClassifier` meta-classifier on the 6-feature vector `[p_xlmr, p_llm, has_context, is_c0, is_c1, is_c2]`.
 
 ```bash
 just train
@@ -147,7 +147,7 @@ just train
 
 ### 4. Inference & Submission
 
-Performs ensembled inference on the test dataset (`dataset/.3_testset.csv`), applying RAG grounding, ensembled XLM-R cross-encoder predictions, Gemma 4 token-efficient verifications, and context-conditional blender parameters to output `submissions/submission.csv` and `submissions/submission_debug.csv`.
+Performs ensembled inference on the test dataset (`dataset/.3_testset.csv`), applying RAG grounding, ensembled XLM-R cross-encoder predictions, Gemma 4 few-shot verifications with cultural-band classification, and a trained RandomForest meta-classifier to blend all signals into `submissions/submission.csv` and `submissions/submission_debug.csv`.
 
 ```bash
 just predict
@@ -201,8 +201,8 @@ aboltabolyzer/
 
 ## Key Highlights
 
-1. **Token-Efficient Prompts**: Zero-shot prompt returns next-token predictions over F/H (Faithful / Hallucinated) using logit extraction, saving massive generation time and context overhead.
-2. **Confidence Gate**: A threshold determines whether predictions are close to 0.5 uncertainty, triggering a full Chain-of-Thought thinking pass to resolve edge cases.
-3. **Grouped Cross-Validation**: Folds are stratified to prevent leakage during cross-encoder tuning.
-4. **Context-Conditional Blending**: Grid searches blend parameters and thresholds independently depending on whether context is present, optimizing the NLI strength of XLM-R for grounded items and the knowledge strength of Gemma + RAG for ungrounded ones.
+1. **Token-Efficient Prompts**: Zero-shot prompt extracts next-token logits over `F`/`H` (Faithful/Hallucinated) variants, saving generation time. Uncertain predictions trigger a Chain-of-Thought pass that asks for a full `verdict: Faithful` or `verdict: Hallucinated` verdict, parsed with a regex.
+2. **Confidence Gate**: When `|p_llm - 0.5| < threshold`, a CoT thinking pass generates a reasoned explanation ending in a full-word verdict, overriding the fast-path probability.
+3. **Grouped Cross-Validation**: 5-fold stratified CV with cosine LR schedule (10% warmup) and gradient clipping trains the XLM-R cross-encoder. Best fold weights are saved to `models/xlmr/`.
+4. **6-Feature RandomForest Meta-Classifier**: A `RandomForestClassifier` is fitted on OOF predictions using features `[p_xlmr, p_llm, has_context, is_c0, is_c1, is_c2]`, learning context-aware and cultural-band-sensitive ensembling rules without needing a manual grid search.
 5. **Rich Terminal Visuals**: Every phase runs with styled progress bars, panels, and loading spinners.

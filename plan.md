@@ -6,8 +6,8 @@ Use this guide to verify, execute, and evaluate the upgraded Bangla Hallucinatio
 
 ## Hardware Configuration (RTX 5060 8GB)
 Your target machine has key capabilities that we leverage:
-1.  **Native `bfloat16` Support:** The GPU supports fast, native bfloat16 calculations. Gemma 4 E2B will load and run at optimal performance.
-2.  **Model Scaling:** `FacebookAI/xlm-roberta-large` (560M parameters) is fine-tuned with LoRA, fitting comfortably in VRAM.
+1.  **Native `bfloat16` Support:** The GPU supports fast, native bfloat16 calculations. Gemma 4 E4B will load and run at optimal performance.
+2.  **Model Scaling:** `FacebookAI/xlm-roberta-large` (560M parameters) is fine-tuned with LoRA + cosine LR schedule + gradient clipping, fitting comfortably in VRAM.
 3.  **VRAM Clearing:** An explicit GPU cache and IPC memory sweep executes between the Cross-Encoder and LLM Verifier phases to prevent VRAM allocation overflows.
 
 ---
@@ -81,10 +81,10 @@ just train
 5.  **LLM Verification & Cultural Band Classification:** 
     *   For each query, Gemma 4 classifies the prompt band into `C0` (Global), `C1` (Bangladeshi), or `C2` (Time-sensitive) via next-token logits.
     *   Retrieves the top-3 nearest training exemplars, excluding the current target query to prevent leakage.
-    *   Gemma 4 evaluates the few-shot prompt to assign a Faithful (Class 1) probability score. Borderline cases trigger CoT reasoning.
-6.  **6-Feature Meta-Classifier fitting:** A `RandomForestClassifier` fits on:
+    *   Gemma 4 evaluates the few-shot prompt to assign a Faithful (Class 1) probability score. Borderline cases trigger a CoT reasoning pass, which asks the model to explain and conclude with `verdict: Faithful` or `verdict: Hallucinated` (parsed via regex).
+6.  **6-Feature RandomForest Meta-Classifier fitting:** A `RandomForestClassifier` fits on OOF features:
     `X = [p_xlmr, p_llm, has_context, is_c0, is_c1, is_c2]`
-    learning context-aware and band-sensitive ensembling rules.
+    learning context-aware and band-sensitive ensembling rules automatically — no manual grid search.
 
 *Expected result:* Evaluated metrics, fold scores, and the trained ensembler are saved to `models/blender_config.pkl`.
 

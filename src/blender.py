@@ -61,7 +61,7 @@ class ScoreBlender:
         from sklearn.metrics import f1_score
 
         overall_f1 = f1_score(y_true, preds, average="macro")
-        print(f"Meta-Classifier Fitted. OOF Combined Macro-F1: {overall_f1:.4f}")
+        print(f"Meta-Classifier Fitted. Train Macro-F1 (in-sample): {overall_f1:.4f}")
         return overall_f1
 
     def predict(self, p_xlmr, p_llm, has_context, is_c0=None, is_c1=None, is_c2=None):
@@ -98,7 +98,9 @@ class ScoreBlender:
 
     def save(self, filepath="models/blender_config.pkl"):
         """Saves the meta-classifier state to disk using pickle."""
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        dirpath = os.path.dirname(filepath)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
         with open(filepath, "wb") as f:
             pickle.dump(self.model, f)
         print(f"Saved meta-classifier to {filepath}")
