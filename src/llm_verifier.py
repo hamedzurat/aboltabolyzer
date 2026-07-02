@@ -189,6 +189,17 @@ class GemmaVerifier:
                 bnb_4bit_quant_type="nf4",
             )
 
+        max_memory = None
+        if torch.cuda.is_available():
+            try:
+                device_id = torch.cuda.current_device()
+                total_vram = torch.cuda.get_device_properties(device_id).total_memory
+                # Allow up to 90% of the total GPU VRAM
+                max_gpu_mem = f"{int(total_vram * 0.9 / (1024**2))}MB"
+                max_memory = {device_id: max_gpu_mem, "cpu": "32GB"}
+            except Exception:
+                pass
+
         with Console().status(
             "Loading weights (this may take a few minutes)...", spinner="bouncingBar"
         ):
@@ -196,6 +207,7 @@ class GemmaVerifier:
                 resolved_name,
                 quantization_config=quant_config,
                 device_map="auto" if torch.cuda.is_available() else None,
+                max_memory=max_memory,
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             )
             self.model.eval()
