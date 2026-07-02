@@ -195,85 +195,113 @@ def train_cross_validation(train_df, config):
         train_loader = DataLoader(train_dataset, batch_size=xlmr_config["batch_size"], shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=xlmr_config["batch_size"], shuffle=False)
 
-        with Console().status(
-            "Initializing base model with LoRA configuration...", spinner="aesthetic"
-        ):
-            model = get_model(
-                xlmr_config["model_name"],
-                xlmr_config["lora_r"],
-                xlmr_config["lora_alpha"],
-                xlmr_config["lora_dropout"],
-                device,
-            )
-
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=float(xlmr_config["lr"]),
-            weight_decay=xlmr_config["weight_decay"],
-        )
-        criterion = torch.nn.BCEWithLogitsLoss()
-
-        epochs = xlmr_config["epochs"]
-        grad_accum_steps = max(1, int(xlmr_config.get("grad_accum_steps", 1)))
-        total_steps = epochs * max(
-            1, (len(train_loader) + grad_accum_steps - 1) // grad_accum_steps
-        )
-        warmup_steps = max(1, total_steps // 10)
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
-        )
-
-        best_val_f1 = 0
-        best_fold_preds = None
-        patience_counter = 0
-
-        for epoch in range(epochs):
-            steps_per_epoch = len(train_loader)
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                transient=True,
-            ) as progress:
-                epoch_task = progress.add_task(
-                    description=f"Epoch {epoch + 1}/{epochs} training...", total=steps_per_epoch
-                )
-                train_loss = train_epoch(
-                    model,
-                    train_loader,
-                    optimizer,
-                    criterion,
-                    device,
-                    progress,
-                    epoch_task,
-                    scheduler=scheduler,
-                    grad_accum_steps=grad_accum_steps,
-                    use_amp=bool(xlmr_config.get("use_amp", True)),
-                )
-
-            val_macro_f1, val_f1_0, val_probs = evaluate(model, val_loader, device)
-
-            # Print epoch report
+        state_dict_path = f"models/xlmr/best_fold_{fold}.pt"
+        if os.path.exists(state_dict_path):
             console.print(
-                f"[bold cyan]Epoch {epoch + 1:02d}[/bold cyan] | "
-                f"Loss: [bold white]{train_loss:.4f}[/bold white] | "
+                f"[bold green]Found existing checkpoint {state_dict_path}. Loading and evaluating...[/bold green]"
+            )
+            with Console().status(
+                "Initializing base model and loading weights...", spinner="aesthetic"
+            ):
+                model = get_model(
+                    xlmr_config["model_name"],
+                    xlmr_config["lora_r"],
+                    xlmr_config["lora_alpha"],
+                    xlmr_config["lora_dropout"],
+                    device,
+                )
+                model.load_state_dict(
+                    torch.load(state_dict_path, map_location=device, weights_only=True)
+                )
+            val_macro_f1, val_f1_0, val_probs = evaluate(model, val_loader, device)
+            console.print(
+                f"[bold green]Loaded Fold {fold + 1} from checkpoint.[/bold green] | "
                 f"Val Macro-F1: [bold green]{val_macro_f1:.4f}[/bold green] | "
                 f"Val F1(0): [bold green]{val_f1_0:.4f}[/bold green]"
             )
+            best_fold_preds = val_probs
+        else:
+            with Console().status(
+                "Initializing base model with LoRA configuration...", spinner="aesthetic"
+            ):
+                model = get_model(
+                    xlmr_config["model_name"],
+                    xlmr_config["lora_r"],
+                    xlmr_config["lora_alpha"],
+                    xlmr_config["lora_dropout"],
+                    device,
+                )
 
-            if val_macro_f1 > best_val_f1:
-                best_val_f1 = val_macro_f1
-                best_fold_preds = val_probs
-                patience_counter = 0
-                torch.save(model.state_dict(), f"models/xlmr/best_fold_{fold}.pt")
-            else:
-                patience_counter += 1
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=float(xlmr_config["lr"]),
+                weight_decay=xlmr_config["weight_decay"],
+            )
+            criterion = torch.nn.BCEWithLogitsLoss()
 
-            if patience_counter >= xlmr_config["early_stopping_patience"]:
-                console.print(f"[bold red]Early stopping triggered at epoch {epoch + 1}[/bold red]")
-                break
+            epochs = xlmr_config["epochs"]
+            grad_accum_steps = max(1, int(xlmr_config.get("grad_accum_steps", 1)))
+            total_steps = epochs * max(
+                1, (len(train_loader) + grad_accum_steps - 1) // grad_accum_steps
+            )
+            warmup_steps = max(1, total_steps // 10)
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+            )
+
+            best_val_f1 = 0
+            best_fold_preds = None
+            patience_counter = 0
+
+            for epoch in range(epochs):
+                steps_per_epoch = len(train_loader)
+
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    transient=True,
+                ) as progress:
+                    epoch_task = progress.add_task(
+                        description=f"Epoch {epoch + 1}/{epochs} training...", total=steps_per_epoch
+                    )
+                    train_loss = train_epoch(
+                        model,
+                        train_loader,
+                        optimizer,
+                        criterion,
+                        device,
+                        progress,
+                        epoch_task,
+                        scheduler=scheduler,
+                        grad_accum_steps=grad_accum_steps,
+                        use_amp=bool(xlmr_config.get("use_amp", True)),
+                    )
+
+                val_macro_f1, val_f1_0, val_probs = evaluate(model, val_loader, device)
+
+                # Print epoch report
+                console.print(
+                    f"[bold cyan]Epoch {epoch + 1:02d}[/bold cyan] | "
+                    f"Loss: [bold white]{train_loss:.4f}[/bold white] | "
+                    f"Val Macro-F1: [bold green]{val_macro_f1:.4f}[/bold green] | "
+                    f"Val F1(0): [bold green]{val_f1_0:.4f}[/bold green]"
+                )
+
+                if val_macro_f1 > best_val_f1:
+                    best_val_f1 = val_macro_f1
+                    best_fold_preds = val_probs
+                    patience_counter = 0
+                    torch.save(model.state_dict(), f"models/xlmr/best_fold_{fold}.pt")
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= xlmr_config["early_stopping_patience"]:
+                    console.print(
+                        f"[bold red]Early stopping triggered at epoch {epoch + 1}[/bold red]"
+                    )
+                    break
 
         oof_preds[val_idx] = best_fold_preds
 

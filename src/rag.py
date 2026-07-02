@@ -9,7 +9,7 @@ import tomllib
 import numpy as np
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from sentence_transformers import SentenceTransformer
 
 console = Console()
@@ -86,15 +86,25 @@ class BanglaRAG:
 
         self.load_model()
 
+        batch_size = 128
+        self.embeddings = []
         with Progress(
-            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            transient=True,
         ) as progress:
-            task = progress.add_task(description="Encoding passages...", total=1)
-            # Encode passages
-            self.embeddings = self.model.encode(
-                self.passages, show_progress_bar=False, normalize_embeddings=True
-            )
-            progress.advance(task)
+            task = progress.add_task(description="Encoding passages...", total=total_p)
+            for i in range(0, total_p, batch_size):
+                batch = self.passages[i : i + batch_size]
+                batch_embeddings = self.model.encode(
+                    batch, show_progress_bar=False, normalize_embeddings=True
+                )
+                self.embeddings.append(batch_embeddings)
+                progress.advance(task, len(batch))
+
+        self.embeddings = np.vstack(self.embeddings)
 
         console.print(f"Saving index to [italic]{self.index_path}[/italic]...")
         os.makedirs(os.path.dirname(self.index_path), exist_ok=True)

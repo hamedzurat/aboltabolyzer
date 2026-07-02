@@ -387,8 +387,34 @@ class GemmaVerifier:
         return p_llm, triggered_think, is_c0, is_c1, is_c2
 
     def predict_dataset(self, df):
-        if self.model is None:
-            self.load_model()
+        cache = {}
+        if os.path.exists(self.debug_log_path):
+            try:
+                with open(self.debug_log_path, "r", encoding="utf-8") as lf:
+                    for line in lf:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            key = (entry["prompt"], entry["response"])
+                            cache[key] = (
+                                entry["p_llm_final"],
+                                entry["triggered_think"],
+                                entry.get("is_c0", 0.0),
+                                entry.get("is_c1", 0.0),
+                                entry.get("is_c2", 0.0),
+                            )
+                        except Exception:
+                            continue
+                if cache:
+                    console.print(
+                        f"[bold green]Loaded {len(cache)} existing predictions from debug log ({self.debug_log_path}).[/bold green]"
+                    )
+            except Exception as e:
+                console.print(
+                    f"[yellow]Could not read existing debug log: {e}. Starting fresh.[/yellow]"
+                )
 
         preds = []
         c0_features = []
@@ -409,10 +435,17 @@ class GemmaVerifier:
                 evidence = str(row["context"])
                 prompt = str(row["prompt_bn"])
                 response = str(row["response_bn"])
+                key = (prompt, response)
 
-                prob, triggered_think, is_c0, is_c1, is_c2 = self.predict_single(
-                    evidence, prompt, response, silent=True
-                )
+                if key in cache:
+                    prob, triggered_think, is_c0, is_c1, is_c2 = cache[key]
+                else:
+                    if self.model is None:
+                        self.load_model()
+                    prob, triggered_think, is_c0, is_c1, is_c2 = self.predict_single(
+                        evidence, prompt, response, silent=True
+                    )
+
                 preds.append(prob)
                 c0_features.append(is_c0)
                 c1_features.append(is_c1)

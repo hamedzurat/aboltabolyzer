@@ -39,59 +39,65 @@ def main():
 
     # 1. Preprocess raw data
     train_processed_path = os.path.join(config["data"]["processed_dir"], "train.csv")
-    if not os.path.exists(train_processed_path):
-        console.print("[yellow]Processed files not found. Executing preprocessing...[/yellow]")
-        run_preprocess()
+    train_evidence_path = os.path.join(config["data"]["processed_dir"], "train_with_evidence.csv")
 
-    train_df = pd.read_csv(train_processed_path)
+    if os.path.exists(train_evidence_path):
+        console.print(
+            f"[bold green]Found existing {train_evidence_path}. Loading cached contexts...[/bold green]"
+        )
+        train_df = pd.read_csv(train_evidence_path)
+    else:
+        if not os.path.exists(train_processed_path):
+            console.print("[yellow]Processed files not found. Executing preprocessing...[/yellow]")
+            run_preprocess()
 
-    # 2. RAG retrieval for NULL-context rows
-    console.print("\n[bold cyan]Step 1: Context Evidence Retrieval[/bold cyan]")
-    null_mask = train_df["context"] == "[NULL]"
-    num_nulls = null_mask.sum()
+        train_df = pd.read_csv(train_processed_path)
 
-    if num_nulls > 0:
-        index_path = config["rag"]["index_path"]
-        query_mode = config["rag"].get("query_mode", "prompt")
-        if os.path.exists(index_path):
-            console.print(
-                f"Dense RAG index found. Retrieving evidence for [bold yellow]{num_nulls}[/bold yellow] NULL-context rows..."
-            )
-            rag = BanglaRAG()
-            rag.load_index()
+        # 2. RAG retrieval for NULL-context rows
+        console.print("\n[bold cyan]Step 1: Context Evidence Retrieval[/bold cyan]")
+        null_mask = train_df["context"] == "[NULL]"
+        num_nulls = null_mask.sum()
 
-            retrieved_contexts = []
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                transient=True,
-            ) as progress:
-                task = progress.add_task(description="Retrieving facts...", total=num_nulls)
-                for idx, row in train_df[null_mask].iterrows():
-                    query = build_rag_query(row, query_mode)
-                    chunks = rag.retrieve(query)
-                    if chunks:
-                        retrieved_contexts.append(" ".join(chunks))
-                    else:
-                        retrieved_contexts.append("[NULL]")
-                    progress.advance(task)
+        if num_nulls > 0:
+            index_path = config["rag"]["index_path"]
+            query_mode = config["rag"].get("query_mode", "prompt")
+            if os.path.exists(index_path):
+                console.print(
+                    f"Dense RAG index found. Retrieving evidence for [bold yellow]{num_nulls}[/bold yellow] NULL-context rows..."
+                )
+                rag = BanglaRAG()
+                rag.load_index()
 
-            train_df.loc[null_mask, "context"] = retrieved_contexts
-            console.print("[green]✔ Context evidence retrieval complete.[/green]")
-        else:
-            console.print(
-                f"[bold red]WARNING: Dense RAG index not found at {index_path}.[/bold red]"
-            )
-            console.print(
-                "NULL-context rows will remain ungrounded. Build the RAG index if a corpus is available."
-            )
+                retrieved_contexts = []
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    transient=True,
+                ) as progress:
+                    task = progress.add_task(description="Retrieving facts...", total=num_nulls)
+                    for idx, row in train_df[null_mask].iterrows():
+                        query = build_rag_query(row, query_mode)
+                        chunks = rag.retrieve(query)
+                        if chunks:
+                            retrieved_contexts.append(" ".join(chunks))
+                        else:
+                            retrieved_contexts.append("[NULL]")
+                        progress.advance(task)
 
-    os.makedirs(config["data"]["processed_dir"], exist_ok=True)
-    train_df.to_csv(
-        os.path.join(config["data"]["processed_dir"], "train_with_evidence.csv"), index=False
-    )
+                train_df.loc[null_mask, "context"] = retrieved_contexts
+                console.print("[green]✔ Context evidence retrieval complete.[/green]")
+            else:
+                console.print(
+                    f"[bold red]WARNING: Dense RAG index not found at {index_path}.[/bold red]"
+                )
+                console.print(
+                    "NULL-context rows will remain ungrounded. Build the RAG index if a corpus is available."
+                )
+
+        os.makedirs(config["data"]["processed_dir"], exist_ok=True)
+        train_df.to_csv(train_evidence_path, index=False)
 
     # 3. Train XLM-RoBERTa Cross-Encoder
     console.print("\n[bold cyan]Step 2: Training XLM-RoBERTa Cross-Encoder[/bold cyan]")
