@@ -22,6 +22,7 @@ dependencies = [
     "rich>=13.7.0",
     "ruff>=0.3.0",
     "pillow>=12.3.0",
+    "torchvision>=0.27.1",
 ]
 
 [tool.ruff]
