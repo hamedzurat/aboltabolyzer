@@ -44,10 +44,10 @@ class ExemplarRetriever:
             from src.config_utils import resolve_model_path
 
             resolved_path = resolve_model_path(self.model_name)
-            
-            # Dynamically select device based on free VRAM
+            # Dynamically select device based on hardware profile and free VRAM
             device = "cpu"
-            if torch.cuda.is_available():
+            profile = self.config.get("runtime", {}).get("hardware_profile", "16gb")
+            if profile != "8gb" and torch.cuda.is_available():
                 try:
                     free_mem, total_mem = torch.cuda.mem_get_info()
                     # Need at least 6.0 GB of free memory to comfortably hold both BGE-M3 and Gemma-4-E4B-it
@@ -58,6 +58,8 @@ class ExemplarRetriever:
                         print(f"[ExemplarRetriever] Limited VRAM ({free_mem / (1024**3):.2f} GB free). Loading BGE-M3 on CPU to reserve space for LLM.")
                 except Exception:
                     pass
+            else:
+                print("[ExemplarRetriever] 8GB profile active. Loading BGE-M3 on CPU to reserve GPU space for LLM.")
             
             self.model = SentenceTransformer(resolved_path, device=device)
 
