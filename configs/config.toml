@@ -35,12 +35,12 @@ batch_size = 16
 grad_accum_steps = 1
 use_amp = true
 epochs = 15
-lr = 8e-5
+lr = 4e-5
 weight_decay = 0.01
 lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.1
-early_stopping_patience = 3
+early_stopping_patience = 5
 
 [gemma]
 model_name = "google/gemma-4-E4B-it"
