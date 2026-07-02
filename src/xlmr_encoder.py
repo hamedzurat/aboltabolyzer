@@ -16,7 +16,12 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
-from src.config_utils import resolve_section
+import logging
+import transformers
+
+# Suppress Hugging Face warnings/load reports for a cleaner UI
+transformers.utils.logging.set_verbosity_error()
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 console = Console()
 

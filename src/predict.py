@@ -14,6 +14,13 @@ from src.llm_verifier import GemmaVerifier
 from src.rag import BanglaRAG
 from src.xlmr_encoder import predict_test
 
+import logging
+import transformers
+
+# Suppress Hugging Face warnings/load reports for a cleaner UI
+transformers.utils.logging.set_verbosity_error()
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 console = Console()
 
 

@@ -10,9 +10,15 @@ import torch
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+import logging
+import transformers
 from transformers import AutoModelForMultimodalLM, AutoProcessor, BitsAndBytesConfig
 
 from src.config_utils import resolve_section
+
+# Suppress Hugging Face warnings/load reports for a cleaner UI
+transformers.utils.logging.set_verbosity_error()
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 console = Console()
 

@@ -17,6 +17,13 @@ from src.preprocess import main as run_preprocess
 from src.rag import BanglaRAG
 from src.xlmr_encoder import train_cross_validation
 
+import logging
+import transformers
+
+# Suppress Hugging Face warnings/load reports for a cleaner UI
+transformers.utils.logging.set_verbosity_error()
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 console = Console()
 
 
