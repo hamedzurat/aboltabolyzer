@@ -3,7 +3,6 @@ import glob
 import json
 import os
 import pickle
-import re
 import tomllib
 
 import numpy as np
@@ -15,8 +14,14 @@ from sentence_transformers import SentenceTransformer
 console = Console()
 
 
-def bengali_tokenize(text):
-    return re.findall(r"[\u0980-\u09ff\w]+", text.lower())
+def truncate_evidence(text, max_tokens):
+    """Truncate evidence by whitespace tokens (approx) to fit the encoder window."""
+    if not text or max_tokens is None or max_tokens <= 0:
+        return text
+    tokens = str(text).split()
+    if len(tokens) <= max_tokens:
+        return str(text)
+    return " ".join(tokens[:max_tokens])
 
 
 class BanglaRAG:
@@ -29,6 +34,7 @@ class BanglaRAG:
         self.model_name = self.config["rag"]["model_name"]
         self.top_k = self.config["rag"]["top_k"]
         self.similarity_threshold = self.config["rag"].get("similarity_threshold", 0.5)
+        self.max_evidence_tokens = self.config["rag"].get("max_evidence_tokens", 512)
 
         self.model = None
         self.passages = []
@@ -133,6 +139,7 @@ class BanglaRAG:
         return True
 
     def retrieve(self, query, top_k=None, similarity_threshold=None):
+        """Return list of {"text": str, "score": float} above the similarity threshold."""
         if self.embeddings is None:
             if not self.load_index():
                 return []
@@ -144,21 +151,29 @@ class BanglaRAG:
         if similarity_threshold is None:
             similarity_threshold = self.similarity_threshold
 
-        # Encode query
         query_embedding = self.model.encode(
             [query], show_progress_bar=False, normalize_embeddings=True
         )[0]
 
-        # Since embeddings and query_embedding are normalized, cosine similarity is dot product
         similarities = np.dot(self.embeddings, query_embedding)
-
-        # Get sorted indices descending
         top_indices = np.argsort(similarities)[::-1][:top_k]
 
-        # Filter by similarity threshold
-        results = [self.passages[i] for i in top_indices if similarities[i] >= similarity_threshold]
-
+        results = []
+        for i in top_indices:
+            score = float(similarities[i])
+            if score >= similarity_threshold:
+                results.append({"text": self.passages[i], "score": score})
         return results
+
+    def format_evidence(self, hits):
+        """Join retrieved hits and truncate to max_evidence_tokens."""
+        if not hits:
+            return "[NULL]", 0, float("nan"), float("nan")
+
+        joined = " ".join(hit["text"] for hit in hits)
+        evidence = truncate_evidence(joined, self.max_evidence_tokens)
+        scores = [hit["score"] for hit in hits]
+        return evidence, len(hits), float(max(scores)), float(np.mean(scores))
 
 
 def main():
@@ -181,7 +196,13 @@ def main():
             console.print(f"\n[bold cyan]Query:[/bold cyan] {args.query}")
             console.print(f"[bold green]Top {len(results)} matches retrieved:[/bold green]")
             for idx, res in enumerate(results):
-                console.print(Panel(res, title=f"Match {idx + 1}", border_style="cyan"))
+                console.print(
+                    Panel(
+                        f"[dim]score={res['score']:.4f}[/dim]\n{res['text']}",
+                        title=f"Match {idx + 1}",
+                        border_style="cyan",
+                    )
+                )
         else:
             console.print("[bold red]Failed to run retrieval.[/bold red]")
 

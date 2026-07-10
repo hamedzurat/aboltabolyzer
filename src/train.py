@@ -11,8 +11,9 @@ from huggingface_hub.utils import disable_progress_bars
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from sklearn.model_selection import StratifiedKFold
 
-from src.blender import ScoreBlender
+from src.blender import ThresholdDecision
 from src.config_utils import fail_on_model_error
 from src.evaluate import compute_metrics
 from src.llm_verifier import GemmaVerifier
@@ -55,12 +56,25 @@ def main():
             f"[bold green]Found existing {train_evidence_path}. Loading cached contexts...[/bold green]"
         )
         train_df = pd.read_csv(train_evidence_path)
+        if "context_original" not in train_df.columns:
+            train_df["context_original"] = train_df["context"]
+        for col, default in (
+            ("n_retrieved", 0),
+            ("retrieval_sim_max", np.nan),
+            ("retrieval_sim_mean", np.nan),
+        ):
+            if col not in train_df.columns:
+                train_df[col] = default
     else:
         if not os.path.exists(train_processed_path):
             console.print("[yellow]Processed files not found. Executing preprocessing...[/yellow]")
             run_preprocess()
 
         train_df = pd.read_csv(train_processed_path)
+        train_df["context_original"] = train_df["context"]
+        train_df["n_retrieved"] = 0
+        train_df["retrieval_sim_max"] = np.nan
+        train_df["retrieval_sim_mean"] = np.nan
 
         # 2. RAG retrieval for NULL-context rows
         console.print("\n[bold cyan]Step 1: Context Evidence Retrieval[/bold cyan]")
@@ -78,6 +92,9 @@ def main():
                 rag.load_index()
 
                 retrieved_contexts = []
+                n_retrieved = []
+                sim_max = []
+                sim_mean = []
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
@@ -88,14 +105,18 @@ def main():
                     task = progress.add_task(description="Retrieving facts...", total=num_nulls)
                     for idx, row in train_df[null_mask].iterrows():
                         query = build_rag_query(row, query_mode)
-                        chunks = rag.retrieve(query)
-                        if chunks:
-                            retrieved_contexts.append(" ".join(chunks))
-                        else:
-                            retrieved_contexts.append("[NULL]")
+                        hits = rag.retrieve(query)
+                        evidence, n_hits, max_score, mean_score = rag.format_evidence(hits)
+                        retrieved_contexts.append(evidence)
+                        n_retrieved.append(n_hits)
+                        sim_max.append(max_score)
+                        sim_mean.append(mean_score)
                         progress.advance(task)
 
                 train_df.loc[null_mask, "context"] = retrieved_contexts
+                train_df.loc[null_mask, "n_retrieved"] = n_retrieved
+                train_df.loc[null_mask, "retrieval_sim_max"] = sim_max
+                train_df.loc[null_mask, "retrieval_sim_mean"] = sim_mean
                 console.print("[green]✔ Context evidence retrieval complete.[/green]")
             else:
                 console.print(
@@ -111,6 +132,7 @@ def main():
     # 3. Train XLM-RoBERTa Cross-Encoder
     console.print("\n[bold cyan]Step 2: Training XLM-RoBERTa Cross-Encoder[/bold cyan]")
     p_xlmr = train_cross_validation(train_df, config)
+    train_df["p_xlmr"] = p_xlmr
 
     # Clean up GPU memory after Cross-Encoder training
     gc.collect()
@@ -118,16 +140,42 @@ def main():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    # 4. Predict using Gemma 4 Verifier
-    console.print("\n[bold cyan]Step 3: Generating Gemma 4 Verifier Scores[/bold cyan]")
+    # 4. Fold-isolated OOF Gemma verifier scores (encoder prior from OOF p_xlmr)
+    console.print("\n[bold cyan]Step 3: Generating OOF Gemma Verifier Scores[/bold cyan]")
 
     if config.get("runtime", {}).get("use_llm_verifier", True):
         verifier = GemmaVerifier()
-        console.print("\n[bold cyan]Building Dynamic Few-Shot Exemplar Index...[/bold cyan]")
-        verifier.exemplar_retriever.build_index(train_df)
+        oof_p_llm = np.zeros(len(train_df))
+
         try:
             verifier.load_model()
-            p_llm, is_c0, is_c1, is_c2 = verifier.predict_dataset(train_df)
+            skf = StratifiedKFold(
+                n_splits=config["num_folds"], shuffle=True, random_state=config["seed"]
+            )
+
+            for fold, (train_idx, val_idx) in enumerate(
+                skf.split(train_df, train_df["label"]), start=1
+            ):
+                console.print(
+                    f"\n[bold yellow]Gemma OOF fold {fold}/{config['num_folds']}[/bold yellow]"
+                )
+                fold_train_df = train_df.iloc[train_idx].reset_index(drop=True)
+                fold_val_df = train_df.iloc[val_idx].reset_index(drop=True)
+
+                verifier.exemplar_retriever.build_index(fold_train_df)
+                fold_p_llm = verifier.predict_dataset(
+                    fold_val_df,
+                    p_xlmr=fold_val_df["p_xlmr"].values,
+                    use_cache=False,
+                    debug_log_path=f"logs/debug_llm_verifier_oof_fold_{fold}.jsonl",
+                )
+
+                oof_p_llm[val_idx] = fold_p_llm
+
+            console.print("\n[bold cyan]Building full exemplar index for inference...[/bold cyan]")
+            verifier.exemplar_retriever.build_index(train_df)
+
+            p_llm = oof_p_llm
         except Exception as e:
             if fail_on_model_error(config):
                 raise RuntimeError(
@@ -138,55 +186,35 @@ def main():
                 "[yellow]Falling back to XLM-R-only scores because fail_on_model_error=false.[/yellow]"
             )
             p_llm = p_xlmr.copy()
-            is_c0 = np.zeros(len(train_df))
-            is_c1 = np.zeros(len(train_df))
-            is_c2 = np.zeros(len(train_df))
     else:
-        console.print("[yellow]LLM verifier disabled. Using XLM-R-only blend features.[/yellow]")
+        console.print(
+            "[yellow]LLM verifier disabled. Using XLM-R scores as Gemma fallback.[/yellow]"
+        )
         p_llm = p_xlmr.copy()
-        is_c0 = np.zeros(len(train_df))
-        is_c1 = np.zeros(len(train_df))
-        is_c2 = np.zeros(len(train_df))
 
     train_df["p_llm"] = p_llm
-    train_df["is_c0"] = is_c0
-    train_df["is_c1"] = is_c1
-    train_df["is_c2"] = is_c2
     train_df.to_csv(
         os.path.join(config["data"]["processed_dir"], "train_with_preds.csv"), index=False
     )
 
-    # 5. Fit Meta-Classifier Blender
-    console.print("\n[bold cyan]Step 4: Training Meta-Classifier Blender[/bold cyan]")
+    # 5. Fit OOF threshold on Gemma verdicts
+    console.print("\n[bold cyan]Step 4: Tuning Threshold on OOF Gemma Scores[/bold cyan]")
     y_true = train_df["label"].values
-    p_xlmr = train_df["p_xlmr"].values
     p_llm = train_df["p_llm"].values
 
-    blender = ScoreBlender()
+    decision = ThresholdDecision()
 
-    with Console().status("Training Meta-Classifier...", spinner="simpleDots"):
-        blender.fit(
+    with Console().status("Tuning threshold...", spinner="simpleDots"):
+        decision.fit(
             y_true,
-            p_xlmr,
             p_llm,
-            has_context=train_df["has_context"].values,
-            is_c0=train_df["is_c0"].values,
-            is_c1=train_df["is_c1"].values,
-            is_c2=train_df["is_c2"].values,
             threshold_metric=config.get("blender", {}).get("threshold_metric", "macro_f1"),
         )
-    blender.save()
+    decision.save()
 
-    # 6. Evaluation metrics
-    console.print("\n[bold cyan]Step 5: Overall Pipeline Performance[/bold cyan]")
-    p_blend, preds = blender.predict(
-        p_xlmr,
-        p_llm,
-        has_context=train_df["has_context"].values,
-        is_c0=train_df["is_c0"].values,
-        is_c1=train_df["is_c1"].values,
-        is_c2=train_df["is_c2"].values,
-    )
+    # 6. Evaluation metrics on OOF Gemma + tuned threshold
+    console.print("\n[bold cyan]Step 5: Overall Pipeline Performance (OOF)[/bold cyan]")
+    _, preds = decision.predict(p_llm)
     compute_metrics(y_true, preds)
 
     console.print(

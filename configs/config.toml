@@ -1,33 +1,80 @@
-# Configuration parameters for Bangla Hallucination Detection
+# =============================================================================
+# Aboltabolyzer — runtime configuration
+# =============================================================================
+# Edit this file, then run: just run / just submit / just first-run-16gb
+# All knob meanings are documented here (not in README).
 
+# Random seed for fold splits and model init reproducibility.
 seed = 42
+
+# Stratified CV folds for XLM-R training and fold-isolated Gemma OOF.
 num_folds = 5
 
+# -----------------------------------------------------------------------------
+# Runtime — which machine profile and verifier mode to use
+# -----------------------------------------------------------------------------
 [runtime]
-# Use "8gb" on your own RTX 5060 8GB for debugging, and "16gb" on the larger
-# desktop for final folds. Profile values override matching sections below.
-hardware_profile = "8gb"
+# Active hardware profile. Values "8gb" or "16gb" override [xlmr] and [gemma]
+# sections below with matching [hardware_profiles.*] blocks.
+hardware_profile = "16gb"
+
+# If true, training/predict abort when Gemma fails instead of faking scores.
 fail_on_model_error = true
+
+# If true, Gemma is the final verdict source (p_llm). If false, p_llm = p_xlmr
+# and the pipeline skips Gemma — useful for 8GB smoke tests without loading LLM.
 use_llm_verifier = true
 
+# -----------------------------------------------------------------------------
+# Data paths
+# -----------------------------------------------------------------------------
 [data]
+# Labeled training JSON (299 samples in the sample competition set).
 sample_path = "dataset/sample_dataset.json"
+
+# Test CSV with id, context, prompt_bn, response_bn (no labels).
 test_path = "dataset/.3_testset.csv"
+
+# Generated CSVs land here (train.csv, oof_xlmr.csv, train_with_preds.csv, …).
 processed_dir = "dataset/processed"
+
+# Final competition submission (id, label).
 submission_output_path = "submissions/submission.csv"
 
+# -----------------------------------------------------------------------------
+# RAG — dense retrieval for rows where context == "[NULL]"
+# -----------------------------------------------------------------------------
 [rag]
+# Directory of *.jsonl corpus files ({ "text": "..." } or { "passage": "..." }).
 corpus_dir = "corpus"
+
+# Pickled dense index built by: just build-index
 index_path = "indexes/dense_index.pkl"
+
+# Few-shot exemplar index for Gemma, built during training.
 exemplar_index_path = "indexes/exemplar_index.pkl"
+
+# SentenceTransformer model for query/passage embedding.
 model_name = "BAAI/bge-m3"
+
+# Max passages to retrieve per query before joining and truncating.
 top_k = 5
+
+# After joining top-k passages, truncate evidence to this many whitespace tokens
+# so the cross-encoder / Gemma context window is not blown by long wiki dumps.
 max_evidence_tokens = 512
+
+# Minimum cosine similarity for a passage to be included. Below threshold → [NULL].
 similarity_threshold = 0.5
-# "prompt" is safer for hallucination detection. "prompt_response" can retrieve
-# evidence related to a false answer and should be treated as an experiment.
+
+# Retrieval query text:
+#   "prompt"          — question only (default; safer for hallucination detection)
+#   "prompt_response" — question + answer (experimental; can retrieve false-claim evidence)
 query_mode = "prompt"
 
+# -----------------------------------------------------------------------------
+# XLM-R cross-encoder (defaults; overridden by active hardware_profile)
+# -----------------------------------------------------------------------------
 [xlmr]
 model_name = "FacebookAI/xlm-roberta-large"
 max_length = 512
@@ -42,15 +89,42 @@ lora_alpha = 16
 lora_dropout = 0.1
 early_stopping_patience = 5
 
+# -----------------------------------------------------------------------------
+# Gemma verifier — final judge with XLM-R encoder prior in the prompt
+# -----------------------------------------------------------------------------
 [gemma]
 model_name = "google/gemma-4-E4B-it"
 load_in_4bit = true
-confidence_threshold = 0.15  # gate threshold: trigger think-pass if |p_llm - 0.5| < threshold
+
+# Think trigger: fast F/H logit pass is uncertain when |p_fast - 0.5| < this value.
+confidence_threshold = 0.15
+
+# Think trigger: Gemma fast pass disagrees with XLM-R prior when |p_fast - p_xlmr| > this.
+disagree_threshold = 0.25
+
+# Think trigger: C0 band (math/science/universal) + no retrieved evidence → force CoT.
+force_think_c0_null = true
+
+# Think trigger: C2 band (recent/time-sensitive) → force CoT.
+force_think_c2 = true
+
+# Max tokens for the CoT think pass (parsed verdict: Faithful / Hallucinated).
 max_think_tokens = 256
 
+# -----------------------------------------------------------------------------
+# Threshold decision — single OOF-tuned cutoff on p_llm (no meta-classifier)
+# -----------------------------------------------------------------------------
 [blender]
+# Metric for grid-searching the decision threshold on OOF Gemma scores:
+#   "macro_f1"    — balanced overall F1
+#   "f1_class_0"  — optimize hallucinated-class recall/precision (label 0)
 threshold_metric = "macro_f1"
 
+# Saved to models/blender_config.pkl (legacy filename; stores threshold only).
+
+# -----------------------------------------------------------------------------
+# Hardware profile: RTX 5060 8GB — fast iteration, XLM-R-only debug
+# -----------------------------------------------------------------------------
 [hardware_profiles.8gb.xlmr]
 model_name = "FacebookAI/xlm-roberta-base"
 max_length = 384
@@ -61,6 +135,9 @@ use_amp = true
 [hardware_profiles.8gb.gemma]
 max_think_tokens = 128
 
+# -----------------------------------------------------------------------------
+# Hardware profile: RTX 5060 16GB — full pipeline with Gemma
+# -----------------------------------------------------------------------------
 [hardware_profiles.16gb.xlmr]
 model_name = "FacebookAI/xlm-roberta-large"
 max_length = 512

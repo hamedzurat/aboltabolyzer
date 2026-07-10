@@ -2,90 +2,44 @@ import os
 import pickle
 
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import f1_score
 
 
-class ScoreBlender:
-    """Ensembles cross-encoder and LLM predictions using a Meta-Classifier (RandomForestClassifier).
+class ThresholdDecision:
+    """Gemma-led final decision via a single OOF-tuned threshold on p_llm.
 
-    Both p_xlmr and p_llm represent Class 1 (Faithful) probabilities.
+    p_llm represents P(label=1 faithful). XLM-R influences Gemma upstream as an
+    encoder prior; it is not blended here.
     """
 
     def __init__(self):
-        # We use a RandomForestClassifier as our meta-classifier.
-        # This is a robust tree-based model that captures non-linear interactions
-        # (e.g., trust LLM more if has_context is False) and works on any dataset size.
-        self.model = RandomForestClassifier(
-            n_estimators=50, max_depth=3, min_samples_leaf=1, random_state=42
-        )
         self.is_fitted = False
         self.threshold = 0.5
         self.threshold_metric = "macro_f1"
 
-    def fit(
-        self,
-        y_true,
-        p_xlmr,
-        p_llm,
-        has_context,
-        is_c0=None,
-        is_c1=None,
-        is_c2=None,
-        threshold_metric="macro_f1",
-        **kwargs,
-    ):
-        """Fits the meta-classifier on the Out-Of-Fold predictions."""
+    def fit(self, y_true, p_llm, threshold_metric="macro_f1"):
+        """Grid-search threshold on out-of-fold Gemma probabilities."""
         self.threshold_metric = threshold_metric
-        # Ensure min_samples_leaf is smaller than the dataset size (important for small unit tests)
-        min_samples = min(20, max(1, len(y_true) // 3))
-        self.model = RandomForestClassifier(
-            n_estimators=50,
-            max_depth=3,
-            min_samples_leaf=min_samples,
-            random_state=42,
-        )
-
-        # Fallbacks if categories are not provided (e.g. legacy tests)
-        if is_c0 is None:
-            is_c0 = np.zeros(len(p_xlmr))
-        if is_c1 is None:
-            is_c1 = np.zeros(len(p_xlmr))
-        if is_c2 is None:
-            is_c2 = np.zeros(len(p_xlmr))
-
-        # Stack inputs into feature matrix
-        x = np.stack(
-            [
-                p_xlmr,
-                p_llm,
-                has_context.astype(float),
-                is_c0.astype(float),
-                is_c1.astype(float),
-                is_c2.astype(float),
-            ],
-            axis=1,
-        )
-
-        self.model.fit(x, y_true)
+        p_llm = np.asarray(p_llm, dtype=float)
+        self.threshold, _ = self._find_best_threshold(y_true, p_llm, threshold_metric)
         self.is_fitted = True
 
-        p_train = self.model.predict_proba(x)[:, 1]
-        self.threshold, overall_f1 = self._find_best_threshold(y_true, p_train, threshold_metric)
-        preds = (p_train >= self.threshold).astype(int)
+        preds = (p_llm >= self.threshold).astype(int)
         overall_f1 = f1_score(y_true, preds, average="macro")
         f1_class_0 = f1_score(y_true, preds, pos_label=0)
+
         from rich.console import Console
         from rich.panel import Panel
 
         console = Console()
         console.print(
             Panel(
-                f"[bold cyan]Model type:[/]      RandomForestClassifier (n_estimators=50, max_depth=3)\n"
-                f"[bold cyan]Optimal threshold:[/] [bold yellow]{self.threshold:.3f}[/] (Optimized for: {threshold_metric})\n"
-                f"[bold cyan]Train Macro-F1:[/]   [bold green]{overall_f1:.4f}[/] (in-sample)\n"
-                f"[bold cyan]Train F1(0):[/]       [bold red]{f1_class_0:.4f}[/]",
-                title="[bold green]✔ Meta-Classifier Blender Fitted[/bold green]",
+                f"[bold cyan]Decision source:[/]  Gemma p_llm (encoder prior upstream)\n"
+                f"[bold cyan]Optimal threshold:[/] [bold yellow]{self.threshold:.3f}[/] "
+                f"(optimized for: {threshold_metric})\n"
+                f"[bold cyan]OOF Macro-F1:[/]     [bold green]{overall_f1:.4f}[/]\n"
+                f"[bold cyan]OOF F1(0):[/]        [bold red]{f1_class_0:.4f}[/]",
+                title="[bold green]✔ Threshold Decision Fitted[/bold green]",
                 border_style="green",
                 expand=False,
             )
@@ -106,73 +60,50 @@ class ScoreBlender:
                 best_threshold = float(threshold)
         return best_threshold, best_score
 
-    def predict(self, p_xlmr, p_llm, has_context, is_c0=None, is_c1=None, is_c2=None):
-        """Calculates blended probability and final binary predictions using the meta-classifier."""
+    def predict(self, p_llm):
+        """Apply tuned threshold to Gemma probabilities."""
+        p_llm = np.asarray(p_llm, dtype=float)
+        threshold = self.threshold if self.is_fitted else 0.5
         if not self.is_fitted:
-            print("Warning: Meta-classifier has not been fitted yet! Returning 50/50 fallback.")
-            p_blend = 0.5 * p_xlmr + 0.5 * p_llm
-            preds = (p_blend >= 0.5).astype(int)
-            return p_blend, preds
-
-        # Fallbacks if categories are not provided
-        if is_c0 is None:
-            is_c0 = np.zeros(len(p_xlmr))
-        if is_c1 is None:
-            is_c1 = np.zeros(len(p_xlmr))
-        if is_c2 is None:
-            is_c2 = np.zeros(len(p_xlmr))
-
-        x = np.stack(
-            [
-                p_xlmr,
-                p_llm,
-                has_context.astype(float),
-                is_c0.astype(float),
-                is_c1.astype(float),
-                is_c2.astype(float),
-            ],
-            axis=1,
-        )
-
-        p_blend = self.model.predict_proba(x)[:, 1]
-        preds = (p_blend >= self.threshold).astype(int)
-        return p_blend, preds
+            print(
+                "Warning: ThresholdDecision has not been fitted yet! Using default threshold=0.5."
+            )
+        preds = (p_llm >= threshold).astype(int)
+        return p_llm, preds
 
     def save(self, filepath="models/blender_config.pkl"):
-        """Saves the meta-classifier state to disk using pickle."""
+        """Save threshold configuration to disk."""
         dirpath = os.path.dirname(filepath)
         if dirpath:
             os.makedirs(dirpath, exist_ok=True)
         with open(filepath, "wb") as f:
             pickle.dump(
                 {
-                    "model": self.model,
                     "threshold": self.threshold,
                     "threshold_metric": self.threshold_metric,
+                    "decision_source": "p_llm",
                 },
                 f,
             )
-        print(f"Saved meta-classifier to {filepath}")
+        print(f"Saved threshold decision config to {filepath}")
 
     def load(self, filepath="models/blender_config.pkl"):
-        """Loads the meta-classifier state from disk."""
-        # Check for legacy JSON file path and adapt
+        """Load threshold configuration from disk."""
         if filepath.endswith(".json"):
             filepath = filepath.replace(".json", ".pkl")
 
         if not os.path.exists(filepath):
-            print(f"Meta-classifier config file {filepath} not found. Fallback to default.")
+            print(f"Threshold config file {filepath} not found. Using default threshold=0.5.")
             return False
 
         with open(filepath, "rb") as f:
             payload = pickle.load(f)
-        if isinstance(payload, dict) and "model" in payload:
-            self.model = payload["model"]
+
+        if isinstance(payload, dict):
             self.threshold = float(payload.get("threshold", 0.5))
             self.threshold_metric = payload.get("threshold_metric", "macro_f1")
         else:
-            self.model = payload
             self.threshold = 0.5
         self.is_fitted = True
-        print(f"Loaded meta-classifier from {filepath} with threshold={self.threshold:.3f}")
+        print(f"Loaded threshold decision from {filepath} with threshold={self.threshold:.3f}")
         return True

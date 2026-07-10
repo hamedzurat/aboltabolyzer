@@ -122,6 +122,9 @@ class GemmaVerifier:
         self.model_name = gemma_config["model_name"]
         self.load_in_4bit = gemma_config["load_in_4bit"]
         self.conf_threshold = gemma_config["confidence_threshold"]
+        self.disagree_threshold = gemma_config.get("disagree_threshold", 0.25)
+        self.force_think_c0_null = gemma_config.get("force_think_c0_null", True)
+        self.force_think_c2 = gemma_config.get("force_think_c2", True)
         self.max_think_tokens = gemma_config["max_think_tokens"]
         self.debug_log_path = "logs/debug_llm_verifier.jsonl"
 
@@ -253,7 +256,74 @@ class GemmaVerifier:
 
         return is_c0, is_c1, is_c2
 
-    def predict_single(self, evidence, prompt_bn, response_bn, silent=True):
+    @staticmethod
+    def _format_encoder_prior(p_xlmr, has_context, evidence):
+        """Build a natural-language XLM-R prior block for Gemma prompts."""
+        if p_xlmr is None:
+            return ""
+
+        p_xlmr = float(p_xlmr)
+        if p_xlmr >= 0.65:
+            verdict_hint = "সম্ভবত Faithful"
+        elif p_xlmr <= 0.35:
+            verdict_hint = "সম্ভবত Hallucinated"
+        else:
+            verdict_hint = "অনিশ্চিত"
+
+        context_note = "প্রদত্ত প্রসঙ্গ আছে" if has_context else "প্রদত্ত প্রসঙ্গ নেই ([NULL])"
+        evidence_note = (
+            "প্রমাণ/তথ্যসূত্র উপলব্ধ"
+            if str(evidence).strip() not in ("[NULL]", "", "None", "nan")
+            else "কোনো প্রমাণ/তথ্যসূত্র নেই"
+        )
+
+        return (
+            f"ক্রস-এনকোডার (XLM-R) ইঙ্গিত:\n"
+            f"- P(Faithful) = {p_xlmr:.2f} → {verdict_hint}\n"
+            f"- {context_note}; {evidence_note}\n"
+            f"এই ইঙ্গিতটি সহায়ক; চূড়ান্ত বিচার তোমার।\n\n"
+        )
+
+    def _should_trigger_think(
+        self,
+        p_fast,
+        p_xlmr,
+        is_c0,
+        is_c2,
+        evidence,
+        think_reasons,
+    ):
+        """Return True if any think trigger fires."""
+        uncertainty = abs(p_fast - 0.5)
+        if uncertainty < self.conf_threshold:
+            think_reasons.append("uncertain_fast_pass")
+            return True
+
+        if p_xlmr is not None and abs(p_fast - float(p_xlmr)) > self.disagree_threshold:
+            think_reasons.append("encoder_disagreement")
+            return True
+
+        evidence_is_null = str(evidence).strip() in ("[NULL]", "", "None", "nan")
+        if self.force_think_c0_null and is_c0 >= 0.5 and evidence_is_null:
+            think_reasons.append("c0_null_evidence")
+            return True
+
+        if self.force_think_c2 and is_c2 >= 0.5:
+            think_reasons.append("c2_time_sensitive")
+            return True
+
+        return False
+
+    def predict_single(
+        self,
+        evidence,
+        prompt_bn,
+        response_bn,
+        p_xlmr=None,
+        has_context=None,
+        silent=True,
+        write_log=True,
+    ):
         if self.model is None:
             self.load_model()
 
@@ -268,7 +338,9 @@ class GemmaVerifier:
             top_k=3,
         )
 
-        # 3. Format prompt with exemplars
+        # 3. Format prompt with exemplars and encoder prior
+        encoder_prior = self._format_encoder_prior(p_xlmr, has_context, evidence)
+
         prompt_exemplars = ""
         for idx, ex in enumerate(exemplars):
             ex_label_str = "F" if ex["label"] == 1 else "H"
@@ -283,6 +355,7 @@ class GemmaVerifier:
         user_content = (
             f"{prompt_exemplars}"
             f"চলতি বিচার্য বিষয়:\n"
+            f"{encoder_prior}"
             f"<evidence>\n{evidence}\n</evidence>\n"
             f"প্রশ্ন: {prompt_bn}\n"
             f"উত্তর: {response_bn}"
@@ -316,26 +389,36 @@ class GemmaVerifier:
 
         p_llm = p_f
 
-        # Check Confidence Gate
-        uncertainty = abs(p_llm - 0.5)
-        triggered_think = False
+        # Check think triggers (uncertainty, encoder disagreement, hard cases)
+        think_reasons = []
+        triggered_think = self._should_trigger_think(
+            p_fast=p_llm,
+            p_xlmr=p_xlmr,
+            is_c0=is_c0,
+            is_c2=is_c2,
+            evidence=evidence,
+            think_reasons=think_reasons,
+        )
         p_llm_no_think = p_llm
-        generated_text = ""  # initialised here so the log block is always safe
+        generated_text = ""
 
-        if uncertainty < self.conf_threshold:
-            triggered_think = True
+        if triggered_think:
             if not silent:
+                reason_str = ", ".join(think_reasons) if think_reasons else "unknown"
                 console.print(
-                    f"[yellow]Uncertain prediction (p_llm={p_llm:.4f}). Triggering thinking pass...[/yellow]"
+                    f"[yellow]Think pass triggered ({reason_str}, p_fast={p_llm:.4f}).[/yellow]"
                 )
 
             think_user_content = (
                 f"{prompt_exemplars}"
                 f"চলতি বিচার্য বিষয়:\n"
+                f"{encoder_prior}"
                 f"<evidence>\n{evidence}\n</evidence>\n"
                 f"প্রশ্ন: {prompt_bn}\n"
                 f"উত্তর: {response_bn}\n"
-                f"বিচার করো এবং নিজের ভাষায় ব্যাখ্যা কর। শেষে অবশ্যই 'verdict: Faithful' অথবা 'verdict: Hallucinated' লিখবে।"
+                f"ক্রস-এনকোডার ইঙ্গিত উপরে দেওয়া আছে; প্রয়োজন হলে তা বাতিল করো।\n"
+                f"বিচার করো এবং নিজের ভাষায় ব্যাখ্যা কর। "
+                f"শেষে অবশ্যই 'verdict: Faithful' অথবা 'verdict: Hallucinated' লিখবে।"
             )
 
             think_messages = [{"role": "user", "content": think_user_content}]
@@ -381,25 +464,33 @@ class GemmaVerifier:
             "evidence": evidence,
             "prompt": prompt_bn,
             "response": response_bn,
+            "p_xlmr": None if p_xlmr is None else float(p_xlmr),
+            "has_context": None if has_context is None else bool(has_context),
             "p_llm_no_think": float(p_llm_no_think),
             "triggered_think": bool(triggered_think),
+            "think_reasons": think_reasons,
             "thinking_cot": generated_text_log,
             "p_llm_final": float(p_llm),
             "is_c0": float(is_c0),
             "is_c1": float(is_c1),
             "is_c2": float(is_c2),
         }
-        os.makedirs(os.path.dirname(self.debug_log_path), exist_ok=True)
-        with open(self.debug_log_path, "a", encoding="utf-8") as lf:
-            lf.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        if write_log:
+            os.makedirs(os.path.dirname(self.debug_log_path), exist_ok=True)
+            with open(self.debug_log_path, "a", encoding="utf-8") as lf:
+                lf.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
-        return p_llm, triggered_think, is_c0, is_c1, is_c2
+        return p_llm, triggered_think
 
-    def predict_dataset(self, df):
+    def predict_dataset(self, df, p_xlmr=None, use_cache=True, debug_log_path=None):
+        active_log_path = debug_log_path or self.debug_log_path
+        original_log_path = self.debug_log_path
+        self.debug_log_path = active_log_path
+
         cache = {}
-        if os.path.exists(self.debug_log_path):
+        if use_cache and os.path.exists(active_log_path):
             try:
-                with open(self.debug_log_path, "r", encoding="utf-8") as lf:
+                with open(active_log_path, "r", encoding="utf-8") as lf:
                     for line in lf:
                         line = line.strip()
                         if not line:
@@ -410,74 +501,84 @@ class GemmaVerifier:
                             cache[key] = (
                                 entry["p_llm_final"],
                                 entry["triggered_think"],
-                                entry.get("is_c0", 0.0),
-                                entry.get("is_c1", 0.0),
-                                entry.get("is_c2", 0.0),
                             )
                         except Exception:
                             continue
                 if cache:
                     console.print(
-                        f"[bold green]Loaded {len(cache)} existing predictions from debug log ({self.debug_log_path}).[/bold green]"
+                        f"[bold green]Loaded {len(cache)} existing predictions from debug log "
+                        f"({active_log_path}).[/bold green]"
                     )
             except Exception as e:
                 console.print(
                     f"[yellow]Could not read existing debug log: {e}. Starting fresh.[/yellow]"
                 )
 
+        if p_xlmr is None:
+            if "p_xlmr" in df.columns:
+                p_xlmr = df["p_xlmr"].values
+            else:
+                p_xlmr = [None] * len(df)
+
+        if "has_context" in df.columns:
+            has_context_values = df["has_context"].values
+        else:
+            has_context_values = (df["context"] != "[NULL]").values
+
         preds = []
-        c0_features = []
-        c1_features = []
-        c2_features = []
         total_rows = len(df)
         think_count = 0
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-        ) as progress:
-            task = progress.add_task(description="Running Gemma Verifier...", total=total_rows)
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+            ) as progress:
+                task = progress.add_task(description="Running Gemma Verifier...", total=total_rows)
 
-            for row_num, (idx, row) in enumerate(df.iterrows(), start=1):
-                evidence = str(row["context"])
-                prompt = str(row["prompt_bn"])
-                response = str(row["response_bn"])
-                key = (prompt, response)
+                for row_num, (idx, row) in enumerate(df.iterrows(), start=1):
+                    evidence = str(row["context"])
+                    prompt = str(row["prompt_bn"])
+                    response = str(row["response_bn"])
+                    row_p_xlmr = p_xlmr[row_num - 1] if p_xlmr is not None else None
+                    row_has_context = bool(has_context_values[row_num - 1])
+                    key = (prompt, response)
 
-                if key in cache:
-                    prob, triggered_think, is_c0, is_c1, is_c2 = cache[key]
-                else:
-                    if self.model is None:
-                        self.load_model()
-                    prob, triggered_think, is_c0, is_c1, is_c2 = self.predict_single(
-                        evidence, prompt, response, silent=True
+                    if use_cache and key in cache:
+                        prob, triggered_think = cache[key]
+                    else:
+                        if self.model is None:
+                            self.load_model()
+                        prob, triggered_think = self.predict_single(
+                            evidence,
+                            prompt,
+                            response,
+                            p_xlmr=row_p_xlmr,
+                            has_context=row_has_context,
+                            silent=True,
+                            write_log=use_cache,
+                        )
+
+                    preds.append(prob)
+
+                    if triggered_think:
+                        think_count += 1
+
+                    progress.update(
+                        task,
+                        description=f"Processed {row_num}/{total_rows} (Think triggers: {think_count})",
                     )
-
-                preds.append(prob)
-                c0_features.append(is_c0)
-                c1_features.append(is_c1)
-                c2_features.append(is_c2)
-
-                if triggered_think:
-                    think_count += 1
-
-                progress.update(
-                    task,
-                    description=f"Processed {row_num}/{total_rows} (Gate triggers: {think_count})",
-                )
-                progress.advance(task)
+                    progress.advance(task)
+        finally:
+            self.debug_log_path = original_log_path
 
         console.print(
-            f"[green]✔ Gemma predictions complete. Gate triggered on {think_count}/{total_rows} rows ({think_count / total_rows * 100:.1f}%).[/green]"
+            f"[green]✔ Gemma predictions complete. Think triggered on "
+            f"{think_count}/{total_rows} rows ({think_count / total_rows * 100:.1f}%).[/green]"
         )
-        return (
-            np.array(preds),
-            np.array(c0_features),
-            np.array(c1_features),
-            np.array(c2_features),
-        )
+        return np.array(preds)
 
 
 def main():
@@ -498,9 +599,8 @@ def main():
     console.print(
         Panel("[bold yellow]🤖 Gemma Verifier Test Phase[/bold yellow]", border_style="yellow")
     )
-    preds, c0, c1, c2 = verifier.predict_dataset(df_sample)
+    preds = verifier.predict_dataset(df_sample)
     console.print(f"Sample predictions: {preds}")
-    console.print(f"Sample categories: C0={c0}, C1={c1}, C2={c2}")
 
 
 if __name__ == "__main__":
