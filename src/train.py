@@ -14,7 +14,12 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from sklearn.model_selection import StratifiedKFold
 
 from src.blender import ThresholdDecision
-from src.config_utils import apply_runtime_settings, fail_on_model_error, validate_config
+from src.config_utils import (
+    apply_runtime_settings,
+    fail_on_model_error,
+    use_llm_verifier,
+    validate_config,
+)
 from src.evaluate import compute_metrics
 from src.llm_verifier import GemmaVerifier
 from src.preprocess import main as run_preprocess
@@ -147,7 +152,7 @@ def main():
     # 4. Fold-isolated OOF Gemma verifier scores (encoder prior from OOF p_xlmr)
     console.print("\n[bold cyan]Step 3: Generating OOF Gemma Verifier Scores[/bold cyan]")
 
-    if config.get("runtime", {}).get("use_llm_verifier", True):
+    if use_llm_verifier(config):
         verifier = GemmaVerifier()
         oof_p_llm = np.zeros(len(train_df))
 

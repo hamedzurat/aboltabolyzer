@@ -14,8 +14,8 @@ num_folds = 10
 # Runtime — which machine profile and verifier mode to use
 # -----------------------------------------------------------------------------
 [runtime]
-# Active hardware profile. Values "8gb" or "16gb" override [xlmr], [gemma],
-# and [rag] with matching [hardware_profiles.*] blocks.
+# Active hardware profile. Values "8gb" or "16gb" override [runtime], [xlmr],
+# [gemma], and [rag] with matching [hardware_profiles.*] blocks.
 hardware_profile = "8gb"
 
 # If true, training/predict abort when Gemma fails instead of faking scores.
@@ -132,6 +132,7 @@ early_stopping_patience = 8
 # -----------------------------------------------------------------------------
 [gemma]
 model_name = "google/gemma-4-E4B-it"
+model_loader = "multimodal_lm"       # "multimodal_lm" or "causal_lm"
 load_in = "4bit"                     # "4bit", "8bit", or "none"
 
 # Load placement. Base defaults are for all-GPU 16GB-style loading.
@@ -190,8 +191,14 @@ threshold_metric = "macro_f1"
 # Saved to models/blender_config.pkl (legacy filename; stores threshold only).
 
 # -----------------------------------------------------------------------------
-# Hardware profile: RTX 5060 8GB — supported int8 Gemma CPU offload
+# Hardware profile: RTX 5060 8GB — smaller text-only Gemma verifier
 # -----------------------------------------------------------------------------
+[hardware_profiles.8gb.runtime]
+# Gemma 4 E4B is not viable on 8GB with this Transformers/Accelerate stack.
+# Use a smaller text-only Gemma verifier instead of disabling Gemma entirely.
+use_llm_verifier = true
+fail_on_model_error = true
+
 [hardware_profiles.8gb.xlmr]
 model_name = "FacebookAI/xlm-roberta-base"
 max_length = 384
@@ -205,16 +212,15 @@ use_amp = false
 early_stopping_patience = 8
 
 [hardware_profiles.8gb.gemma]
-load_in = "8bit"                        # bitsandbytes int8 supports CPU offload; 4bit+auto does not.
-llm_int8_enable_fp32_cpu_offload = true
-device_map = "auto"
-# Keep below total 8GB VRAM so activations, CUDA context, and other allocations
-# have headroom. Lower this if Gemma still OOMs during load.
-cuda_max_memory = "6GiB"
-cpu_max_memory = "48GiB"
+model_name = "google/gemma-3-1b-it"
+model_loader = "causal_lm"
+load_in = "4bit"
+llm_int8_enable_fp32_cpu_offload = false
+device_map = "cuda:0"
+cuda_max_memory = "7GiB"
 max_input_tokens = 1536
-use_inputs_embeds_for_forward = true
-use_language_model_direct = true
+use_inputs_embeds_for_forward = false
+use_language_model_direct = false
 classify_cultural_band = false
 enable_think_pass = false
 exemplar_top_k = 0
@@ -228,6 +234,10 @@ max_seq_length = 512
 # -----------------------------------------------------------------------------
 # Hardware profile: RTX 5060 16GB — full pipeline with Gemma
 # -----------------------------------------------------------------------------
+[hardware_profiles.16gb.runtime]
+use_llm_verifier = true
+fail_on_model_error = true
+
 [hardware_profiles.16gb.xlmr]
 model_name = "FacebookAI/xlm-roberta-large"
 max_length = 512

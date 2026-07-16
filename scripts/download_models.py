@@ -53,6 +53,13 @@ def main():
     if args.include_gemma:
         gemma_config = resolve_section(config, "gemma")
         model_names.append(gemma_config["model_name"])
+        if args.all_profiles:
+            base_gemma = config.get("gemma", {})
+            for profile in config.get("hardware_profiles", {}).values():
+                if "gemma" in profile:
+                    profile_gemma = dict(base_gemma)
+                    profile_gemma.update(profile["gemma"])
+                    model_names.append(profile_gemma.get("model_name"))
 
     os.makedirs(args.models_dir, exist_ok=True)
 

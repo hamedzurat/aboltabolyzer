@@ -18,6 +18,10 @@ def resolve_section(config, section_name):
     return section
 
 
+def resolve_runtime(config):
+    return resolve_section(config, "runtime")
+
+
 def resolve_quantization_mode(gemma_config):
     mode = gemma_config.get("load_in")
     if mode is not None:
@@ -62,6 +66,9 @@ def validate_config(config):
 
     gemma_config = resolve_section(config, "gemma")
     load_in = resolve_quantization_mode(gemma_config)
+    model_loader = gemma_config.get("model_loader", "multimodal_lm")
+    if model_loader not in ("multimodal_lm", "causal_lm"):
+        raise ValueError("gemma.model_loader must be 'multimodal_lm' or 'causal_lm'.")
     device_map = gemma_config.get("device_map")
     int8_offload = bool(gemma_config.get("llm_int8_enable_fp32_cpu_offload", False))
 
@@ -86,13 +93,17 @@ def validate_config(config):
 
 
 def fail_on_model_error(config):
-    return bool(config.get("runtime", {}).get("fail_on_model_error", True))
+    return bool(resolve_runtime(config).get("fail_on_model_error", True))
+
+
+def use_llm_verifier(config):
+    return bool(resolve_runtime(config).get("use_llm_verifier", True))
 
 
 def apply_runtime_settings(config):
     global _INTEROP_THREADS_CONFIGURED
 
-    runtime = config.get("runtime", {})
+    runtime = resolve_runtime(config)
 
     torch_num_threads = int(runtime.get("torch_num_threads", 0) or 0)
     if torch_num_threads > 0:

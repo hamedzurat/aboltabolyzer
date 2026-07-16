@@ -19,7 +19,9 @@ from src.config_utils import (
     apply_runtime_settings,
     fail_on_model_error,
     resolve_quantization_mode,
+    resolve_runtime,
     resolve_section,
+    use_llm_verifier,
     validate_config,
 )
 from src.llm_verifier import GemmaVerifier
@@ -163,7 +165,8 @@ def main():
     predict_config = config.get("predict", {})
     use_checkpoints = bool(predict_config.get("use_checkpoints", True))
     force_recompute = bool(predict_config.get("force_recompute", False))
-    hardware_profile = config.get("runtime", {}).get("hardware_profile", "default")
+    runtime_config = resolve_runtime(config)
+    hardware_profile = runtime_config.get("hardware_profile", "default")
 
     # 1. Load preprocessed test dataset
     test_processed_path = os.path.join(config["data"]["processed_dir"], "test.csv")
@@ -287,17 +290,20 @@ def main():
     console.print("\n[bold cyan]Step 3: Gemma 4 Verifier Inference[/bold cyan]")
     test_df["p_xlmr"] = p_xlmr
     verifier = GemmaVerifier()
-    if config.get("runtime", {}).get("use_llm_verifier", True):
+    if use_llm_verifier(config):
         llm_checkpoint_path = _prediction_checkpoint_path(
             config, "llm_predictions_path", "test_llm_preds.csv"
         )
         p_llm = None
         llm_from_checkpoint = False
         llm_checkpoint_source = "gemma"
+        checkpoint_gemma_config = resolve_section(config, "gemma")
         llm_metadata = {
             "checkpoint_source": "gemma",
             "hardware_profile": hardware_profile,
-            "gemma_load_in": resolve_quantization_mode(resolve_section(config, "gemma")),
+            "gemma_model_name": checkpoint_gemma_config.get("model_name"),
+            "gemma_model_loader": checkpoint_gemma_config.get("model_loader"),
+            "gemma_load_in": resolve_quantization_mode(checkpoint_gemma_config),
         }
         if use_checkpoints and not force_recompute:
             p_llm = _load_prediction_checkpoint(
@@ -423,7 +429,7 @@ def main():
     debug_df["threshold_metric"] = decision.threshold_metric
     debug_df["threshold_margin"] = debug_df["p_final"] - float(decision.threshold)
     debug_df["threshold_abs_margin"] = debug_df["threshold_margin"].abs()
-    debug_df["used_llm_verifier"] = bool(config.get("runtime", {}).get("use_llm_verifier", True))
+    debug_df["used_llm_verifier"] = use_llm_verifier(config)
     debug_df["encoder_disagree"] = (debug_df["p_xlmr"] - debug_df["p_llm"]).abs()
     debug_df["llm_minus_xlmr"] = debug_df["p_llm"] - debug_df["p_xlmr"]
     debug_df["xlmr_label_at_threshold"] = (debug_df["p_xlmr"] >= decision.threshold).astype(int)
@@ -473,6 +479,7 @@ def main():
     debug_df["xlmr_num_workers"] = xlmr_config.get("num_workers")
     debug_df["xlmr_pin_memory"] = xlmr_config.get("pin_memory")
     debug_df["gemma_model_name"] = gemma_config.get("model_name")
+    debug_df["gemma_model_loader"] = gemma_config.get("model_loader")
     debug_df["gemma_device_map"] = gemma_config.get("device_map")
     debug_df["gemma_cuda_max_memory"] = gemma_config.get("cuda_max_memory")
     debug_df["gemma_max_input_tokens"] = gemma_config.get("max_input_tokens")
@@ -589,6 +596,7 @@ def main():
         "xlmr_num_workers",
         "xlmr_pin_memory",
         "gemma_model_name",
+        "gemma_model_loader",
         "gemma_device_map",
         "gemma_cuda_max_memory",
         "gemma_max_input_tokens",

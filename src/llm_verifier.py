@@ -13,7 +13,13 @@ from huggingface_hub.utils import disable_progress_bars
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
-from transformers import AutoModelForMultimodalLM, AutoProcessor, BitsAndBytesConfig
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForMultimodalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
 
 from src.config_utils import resolve_quantization_mode, resolve_section
 
@@ -147,6 +153,7 @@ class GemmaVerifier:
         gemma_config = resolve_section(self.config, "gemma")
 
         self.model_name = gemma_config["model_name"]
+        self.model_loader = gemma_config.get("model_loader", "multimodal_lm")
         self.load_in = resolve_quantization_mode(gemma_config)
         self.device_map = gemma_config.get("device_map", "cuda:0")
         self.cuda_max_memory = gemma_config.get("cuda_max_memory")
@@ -162,7 +169,9 @@ class GemmaVerifier:
         self.exemplar_top_k = int(gemma_config.get("exemplar_top_k", 3))
         self.classify_cultural_band_enabled = gemma_config.get("classify_cultural_band", True)
         self.enable_think_pass = gemma_config.get("enable_think_pass", True)
-        self.use_inputs_embeds_for_forward = gemma_config.get("use_inputs_embeds_for_forward", False)
+        self.use_inputs_embeds_for_forward = gemma_config.get(
+            "use_inputs_embeds_for_forward", False
+        )
         self.use_language_model_direct = gemma_config.get("use_language_model_direct", False)
         self.conf_threshold = gemma_config["confidence_threshold"]
         self.disagree_threshold = gemma_config.get("disagree_threshold", 0.25)
@@ -192,8 +201,16 @@ class GemmaVerifier:
             torch.cuda.ipc_collect()
 
         with Console().status("Initializing processor...", spinner="aesthetic"):
-            self.processor = AutoProcessor.from_pretrained(resolved_name)
-            self.tokenizer = self.processor.tokenizer
+            if self.model_loader == "causal_lm":
+                self.tokenizer = AutoTokenizer.from_pretrained(resolved_name)
+                self.processor = self.tokenizer
+            elif self.model_loader == "multimodal_lm":
+                self.processor = AutoProcessor.from_pretrained(resolved_name)
+                self.tokenizer = self.processor.tokenizer
+            else:
+                raise ValueError(
+                    "gemma.model_loader must be 'causal_lm' or 'multimodal_lm'."
+                )
 
             f_variants = ["F", " F", "faithful", " Faithful"]
             h_variants = ["H", " H", "hallucinated", " Hallucinated"]
@@ -252,7 +269,12 @@ class GemmaVerifier:
         with Console().status(
             "Loading weights (this may take a few minutes)...", spinner="bouncingBar"
         ):
-            self.model = AutoModelForMultimodalLM.from_pretrained(resolved_name, **load_kwargs)
+            model_class = (
+                AutoModelForCausalLM
+                if self.model_loader == "causal_lm"
+                else AutoModelForMultimodalLM
+            )
+            self.model = model_class.from_pretrained(resolved_name, **load_kwargs)
             self.model.eval()
             self.input_device = self._infer_input_device()
             if self.use_language_model_direct and not (
