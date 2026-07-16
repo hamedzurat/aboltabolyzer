@@ -29,6 +29,60 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 console = Console()
 
 
+def _prediction_checkpoint_path(config, key, default_filename):
+    predict_config = config.get("predict", {})
+    configured_path = predict_config.get(key)
+    if configured_path:
+        return configured_path
+    return os.path.join(config["data"]["processed_dir"], default_filename)
+
+
+def _load_prediction_checkpoint(path, expected_len, column, expected_ids=None):
+    if not os.path.exists(path):
+        return None
+    try:
+        checkpoint_df = pd.read_csv(path)
+    except Exception as e:
+        console.print(f"[yellow]Could not read prediction checkpoint {path}: {e}[/yellow]")
+        return None
+
+    if column not in checkpoint_df.columns:
+        console.print(f"[yellow]Ignoring {path}; missing column '{column}'.[/yellow]")
+        return None
+    if len(checkpoint_df) != expected_len:
+        console.print(
+            f"[yellow]Ignoring {path}; expected {expected_len} rows, found "
+            f"{len(checkpoint_df)}.[/yellow]"
+        )
+        return None
+    if expected_ids is not None and "id" in checkpoint_df.columns:
+        checkpoint_ids = checkpoint_df["id"].astype(str).tolist()
+        current_ids = pd.Series(expected_ids).astype(str).tolist()
+        if checkpoint_ids != current_ids:
+            console.print(
+                f"[yellow]Ignoring {path}; checkpoint ids do not match test ids.[/yellow]"
+            )
+            return None
+
+    values = checkpoint_df[column].to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        console.print(f"[yellow]Ignoring {path}; found non-finite predictions.[/yellow]")
+        return None
+    console.print(f"[bold green]Loaded checkpointed {column} from {path}.[/bold green]")
+    return values
+
+
+def _save_prediction_checkpoint(path, ids, column, values):
+    checkpoint_dir = os.path.dirname(path)
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_df = pd.DataFrame({column: values})
+    if ids is not None:
+        checkpoint_df.insert(0, "id", ids)
+    checkpoint_df.to_csv(path, index=False)
+    console.print(f"[green]Saved {column} checkpoint to {path}.[/green]")
+
+
 def build_rag_query(row, query_mode):
     if query_mode == "prompt_response":
         return f"{row['prompt_bn']} {row['response_bn']}"
@@ -77,6 +131,9 @@ def main():
 
     with open("configs/config.toml", "rb") as f:
         config = tomllib.load(f)
+    predict_config = config.get("predict", {})
+    use_checkpoints = bool(predict_config.get("use_checkpoints", True))
+    force_recompute = bool(predict_config.get("force_recompute", False))
 
     # 1. Load preprocessed test dataset
     test_processed_path = os.path.join(config["data"]["processed_dir"], "test.csv")
@@ -161,7 +218,19 @@ def main():
 
     # 3. Predict with XLM-RoBERTa Cross-Encoder
     console.print("\n[bold cyan]Step 2: XLM-RoBERTa Ensemble Inference[/bold cyan]")
-    p_xlmr = predict_test(test_df, config)
+    ids = test_df["id"] if "id" in test_df.columns else None
+    xlmr_checkpoint_path = _prediction_checkpoint_path(
+        config, "xlmr_predictions_path", "test_xlmr_preds.csv"
+    )
+    p_xlmr = None
+    if use_checkpoints and not force_recompute:
+        p_xlmr = _load_prediction_checkpoint(
+            xlmr_checkpoint_path, len(test_df), "p_xlmr", expected_ids=ids
+        )
+    if p_xlmr is None:
+        p_xlmr = predict_test(test_df, config)
+        if use_checkpoints:
+            _save_prediction_checkpoint(xlmr_checkpoint_path, ids, "p_xlmr", p_xlmr)
 
     # Clean up GPU memory after Cross-Encoder prediction
     gc.collect()
@@ -174,37 +243,59 @@ def main():
     test_df["p_xlmr"] = p_xlmr
     verifier = GemmaVerifier()
     if config.get("runtime", {}).get("use_llm_verifier", True):
-        try:
-            verifier.load_model()
-            if not verifier.exemplar_retriever.load_index():
-                train_evidence_path = os.path.join(
-                    config["data"]["processed_dir"], "train_with_evidence.csv"
-                )
-                if os.path.exists(train_evidence_path):
-                    train_df = pd.read_csv(train_evidence_path)
-                    if "label" in train_df.columns:
-                        console.print(
-                            "[yellow]Exemplar index missing; rebuilding from labeled train data.[/yellow]"
-                        )
-                        verifier.exemplar_retriever.build_index(train_df)
-            p_llm = verifier.predict_dataset(
-                test_df,
-                p_xlmr=p_xlmr,
-                use_cache=True,
+        llm_checkpoint_path = _prediction_checkpoint_path(
+            config, "llm_predictions_path", "test_llm_preds.csv"
+        )
+        p_llm = None
+        if use_checkpoints and not force_recompute:
+            p_llm = _load_prediction_checkpoint(
+                llm_checkpoint_path, len(test_df), "p_llm", expected_ids=ids
             )
-        except Exception as e:
-            if fail_on_model_error(config):
-                raise RuntimeError("Gemma verifier failed; refusing to submit fake scores.") from e
-            console.print(f"[bold red]Failed to run Gemma verifier on test set: {e}[/bold red]")
+        if p_llm is not None:
             console.print(
-                "[yellow]Falling back to XLM-R-only scores because fail_on_model_error=false.[/yellow]"
+                "[bold green]Skipping Gemma; verifier checkpoint is complete.[/bold green]"
             )
-            p_llm = p_xlmr.copy()
+        else:
+            try:
+                verifier.load_model()
+                if verifier.exemplar_top_k > 0 and not verifier.exemplar_retriever.load_index():
+                    train_evidence_path = os.path.join(
+                        config["data"]["processed_dir"], "train_with_evidence.csv"
+                    )
+                    if os.path.exists(train_evidence_path):
+                        train_df = pd.read_csv(train_evidence_path)
+                        if "label" in train_df.columns:
+                            console.print(
+                                "[yellow]Exemplar index missing; rebuilding from labeled train data.[/yellow]"
+                            )
+                            verifier.exemplar_retriever.build_index(train_df)
+                p_llm = verifier.predict_dataset(
+                    test_df,
+                    p_xlmr=p_xlmr,
+                    use_cache=True,
+                )
+                if use_checkpoints:
+                    _save_prediction_checkpoint(llm_checkpoint_path, ids, "p_llm", p_llm)
+            except Exception as e:
+                if fail_on_model_error(config):
+                    raise RuntimeError(
+                        "Gemma verifier failed; refusing to submit fake scores."
+                    ) from e
+                console.print(f"[bold red]Failed to run Gemma verifier on test set: {e}[/bold red]")
+                console.print(
+                    "[yellow]Falling back to XLM-R-only scores because fail_on_model_error=false.[/yellow]"
+                )
+                p_llm = p_xlmr.copy()
     else:
         console.print(
             "[yellow]LLM verifier disabled. Using XLM-R scores as Gemma fallback.[/yellow]"
         )
         p_llm = p_xlmr.copy()
+        llm_checkpoint_path = _prediction_checkpoint_path(
+            config, "llm_predictions_path", "test_llm_preds.csv"
+        )
+        if use_checkpoints:
+            _save_prediction_checkpoint(llm_checkpoint_path, ids, "p_llm", p_llm)
 
     test_df["p_llm"] = p_llm
     test_df.to_csv(

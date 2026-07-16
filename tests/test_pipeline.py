@@ -4,8 +4,12 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import numpy as np
+import pandas as pd
 
 from src.blender import ThresholdDecision
+from src.config_utils import resolve_section
+from src.llm_verifier import _resolve_torch_dtype
+from src.predict import _load_prediction_checkpoint, _save_prediction_checkpoint
 from src.preprocess import clean_text
 
 
@@ -62,6 +66,53 @@ def test_threshold_decision_unfitted_default():
 
     assert np.allclose(p_final, p_llm)
     assert list(preds) == [1, 0, 1]
+
+
+def test_hardware_profile_overlays_gemma_memory_settings():
+    config = {
+        "runtime": {"hardware_profile": "8gb"},
+        "gemma": {
+            "device_map": "cuda:0",
+            "cuda_max_memory": "14GiB",
+            "exemplar_top_k": 3,
+        },
+        "hardware_profiles": {
+            "8gb": {
+                "gemma": {
+                    "device_map": "auto",
+                    "cuda_max_memory": "6GiB",
+                    "exemplar_top_k": 0,
+                }
+            }
+        },
+    }
+
+    gemma_config = resolve_section(config, "gemma")
+
+    assert gemma_config["device_map"] == "auto"
+    assert gemma_config["cuda_max_memory"] == "6GiB"
+    assert gemma_config["exemplar_top_k"] == 0
+
+
+def test_prediction_checkpoint_round_trip(tmp_path):
+    checkpoint_path = tmp_path / "test_llm_preds.csv"
+    ids = pd.Series([101, 102, 103])
+    values = np.array([0.1, 0.9, 0.4])
+
+    _save_prediction_checkpoint(str(checkpoint_path), ids, "p_llm", values)
+    loaded = _load_prediction_checkpoint(str(checkpoint_path), 3, "p_llm")
+
+    assert np.allclose(loaded, values)
+    assert _load_prediction_checkpoint(str(checkpoint_path), 4, "p_llm") is None
+
+
+def test_resolve_torch_dtype_rejects_unknown_dtype():
+    import pytest
+    import torch
+
+    assert _resolve_torch_dtype("bf16", torch.float32) is torch.bfloat16
+    with pytest.raises(ValueError):
+        _resolve_torch_dtype("tinyfloat", torch.float32)
 
 
 def test_dense_rag():

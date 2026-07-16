@@ -26,6 +26,21 @@ fail_on_model_error = true
 use_llm_verifier = true
 
 # -----------------------------------------------------------------------------
+# Prediction checkpoints — resume `just predict` after OOMs/interruptions
+# -----------------------------------------------------------------------------
+[predict]
+# If true, prediction reuses completed stage CSVs instead of recomputing.
+use_checkpoints = true
+
+# Set true for a one-off clean prediction run without deleting checkpoint files.
+force_recompute = false
+
+# Stage-level prediction checkpoints. `test_with_evidence.csv` and the Gemma
+# JSONL debug log are also resumable caches.
+xlmr_predictions_path = "dataset/processed/test_xlmr_preds.csv"
+llm_predictions_path = "dataset/processed/test_llm_preds.csv"
+
+# -----------------------------------------------------------------------------
 # Data paths
 # -----------------------------------------------------------------------------
 [data]
@@ -106,6 +121,24 @@ early_stopping_patience = 8
 model_name = "google/gemma-4-E4B-it"
 load_in_4bit = true
 
+# Load placement. 16GB can use "cuda:0"; 8GB should use "auto" with CPU offload.
+device_map = "cuda:0"
+cuda_max_memory = "14GiB"
+cpu_max_memory = "32GiB"
+offload_folder = "models/offload/gemma"
+
+# Quant/compute dtype knobs. 8GB can switch to float16 if bf16 is unstable.
+torch_dtype = "bfloat16"
+bnb_4bit_compute_dtype = "bfloat16"
+clear_cuda_before_load = true
+
+# Truncate Gemma inputs before they get too large. Null means tokenizer default.
+max_input_tokens = 3072
+
+# Dynamic few-shot examples. Lower this to reduce prompt length and avoid loading
+# the exemplar embedding model during prediction.
+exemplar_top_k = 3
+
 # Think trigger: fast F/H logit pass is uncertain when |p_fast - 0.5| < this value.
 confidence_threshold = 0.15
 
@@ -133,7 +166,7 @@ threshold_metric = "macro_f1"
 # Saved to models/blender_config.pkl (legacy filename; stores threshold only).
 
 # -----------------------------------------------------------------------------
-# Hardware profile: RTX 5060 8GB — fast iteration, XLM-R-only debug
+# Hardware profile: RTX 5060 8GB — low-VRAM Gemma with CPU offload
 # -----------------------------------------------------------------------------
 [hardware_profiles.8gb.xlmr]
 model_name = "FacebookAI/xlm-roberta-base"
@@ -144,6 +177,11 @@ use_amp = false
 early_stopping_patience = 8
 
 [hardware_profiles.8gb.gemma]
+device_map = "auto"
+cuda_max_memory = "6GiB"
+cpu_max_memory = "48GiB"
+max_input_tokens = 1536
+exemplar_top_k = 0
 max_think_tokens = 128
 
 [hardware_profiles.8gb.rag]
@@ -161,6 +199,10 @@ grad_accum_steps = 4
 use_amp = true
 
 [hardware_profiles.16gb.gemma]
+device_map = "cuda:0"
+cuda_max_memory = "14GiB"
+max_input_tokens = 3072
+exemplar_top_k = 3
 max_think_tokens = 256
 
 [hardware_profiles.16gb.rag]

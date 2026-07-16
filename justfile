@@ -68,9 +68,9 @@ prepare-lite: download-models
 [group('workflows')]
 first-run-16gb: sync prepare-full preprocess train predict
 
-[doc('8GB first run: sync → lite assets → preprocess → fresh train → predict (no Gemma)')]
+[doc('8GB first run: sync → full assets → preprocess → fresh train → predict (low-VRAM Gemma)')]
 [group('workflows')]
-first-run-8gb: sync prepare-lite preprocess train predict
+first-run-8gb: sync prepare-full preprocess train predict
 
 [doc('Full pipeline: preprocess → fresh train → predict')]
 [group('workflows')]

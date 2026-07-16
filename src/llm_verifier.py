@@ -26,6 +26,23 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 console = Console()
 
 
+def _resolve_torch_dtype(dtype_name, default):
+    if dtype_name in (None, "auto"):
+        return default
+    dtype_map = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    try:
+        return dtype_map[str(dtype_name).lower()]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported torch dtype in config: {dtype_name}") from exc
+
+
 class ExemplarRetriever:
     """Retrieves dynamic, leakage-free training exemplars for in-context learning (few-shot)."""
 
@@ -131,6 +148,15 @@ class GemmaVerifier:
 
         self.model_name = gemma_config["model_name"]
         self.load_in_4bit = gemma_config["load_in_4bit"]
+        self.device_map = gemma_config.get("device_map", "cuda:0")
+        self.cuda_max_memory = gemma_config.get("cuda_max_memory")
+        self.cpu_max_memory = gemma_config.get("cpu_max_memory", "32GiB")
+        self.offload_folder = gemma_config.get("offload_folder", "models/offload/gemma")
+        self.torch_dtype_name = gemma_config.get("torch_dtype", "bfloat16")
+        self.bnb_compute_dtype_name = gemma_config.get("bnb_4bit_compute_dtype", "bfloat16")
+        self.clear_cuda_before_load = gemma_config.get("clear_cuda_before_load", True)
+        self.max_input_tokens = gemma_config.get("max_input_tokens")
+        self.exemplar_top_k = int(gemma_config.get("exemplar_top_k", 3))
         self.conf_threshold = gemma_config["confidence_threshold"]
         self.disagree_threshold = gemma_config.get("disagree_threshold", 0.25)
         self.force_think_c0_null = gemma_config.get("force_think_c0_null", True)
@@ -153,6 +179,9 @@ class GemmaVerifier:
 
         resolved_name = resolve_model_path(self.model_name)
         console.print(f"[bold cyan]Loading Gemma 4 verifier model:[/bold cyan] {self.model_name}")
+        if self.clear_cuda_before_load and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
         with Console().status("Initializing processor...", spinner="aesthetic"):
             self.processor = AutoProcessor.from_pretrained(resolved_name)
@@ -180,23 +209,57 @@ class GemmaVerifier:
         if self.load_in_4bit and torch.cuda.is_available():
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=_resolve_torch_dtype(
+                    self.bnb_compute_dtype_name, torch.bfloat16
+                ),
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
             )
 
+        torch_dtype = _resolve_torch_dtype(
+            self.torch_dtype_name,
+            torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        )
+        load_kwargs = {
+            "quantization_config": quant_config,
+            "torch_dtype": torch_dtype,
+            "low_cpu_mem_usage": True,
+        }
+        if torch.cuda.is_available():
+            load_kwargs["device_map"] = self.device_map
+            if self.device_map == "auto":
+                max_memory = {"cpu": self.cpu_max_memory}
+                if self.cuda_max_memory:
+                    max_memory[0] = self.cuda_max_memory
+                load_kwargs["max_memory"] = max_memory
+                load_kwargs["offload_folder"] = self.offload_folder
+        else:
+            load_kwargs["device_map"] = None
+
         with Console().status(
             "Loading weights (this may take a few minutes)...", spinner="bouncingBar"
         ):
-            self.model = AutoModelForMultimodalLM.from_pretrained(
-                resolved_name,
-                quantization_config=quant_config,
-                device_map="cuda:0" if torch.cuda.is_available() else None,
-                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-            )
+            self.model = AutoModelForMultimodalLM.from_pretrained(resolved_name, **load_kwargs)
             self.model.eval()
 
         console.print("[green]✔ Gemma 4 model loaded successfully![/green]")
+
+    def _prepare_inputs(self, prompt):
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        original_truncation_side = getattr(tokenizer, "truncation_side", None)
+        if tokenizer is not None and self.max_input_tokens is not None:
+            tokenizer.truncation_side = "left"
+        try:
+            inputs = self.processor(
+                text=prompt,
+                return_tensors="pt",
+                truncation=self.max_input_tokens is not None,
+                max_length=self.max_input_tokens,
+            )
+        finally:
+            if tokenizer is not None and original_truncation_side is not None:
+                tokenizer.truncation_side = original_truncation_side
+        return {k: v.to(self.model.device) for k, v in inputs.items()}
 
     def predict_cultural_band(self, prompt_bn):
         """Classifies the prompt into C0, C1, or C2 based on next-token logits."""
@@ -220,8 +283,7 @@ class GemmaVerifier:
         )
         prompt += "C"  # Pre-fill assistant response with "C" so the next token is exactly "0", "1", or "2"!
 
-        inputs = self.processor(text=prompt, return_tensors="pt")
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        inputs = self._prepare_inputs(prompt)
 
         with torch.no_grad():
             outputs = self.model(**inputs)
@@ -341,12 +403,15 @@ class GemmaVerifier:
         is_c0, is_c1, is_c2 = self.predict_cultural_band(prompt_bn)
 
         # 2. Retrieve training exemplars for dynamic few-shot prompting
-        exemplars = self.exemplar_retriever.retrieve_exemplars(
-            query=f"{prompt_bn} {response_bn}",
-            exclude_prompt=prompt_bn,
-            exclude_response=response_bn,
-            top_k=3,
-        )
+        if self.exemplar_top_k > 0:
+            exemplars = self.exemplar_retriever.retrieve_exemplars(
+                query=f"{prompt_bn} {response_bn}",
+                exclude_prompt=prompt_bn,
+                exclude_response=response_bn,
+                top_k=self.exemplar_top_k,
+            )
+        else:
+            exemplars = []
 
         # 3. Format prompt with exemplars and encoder prior
         encoder_prior = self._format_encoder_prior(p_xlmr, has_context, evidence)
@@ -378,8 +443,7 @@ class GemmaVerifier:
         # Append target prefix completion so the model continues directly after the prompt
         prompt += "বিচার (F/H):"
 
-        inputs = self.processor(text=prompt, return_tensors="pt")
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        inputs = self._prepare_inputs(prompt)
 
         with torch.no_grad():
             outputs = self.model(**inputs)
@@ -436,8 +500,7 @@ class GemmaVerifier:
                 think_messages, tokenize=False, add_generation_prompt=True
             )
 
-            think_inputs = self.processor(text=think_prompt, return_tensors="pt")
-            think_inputs = {k: v.to(self.model.device) for k, v in think_inputs.items()}
+            think_inputs = self._prepare_inputs(think_prompt)
 
             with torch.no_grad():
                 gen_outputs = self.model.generate(

@@ -138,17 +138,23 @@ just run                      # preprocess + fresh train + predict
 
 ---
 
-### Profile B — 8GB XLM-R debug (no Gemma)
+### Profile B — 8GB low-VRAM Gemma
 
-**Machine:** RTX 5060 8GB or any GPU too small for Gemma + XLM-R together.
+**Machine:** RTX 5060 mobile 8GB or any GPU too small for all-GPU Gemma.
 
 **Set in `configs/config.toml`:**
 
 ```toml
 [runtime]
 hardware_profile = "8gb"
-use_llm_verifier = false
+use_llm_verifier = true
 fail_on_model_error = true
+
+[hardware_profiles.8gb.gemma]
+device_map = "auto"
+cuda_max_memory = "6GiB"
+max_input_tokens = 1536
+exemplar_top_k = 0
 
 [hardware_profiles.8gb.rag]
 batch_size = 32
@@ -161,7 +167,19 @@ max_seq_length = 512
 just first-run-8gb
 ```
 
-Or step by step: `just sync` → `just prepare-lite` → `just preprocess` → `just train` → `just predict`
+Or step by step: `just sync` → `just prepare-full` → `just preprocess` → `just train` → `just predict`
+
+This profile keeps Gemma in 4-bit but lets Transformers/Accelerate offload model
+parts to CPU RAM, caps CUDA placement to leave headroom, truncates long prompts,
+and disables dynamic exemplars during prediction. It is slower than the 16GB
+profile, but it should resume cleanly if the run is interrupted.
+
+For a pure XLM-R debug run, set:
+
+```toml
+[runtime]
+use_llm_verifier = false
+```
 
 > **Tip:** `just train` always wipes `models/xlmr/` and retrains from scratch.
 > Use `just train-continue` to resume — it skips folds whose checkpoint already exists.
@@ -189,9 +207,23 @@ Compare `submission_debug.csv` columns `n_retrieved`, `retrieval_sim_max`, `rag_
 | Symptom          | Fix                                                                                   |
 | ---------------- | ------------------------------------------------------------------------------------- |
 | XLM-R OOM        | Lower `batch_size` or `max_length` in active hardware profile (`configs/config.toml`) |
-| Gemma OOM        | Reduce `max_think_tokens` in config                                                   |
+| Gemma OOM        | Use the `8gb` profile, lower `cuda_max_memory`, `max_input_tokens`, `max_think_tokens`, or set `exemplar_top_k = 0` |
 | RAG Indexing OOM | Lower `batch_size` or `max_seq_length` in `[rag]` or profile-specific `[hardware_profiles.<profile>.rag]` section |
 | Stale RAG scores | `just clean-rag-cache` then re-run `just train` / `just predict`                      |
+
+### Prediction resume
+
+`just predict` writes stage checkpoints:
+
+| File                                      | Stage                                      |
+| ----------------------------------------- | ------------------------------------------ |
+| `dataset/processed/test_with_evidence.csv`| RAG-filled test contexts                   |
+| `dataset/processed/test_xlmr_preds.csv`   | XLM-R ensemble probabilities               |
+| `logs/debug_llm_verifier.jsonl`           | Row-level Gemma verifier cache             |
+| `dataset/processed/test_llm_preds.csv`    | Complete Gemma probability vector          |
+
+Leave `[predict].use_checkpoints = true` to resume after an OOM or interruption.
+Set `[predict].force_recompute = true` for one clean rerun without deleting files.
 
 ---
 
@@ -204,7 +236,7 @@ Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **c
 | Command               | What it does                                                            |
 | --------------------- | ----------------------------------------------------------------------- |
 | `just first-run-16gb` | sync → prepare-full → preprocess → **fresh train** → predict            |
-| `just first-run-8gb`  | sync → prepare-lite → preprocess → **fresh train** → predict (no Gemma) |
+| `just first-run-8gb`  | sync → prepare-full → preprocess → **fresh train** → predict (low-VRAM Gemma) |
 | `just run`            | preprocess → fresh train → predict                                      |
 | `just submit`         | **fresh train** → predict (data already preprocessed)                   |
 | `just submit-continue`| resume existing checkpoints → predict                                   |
