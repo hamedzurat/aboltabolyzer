@@ -29,12 +29,18 @@ class BanglaRAG:
         with open(config_path, "rb") as f:
             self.config = tomllib.load(f)
 
-        self.corpus_dir = self.config["rag"]["corpus_dir"]
-        self.index_path = self.config["rag"]["index_path"]
-        self.model_name = self.config["rag"]["model_name"]
-        self.top_k = self.config["rag"]["top_k"]
-        self.similarity_threshold = self.config["rag"].get("similarity_threshold", 0.5)
-        self.max_evidence_tokens = self.config["rag"].get("max_evidence_tokens", 512)
+        from src.config_utils import resolve_section
+
+        self.rag_config = resolve_section(self.config, "rag")
+
+        self.corpus_dir = self.rag_config["corpus_dir"]
+        self.index_path = self.rag_config["index_path"]
+        self.model_name = self.rag_config["model_name"]
+        self.top_k = self.rag_config["top_k"]
+        self.similarity_threshold = self.rag_config.get("similarity_threshold", 0.5)
+        self.max_evidence_tokens = self.rag_config.get("max_evidence_tokens", 512)
+        self.batch_size = self.rag_config.get("batch_size", 32)
+        self.max_seq_length = self.rag_config.get("max_seq_length", None)
 
         self.model = None
         self.passages = []
@@ -47,6 +53,10 @@ class BanglaRAG:
             resolved_path = resolve_model_path(self.model_name)
             with Console().status("Loading SentenceTransformer model...", spinner="aesthetic"):
                 self.model = SentenceTransformer(resolved_path)
+            if self.max_seq_length is not None:
+                self.model.max_seq_length = self.max_seq_length
+            if self.model.device.type == "cuda":
+                self.model = self.model.half()
 
     def load_corpus(self):
         passages = []
@@ -77,6 +87,9 @@ class BanglaRAG:
                             except json.JSONDecodeError:
                                 continue
                 progress.advance(task)
+
+        # Sort passages by length to optimize encoder performance
+        passages = sorted(passages, key=len)
         return passages
 
     def build_index(self):
@@ -92,8 +105,33 @@ class BanglaRAG:
 
         self.load_model()
 
-        batch_size = 128
-        self.embeddings = []
+        import math
+
+        chunk_size = 5000
+        num_chunks = math.ceil(total_p / chunk_size)
+        chunks_dir = os.path.join(os.path.dirname(self.index_path), "chunks")
+        os.makedirs(chunks_dir, exist_ok=True)
+
+        embeddings_chunks = [None] * num_chunks
+        completed_chunks = 0
+
+        for chunk_idx in range(num_chunks):
+            chunk_file = os.path.join(chunks_dir, f"chunk_{chunk_idx}.pkl")
+            if os.path.exists(chunk_file):
+                try:
+                    with open(chunk_file, "rb") as f:
+                        chunk_data = pickle.load(f)
+                        embeddings_chunks[chunk_idx] = chunk_data["embeddings"]
+                        completed_chunks += 1
+                except Exception:
+                    os.remove(chunk_file)
+
+        if completed_chunks > 0:
+            console.print(
+                f"Found [bold green]{completed_chunks}/{num_chunks}[/bold green] already completed chunks. Resuming..."
+            )
+
+        batch_size = self.batch_size
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -101,21 +139,48 @@ class BanglaRAG:
             TaskProgressColumn(),
             transient=True,
         ) as progress:
-            task = progress.add_task(description="Encoding passages...", total=total_p)
-            for i in range(0, total_p, batch_size):
-                batch = self.passages[i : i + batch_size]
-                batch_embeddings = self.model.encode(
-                    batch, show_progress_bar=False, normalize_embeddings=True
-                )
-                self.embeddings.append(batch_embeddings)
-                progress.advance(task, len(batch))
+            task = progress.add_task(description="Encoding passages...", total=num_chunks)
+            progress.advance(task, completed_chunks)
 
-        self.embeddings = np.vstack(self.embeddings)
+            for chunk_idx in range(num_chunks):
+                if embeddings_chunks[chunk_idx] is not None:
+                    continue
+
+                start_idx = chunk_idx * chunk_size
+                end_idx = min(start_idx + chunk_size, total_p)
+                chunk_passages = self.passages[start_idx:end_idx]
+
+                chunk_embeddings = self.model.encode(
+                    chunk_passages,
+                    show_progress_bar=False,
+                    normalize_embeddings=True,
+                    batch_size=batch_size,
+                )
+
+                chunk_file = os.path.join(chunks_dir, f"chunk_{chunk_idx}.pkl")
+                with open(chunk_file, "wb") as f:
+                    pickle.dump({"embeddings": chunk_embeddings}, f)
+
+                embeddings_chunks[chunk_idx] = chunk_embeddings
+                progress.advance(task, 1)
+
+        console.print("Merging all chunks...")
+        self.embeddings = np.vstack(embeddings_chunks)
 
         console.print(f"Saving index to [italic]{self.index_path}[/italic]...")
         os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
         with open(self.index_path, "wb") as f:
             pickle.dump({"passages": self.passages, "embeddings": self.embeddings}, f)
+
+        # Cleanup chunk files
+        try:
+            for chunk_idx in range(num_chunks):
+                chunk_file = os.path.join(chunks_dir, f"chunk_{chunk_idx}.pkl")
+                if os.path.exists(chunk_file):
+                    os.remove(chunk_file)
+            os.rmdir(chunks_dir)
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not clean up temporary chunks: {e}[/yellow]")
 
         console.print(
             Panel(

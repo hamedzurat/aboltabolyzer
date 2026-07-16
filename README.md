@@ -102,6 +102,10 @@ Pick one profile, edit **`configs/config.toml` `[runtime]`**, then run the comma
 hardware_profile = "16gb"
 use_llm_verifier = true
 fail_on_model_error = true
+
+[hardware_profiles.16gb.rag]
+batch_size = 64
+max_seq_length = 512
 ```
 
 **Commands (first time):**
@@ -143,6 +147,10 @@ just run                      # preprocess + train + predict
 hardware_profile = "8gb"
 use_llm_verifier = false
 fail_on_model_error = true
+
+[hardware_profiles.8gb.rag]
+batch_size = 32
+max_seq_length = 512
 ```
 
 **Commands:**
@@ -177,6 +185,7 @@ Compare `submission_debug.csv` columns `n_retrieved`, `retrieval_sim_max`, `rag_
 | ---------------- | ------------------------------------------------------------------------------------- |
 | XLM-R OOM        | Lower `batch_size` or `max_length` in active hardware profile (`configs/config.toml`) |
 | Gemma OOM        | Reduce `max_think_tokens` in config                                                   |
+| RAG Indexing OOM | Lower `batch_size` or `max_seq_length` in `[rag]` or profile-specific `[hardware_profiles.<profile>.rag]` section |
 | Stale RAG scores | `just clean-rag-cache` then re-run `just train` / `just predict`                      |
 
 ---

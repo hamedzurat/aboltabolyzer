@@ -2,7 +2,6 @@
 # Run `just` to list recipes by group. Config: configs/config.toml
 
 export PYTHONPATH := "."
-export HF_HUB_ENABLE_HF_TRANSFER := "1"
 
 default:
     @just --list
@@ -105,6 +104,7 @@ predict:
 [group('cache')]
 clean-rag-cache:
     rm -f dataset/processed/train_with_evidence.csv dataset/processed/test_with_evidence.csv
+    rm -rf indexes/dense_index.pkl indexes/exemplar_index.pkl indexes/chunks/
 
 [doc('Remove all dataset/processed intermediates (keeps raw data in dataset/)')]
 [group('cache')]

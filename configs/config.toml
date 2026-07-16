@@ -16,7 +16,7 @@ num_folds = 5
 [runtime]
 # Active hardware profile. Values "8gb" or "16gb" override [xlmr] and [gemma]
 # sections below with matching [hardware_profiles.*] blocks.
-hardware_profile = "16gb"
+hardware_profile = "8gb"
 
 # If true, training/predict abort when Gemma fails instead of faking scores.
 fail_on_model_error = true
@@ -71,6 +71,12 @@ similarity_threshold = 0.5
 #   "prompt"          — question only (default; safer for hallucination detection)
 #   "prompt_response" — question + answer (experimental; can retrieve false-claim evidence)
 query_mode = "prompt"
+
+# Batch size for SentenceTransformer encoding (prevents OOM on smaller GPUs).
+batch_size = 32
+
+# Max sequence length for the embedding model to limit GPU memory usage.
+max_seq_length = 512
 
 # -----------------------------------------------------------------------------
 # XLM-R cross-encoder (defaults; overridden by active hardware_profile)
@@ -135,6 +141,10 @@ use_amp = true
 [hardware_profiles.8gb.gemma]
 max_think_tokens = 128
 
+[hardware_profiles.8gb.rag]
+batch_size = 32
+max_seq_length = 512
+
 # -----------------------------------------------------------------------------
 # Hardware profile: RTX 5060 16GB — full pipeline with Gemma
 # -----------------------------------------------------------------------------
@@ -147,3 +157,7 @@ use_amp = true
 
 [hardware_profiles.16gb.gemma]
 max_think_tokens = 256
+
+[hardware_profiles.16gb.rag]
+batch_size = 64
+max_seq_length = 512

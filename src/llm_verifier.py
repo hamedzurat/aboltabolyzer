@@ -31,8 +31,11 @@ class ExemplarRetriever:
 
     def __init__(self, config):
         self.config = config
-        self.model_name = config["rag"]["model_name"]
-        self.exemplar_path = config["rag"]["exemplar_index_path"]
+        self.rag_config = resolve_section(config, "rag")
+        self.model_name = self.rag_config["model_name"]
+        self.exemplar_path = self.rag_config["exemplar_index_path"]
+        self.batch_size = self.rag_config.get("batch_size", 32)
+        self.max_seq_length = self.rag_config.get("max_seq_length", None)
         self.model = None
         self.exemplars = []
         self.embeddings = None
@@ -45,6 +48,10 @@ class ExemplarRetriever:
 
             resolved_path = resolve_model_path(self.model_name)
             self.model = SentenceTransformer(resolved_path)
+            if self.max_seq_length is not None:
+                self.model.max_seq_length = self.max_seq_length
+            if self.model.device.type == "cuda":
+                self.model = self.model.half()
 
     def build_index(self, df):
         """Encodes and saves the training dataframe rows as exemplars."""
@@ -64,7 +71,10 @@ class ExemplarRetriever:
             texts_to_encode.append(f"{row['prompt_bn']} {row['response_bn']}")
 
         self.embeddings = self.model.encode(
-            texts_to_encode, show_progress_bar=False, normalize_embeddings=True
+            texts_to_encode,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+            batch_size=self.batch_size,
         )
 
         os.makedirs(os.path.dirname(self.exemplar_path), exist_ok=True)
