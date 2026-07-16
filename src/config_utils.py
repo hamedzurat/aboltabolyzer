@@ -36,14 +36,14 @@ def resolve_quantization_mode(gemma_config):
             "no": "none",
         }
         if normalized not in aliases:
-            raise ValueError(f"Unsupported Gemma load_in mode: {mode}")
+            raise ValueError(f"Unsupported LLM verifier load_in mode: {mode}")
         return aliases[normalized]
 
     # Backward-compatible fallback for old config files.
     load_in_4bit = bool(gemma_config.get("load_in_4bit", False))
     load_in_8bit = bool(gemma_config.get("load_in_8bit", False))
     if load_in_4bit and load_in_8bit:
-        raise ValueError("Gemma config cannot set both load_in_4bit and load_in_8bit.")
+        raise ValueError("LLM verifier config cannot set both load_in_4bit and load_in_8bit.")
     if load_in_4bit:
         return "4bit"
     if load_in_8bit:
@@ -74,14 +74,14 @@ def validate_config(config):
 
     if load_in == "4bit" and device_map == "auto":
         raise ValueError(
-            'Gemma load_in="4bit" cannot use device_map="auto" when CPU/disk '
+            'LLM verifier load_in="4bit" cannot use device_map="auto" when CPU/disk '
             'dispatch may occur. Use load_in="8bit" with '
             "llm_int8_enable_fp32_cpu_offload=true for 8GB, or device_map='cuda:0' "
             "for all-GPU loading."
         )
     if load_in == "8bit" and device_map == "auto" and not int8_offload:
         raise ValueError(
-            'Gemma load_in="8bit" with device_map="auto" requires '
+            'LLM verifier load_in="8bit" with device_map="auto" requires '
             "llm_int8_enable_fp32_cpu_offload=true."
         )
 

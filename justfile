@@ -3,7 +3,7 @@
 
 export PYTHONPATH := "."
 # Prevent PyTorch allocator from holding reserved-but-free VRAM between XLM-R
-# and Gemma model loads. Without this, 5+ GiB stays "reserved" and Gemma OOMs.
+# and LLM verifier loads. Without this, 5+ GiB can stay reserved and cause OOMs.
 export PYTORCH_CUDA_ALLOC_CONF := "expandable_segments:True"
 
 default:
@@ -26,7 +26,7 @@ download-models:
 download-models-all:
     uv run python scripts/download_models.py --all-profiles
 
-[doc('Download all XLM-R profiles + BGE-M3 + Gemma (HF gated access may be required)')]
+[doc('Download all XLM-R profiles + BGE-M3 + active LLM verifier')]
 [group('setup')]
 download-models-gemma:
     uv run python scripts/download_models.py --all-profiles --include-gemma
@@ -54,7 +54,7 @@ prepare-rag: download-corpus build-index
 [group('setup')]
 prepare-assets: download-models-all download-corpus build-index
 
-[doc('Everything for the 16GB full pipeline: models (incl. Gemma) + wiki + RAG index')]
+[doc('Everything for the full pipeline: models (incl. active verifier) + wiki + RAG index')]
 [group('setup')]
 prepare-full: download-models-gemma download-corpus build-index
 
@@ -68,7 +68,7 @@ prepare-lite: download-models
 [group('workflows')]
 first-run-16gb: sync prepare-full preprocess train predict
 
-[doc('8GB first run: sync → full assets → preprocess → fresh train → predict (Gemma 3 1B)')]
+[doc('8GB first run: sync → full assets → preprocess → fresh train → predict (Qwen 1.5B verifier)')]
 [group('workflows')]
 first-run-8gb: sync prepare-full preprocess train predict
 

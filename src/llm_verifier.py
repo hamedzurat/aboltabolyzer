@@ -195,7 +195,7 @@ class GemmaVerifier:
         from src.config_utils import resolve_model_path
 
         resolved_name = resolve_model_path(self.model_name)
-        console.print(f"[bold cyan]Loading Gemma 4 verifier model:[/bold cyan] {self.model_name}")
+        console.print(f"[bold cyan]Loading LLM verifier model:[/bold cyan] {self.model_name}")
         if self.clear_cuda_before_load and torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
@@ -287,7 +287,7 @@ class GemmaVerifier:
                     "model with model.language_model and lm_head."
                 )
 
-        console.print("[green]✔ Gemma 4 model loaded successfully![/green]")
+        console.print("[green]✔ LLM verifier model loaded successfully![/green]")
 
     def _infer_input_device(self):
         if torch.cuda.is_available():
@@ -297,7 +297,7 @@ class GemmaVerifier:
         return self.model.device
 
     def _prepare_inputs(self, prompt, use_inputs_embeds=None):
-        tokenizer = getattr(self.processor, "tokenizer", None)
+        tokenizer = getattr(self.processor, "tokenizer", None) or self.tokenizer
         original_truncation_side = getattr(tokenizer, "truncation_side", None)
         if tokenizer is not None and self.max_input_tokens is not None:
             tokenizer.truncation_side = "left"
@@ -324,7 +324,10 @@ class GemmaVerifier:
 
     def _forward_logits(self, inputs):
         if not self.use_language_model_direct:
-            outputs = self.model(**inputs, logits_to_keep=1)
+            try:
+                outputs = self.model(**inputs, logits_to_keep=1)
+            except TypeError:
+                outputs = self.model(**inputs)
             return outputs.logits
 
         input_ids = inputs["input_ids"]

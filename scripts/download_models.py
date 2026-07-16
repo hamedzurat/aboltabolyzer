@@ -1,8 +1,11 @@
 import argparse
 import os
+import sys
 import tomllib
 
 from huggingface_hub import snapshot_download
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.config_utils import resolve_section, validate_config
 
@@ -24,12 +27,20 @@ def main():
     parser.add_argument(
         "--include-gemma",
         action="store_true",
-        help="Also download the configured Gemma verifier model. Requires HF access if gated.",
+        help="Also download the active configured LLM verifier model.",
     )
     parser.add_argument(
         "--all-profiles",
         action="store_true",
         help="Download XLM-R models from all configured hardware profiles.",
+    )
+    parser.add_argument(
+        "--all-profile-gemmas",
+        action="store_true",
+        help=(
+            "When --include-gemma is set, also download verifier models from all "
+            "hardware profiles. Some profiles may require gated HF access."
+        ),
     )
     parser.add_argument(
         "--models-dir",
@@ -53,7 +64,7 @@ def main():
     if args.include_gemma:
         gemma_config = resolve_section(config, "gemma")
         model_names.append(gemma_config["model_name"])
-        if args.all_profiles:
+        if args.all_profile_gemmas:
             base_gemma = config.get("gemma", {})
             for profile in config.get("hardware_profiles", {}).values():
                 if "gemma" in profile:

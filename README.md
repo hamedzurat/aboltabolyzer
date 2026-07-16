@@ -10,7 +10,7 @@ Bangla hallucination detection for competition submission.
 | **label 0**   | Hallucinated, unsupported, or wrong |
 | **label 1**   | Faithful, supported, correct        |
 
-**Architecture:** XLM-R (LoRA) produces an encoder prior → Gemma gives the final verdict → one OOF-tuned threshold on `p_llm` decides the label. No RandomForest blender.
+**Architecture:** XLM-R (LoRA) produces an encoder prior → the LLM verifier gives the final verdict → one OOF-tuned threshold on `p_llm` decides the label. No RandomForest blender.
 
 **Config:** choose the machine profile in [`configs/config.toml`](configs/config.toml),
 then run the matching `just` workflow.
@@ -29,14 +29,14 @@ dataset/sample_submission.csv
 
 ```toml
 [runtime]
-hardware_profile = "8gb"   # RTX 5060 mobile 8GB: smaller Gemma verifier
+hardware_profile = "8gb"   # RTX 5060 mobile 8GB: ungated Qwen verifier
 # hardware_profile = "16gb" # RTX 5060 16GB: full Gemma 4 verifier
 ```
 
 3. Run one command:
 
 ```bash
-just first-run-8gb   # 8GB, Gemma 3 1B verifier
+just first-run-8gb   # 8GB, Qwen 1.5B verifier
 # or
 just first-run-16gb  # 16GB, faster full pipeline
 ```
@@ -53,8 +53,8 @@ Inspect:
 submissions/latest/submission_debug.csv
 ```
 
-Gemma may require Hugging Face access. If the Gemma repository is gated, log in
-with `huggingface-cli login` before `just prepare-full`.
+The 8GB profile uses ungated `Qwen/Qwen2.5-1.5B-Instruct`. The 16GB profile
+uses Gemma 4, which may require Hugging Face access.
 
 ---
 
@@ -179,7 +179,7 @@ Or step by step:
 
 ```bash
 just sync
-just prepare-full             # models (incl. Gemma) + wiki + RAG index
+just prepare-full             # models (incl. active verifier) + wiki + RAG index
 just preprocess
 just train
 just predict
@@ -194,20 +194,21 @@ just submit-continue          # resume from existing checkpoints + predict
 just run                      # preprocess + fresh train + predict
 ```
 
-**Notes:** Training runs Gemma once per CV fold for OOF scoring, then builds a
-full exemplar index for inference. Inference is one Gemma fast pass per test row,
-plus a think pass on triggered rows.
+**Notes:** Training runs the LLM verifier once per CV fold for OOF scoring, then
+builds a full exemplar index for inference. Inference is one fast pass per test
+row, plus a think pass on triggered rows when enabled.
 
 ---
 
-### Profile B — 8GB Smaller Gemma Verifier
+### Profile B — 8GB Ungated Qwen Verifier
 
 **Machine:** RTX 5060 mobile 8GB or any GPU too small for Gemma 4 E4B.
 
-Use this when the 16GB Gemma 4 profile does not fit. On this stack, Gemma 4 E4B
-does not run reliably on 8GB: int8 CPU offload loads the model, but scoring moves
-a huge per-layer embedding to CUDA and OOMs. The 8GB profile therefore uses the
-smaller text-only `google/gemma-3-1b-it` verifier in 4-bit mode.
+Use this when the 16GB Gemma 4 profile does not fit or you do not want to deal
+with gated model access. On this stack, Gemma 4 E4B does not run reliably on 8GB:
+int8 CPU offload loads the model, but scoring moves a huge per-layer embedding
+to CUDA and OOMs. The 8GB profile therefore uses the ungated text-only
+`Qwen/Qwen2.5-1.5B-Instruct` verifier in 4-bit mode.
 
 **Set in `configs/config.toml`:**
 
@@ -221,7 +222,7 @@ use_checkpoints = true
 force_recompute = false
 
 [hardware_profiles.8gb.gemma]
-model_name = "google/gemma-3-1b-it"
+model_name = "Qwen/Qwen2.5-1.5B-Instruct"
 model_loader = "causal_lm"
 load_in = "4bit"
 device_map = "cuda:0"
@@ -250,7 +251,7 @@ just first-run-8gb
 Or step by step: `just sync` → `just prepare-full` → `just preprocess` → `just train` → `just predict`
 
 This profile still disables dynamic exemplars, cultural-band routing, and the
-generated think pass by default to keep Gemma inference small and stable.
+generated think pass by default to keep verifier inference small and stable.
 
 For a pure XLM-R debug run without loading Gemma, set:
 
@@ -262,7 +263,7 @@ use_llm_verifier = false
 > **Tip:** `just train` always wipes `models/xlmr/` and retrains from scratch.
 > Use `just train-continue` to resume — it skips folds whose checkpoint already exists.
 
-Use this to debug preprocessing, RAG, and cross-encoder training without loading Gemma.
+Use this to debug preprocessing, RAG, and cross-encoder training without loading the verifier.
 
 ---
 
@@ -324,23 +325,23 @@ ignored instead of silently reused.
 
 The defaults are conservative. Tune in `configs/config.toml`:
 
-| Knob                                           | Where                         | Effect                                                           |
-| ---------------------------------------------- | ----------------------------- | ---------------------------------------------------------------- |
-| `batch_size`                                   | `[hardware_profiles.*.xlmr]`  | Bigger is faster until XLM-R OOMs                                |
-| `use_amp`                                      | `[hardware_profiles.*.xlmr]`  | Faster/lower VRAM on newer GPUs; enabled for 16GB by default     |
-| `num_workers`, `pin_memory`, `prefetch_factor` | `[hardware_profiles.*.xlmr]`  | Improves DataLoader throughput                                   |
-| `query_batch_size`                             | `[hardware_profiles.*.rag]`   | Batch-encodes RAG queries; bigger is faster until embedding OOM  |
-| `model_loader`                                 | `[hardware_profiles.*.gemma]` | `"causal_lm"` for text-only Gemma, `"multimodal_lm"` for Gemma 4 |
-| `device_map`                                   | `[hardware_profiles.*.gemma]` | `"cuda:0"` is fastest; `"auto"` allows CPU offload               |
-| `load_in`                                      | `[hardware_profiles.*.gemma]` | `"4bit"` for 16GB all-GPU; `"8bit"` for 8GB CPU offload          |
-| `cuda_max_memory`                              | `[hardware_profiles.*.gemma]` | Lower to avoid OOM on 8GB; raise on larger cards                 |
-| `max_input_tokens`                             | `[hardware_profiles.*.gemma]` | Lower saves memory/time but may truncate evidence                |
-| `use_language_model_direct`                    | `[hardware_profiles.*.gemma]` | Bypasses Gemma 4 multimodal wrapper for text-only offload runs   |
-| `use_inputs_embeds_for_forward`                | `[hardware_profiles.*.gemma]` | Optional text-embedding workaround for non-direct forwards       |
-| `classify_cultural_band`, `enable_think_pass`  | `[hardware_profiles.*.gemma]` | Extra Gemma calls; enabled on 16GB, disabled on 8GB by default   |
-| `exemplar_top_k`                               | `[hardware_profiles.*.gemma]` | More examples may help quality but increases prompt cost         |
+| Knob                                           | Where                         | Effect                                                                     |
+| ---------------------------------------------- | ----------------------------- | -------------------------------------------------------------------------- |
+| `batch_size`                                   | `[hardware_profiles.*.xlmr]`  | Bigger is faster until XLM-R OOMs                                          |
+| `use_amp`                                      | `[hardware_profiles.*.xlmr]`  | Faster/lower VRAM on newer GPUs; enabled for 16GB by default               |
+| `num_workers`, `pin_memory`, `prefetch_factor` | `[hardware_profiles.*.xlmr]`  | Improves DataLoader throughput                                             |
+| `query_batch_size`                             | `[hardware_profiles.*.rag]`   | Batch-encodes RAG queries; bigger is faster until embedding OOM            |
+| `model_loader`                                 | `[hardware_profiles.*.gemma]` | `"causal_lm"` for text-only verifier models, `"multimodal_lm"` for Gemma 4 |
+| `device_map`                                   | `[hardware_profiles.*.gemma]` | `"cuda:0"` is fastest; `"auto"` allows CPU offload                         |
+| `load_in`                                      | `[hardware_profiles.*.gemma]` | `"4bit"` for compact GPU loading; `"8bit"` for int8 loading                |
+| `cuda_max_memory`                              | `[hardware_profiles.*.gemma]` | Lower to avoid OOM on 8GB; raise on larger cards                           |
+| `max_input_tokens`                             | `[hardware_profiles.*.gemma]` | Lower saves memory/time but may truncate evidence                          |
+| `use_language_model_direct`                    | `[hardware_profiles.*.gemma]` | Bypasses Gemma 4 multimodal wrapper for text-only offload runs             |
+| `use_inputs_embeds_for_forward`                | `[hardware_profiles.*.gemma]` | Optional text-embedding workaround for non-direct forwards                 |
+| `classify_cultural_band`, `enable_think_pass`  | `[hardware_profiles.*.gemma]` | Extra Gemma calls; enabled on 16GB, disabled on 8GB by default             |
+| `exemplar_top_k`                               | `[hardware_profiles.*.gemma]` | More examples may help quality but increases prompt cost                   |
 
-For 8GB, use the smaller `google/gemma-3-1b-it` causal-LM profile. For 16GB,
+For 8GB, use the ungated `Qwen/Qwen2.5-1.5B-Instruct` causal-LM profile. For 16GB,
 keep Gemma 4 on `device_map = "cuda:0"` for best throughput.
 The config is validated before training/prediction, so unsupported combinations
 such as `load_in = "4bit"` with `device_map = "auto"` fail early with a clear
@@ -354,30 +355,30 @@ Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **c
 
 ### Workflows (start here)
 
-| Command                | What it does                                                              |
-| ---------------------- | ------------------------------------------------------------------------- |
-| `just first-run-16gb`  | sync → prepare-full → preprocess → **fresh train** → predict              |
-| `just first-run-8gb`   | sync → prepare-full → preprocess → **fresh train** → predict (Gemma 3 1B) |
-| `just run`             | preprocess → fresh train → predict                                        |
-| `just submit`          | **fresh train** → predict (data already preprocessed)                     |
-| `just submit-continue` | resume existing checkpoints → predict                                     |
-| `just smoke-rag`       | small wiki → index → fresh train → predict                                |
+| Command                | What it does                                                             |
+| ---------------------- | ------------------------------------------------------------------------ |
+| `just first-run-16gb`  | sync → prepare-full → preprocess → **fresh train** → predict             |
+| `just first-run-8gb`   | sync → prepare-full → preprocess → **fresh train** → predict (Qwen 1.5B) |
+| `just run`             | preprocess → fresh train → predict                                       |
+| `just submit`          | **fresh train** → predict (data already preprocessed)                    |
+| `just submit-continue` | resume existing checkpoints → predict                                    |
+| `just smoke-rag`       | small wiki → index → fresh train → predict                               |
 
 ### Setup
 
-| Command                      | What it does                                            |
-| ---------------------------- | ------------------------------------------------------- |
-| `just sync`                  | Install Python deps via uv                              |
-| `just prepare-full`          | Gemma + both XLM-R profiles + BGE-M3 + wiki + RAG index |
-| `just prepare-assets`        | Both XLM-R profiles + BGE-M3 + wiki + index (no Gemma)  |
-| `just prepare-lite`          | Active-profile XLM-R + BGE-M3 only                      |
-| `just prepare-rag`           | Full wiki download + build index                        |
-| `just download-models`       | XLM-R for active profile + BGE-M3                       |
-| `just download-models-all`   | XLM-R for both profiles + BGE-M3                        |
-| `just download-models-gemma` | Above + Gemma                                           |
-| `just download-corpus`       | Full Bengali Wikipedia → `corpus/`                      |
-| `just download-corpus-small` | 200-article wiki sample                                 |
-| `just build-index`           | Build `indexes/dense_index.pkl`                         |
+| Command                      | What it does                                                      |
+| ---------------------------- | ----------------------------------------------------------------- |
+| `just sync`                  | Install Python deps via uv                                        |
+| `just prepare-full`          | Active verifier + both XLM-R profiles + BGE-M3 + wiki + RAG index |
+| `just prepare-assets`        | Both XLM-R profiles + BGE-M3 + wiki + index (no Gemma)            |
+| `just prepare-lite`          | Active-profile XLM-R + BGE-M3 only                                |
+| `just prepare-rag`           | Full wiki download + build index                                  |
+| `just download-models`       | XLM-R for active profile + BGE-M3                                 |
+| `just download-models-all`   | XLM-R for both profiles + BGE-M3                                  |
+| `just download-models-gemma` | Above + active verifier                                           |
+| `just download-corpus`       | Full Bengali Wikipedia → `corpus/`                                |
+| `just download-corpus-small` | 200-article wiki sample                                           |
+| `just build-index`           | Build `indexes/dense_index.pkl`                                   |
 
 ### Pipeline
 
@@ -526,7 +527,7 @@ corpus/*.jsonl                 # { "text": "..." } or { "passage": "..." }
 2. **C0/C1/C2 bands** — LLM-guessed, only used to trigger think; can misfire on edge cases.
 3. **Wiki-only RAG** — weak on math, spelling MCQs, recent news; think-pass is the fallback.
 4. **Expensive OOF Gemma training** — one verifier pass per configured CV fold; plan GPU time accordingly.
-5. **8GB uses a smaller Gemma** — Gemma 4 E4B offload loads but OOMs during scoring on this stack, so 8GB uses `google/gemma-3-1b-it`.
+5. **8GB uses a smaller verifier** — Gemma 4 E4B offload loads but OOMs during scoring on this stack, so 8GB uses `Qwen/Qwen2.5-1.5B-Instruct`.
 6. **Cached evidence CSVs** — if you change corpus/index/config RAG knobs, delete `*_with_evidence.csv` before re-running.
 7. **Kaggle packaging not automated** — fold checkpoints, index, and exemplars must be bundled manually as a Dataset for offline submit.
 

@@ -191,11 +191,11 @@ threshold_metric = "macro_f1"
 # Saved to models/blender_config.pkl (legacy filename; stores threshold only).
 
 # -----------------------------------------------------------------------------
-# Hardware profile: RTX 5060 8GB — smaller text-only Gemma verifier
+# Hardware profile: RTX 5060 8GB — ungated small text-only verifier
 # -----------------------------------------------------------------------------
 [hardware_profiles.8gb.runtime]
 # Gemma 4 E4B is not viable on 8GB with this Transformers/Accelerate stack.
-# Use a smaller text-only Gemma verifier instead of disabling Gemma entirely.
+# Use an ungated small text-only verifier instead of disabling the LLM entirely.
 use_llm_verifier = true
 fail_on_model_error = true
 
@@ -212,7 +212,7 @@ use_amp = false
 early_stopping_patience = 8
 
 [hardware_profiles.8gb.gemma]
-model_name = "google/gemma-3-1b-it"
+model_name = "Qwen/Qwen2.5-1.5B-Instruct"
 model_loader = "causal_lm"
 load_in = "4bit"
 llm_int8_enable_fp32_cpu_offload = false
