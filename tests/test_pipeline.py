@@ -98,12 +98,29 @@ def test_prediction_checkpoint_round_trip(tmp_path):
     checkpoint_path = tmp_path / "test_llm_preds.csv"
     ids = pd.Series([101, 102, 103])
     values = np.array([0.1, 0.9, 0.4])
+    metadata = {"checkpoint_source": "gemma", "hardware_profile": "8gb"}
 
-    _save_prediction_checkpoint(str(checkpoint_path), ids, "p_llm", values)
-    loaded = _load_prediction_checkpoint(str(checkpoint_path), 3, "p_llm")
+    _save_prediction_checkpoint(str(checkpoint_path), ids, "p_llm", values, metadata=metadata)
+    loaded = _load_prediction_checkpoint(
+        str(checkpoint_path),
+        3,
+        "p_llm",
+        expected_ids=ids,
+        expected_metadata=metadata,
+    )
 
     assert np.allclose(loaded, values)
     assert _load_prediction_checkpoint(str(checkpoint_path), 4, "p_llm") is None
+    assert (
+        _load_prediction_checkpoint(
+            str(checkpoint_path),
+            3,
+            "p_llm",
+            expected_ids=ids,
+            expected_metadata={"checkpoint_source": "xlmr_fallback"},
+        )
+        is None
+    )
 
 
 def test_resolve_torch_dtype_rejects_unknown_dtype():

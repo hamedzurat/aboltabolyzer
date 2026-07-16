@@ -15,7 +15,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from src.blender import ThresholdDecision
-from src.config_utils import fail_on_model_error
+from src.config_utils import fail_on_model_error, resolve_section
 from src.llm_verifier import GemmaVerifier
 from src.rag import BanglaRAG
 from src.xlmr_encoder import predict_test
@@ -37,7 +37,13 @@ def _prediction_checkpoint_path(config, key, default_filename):
     return os.path.join(config["data"]["processed_dir"], default_filename)
 
 
-def _load_prediction_checkpoint(path, expected_len, column, expected_ids=None):
+def _load_prediction_checkpoint(
+    path,
+    expected_len,
+    column,
+    expected_ids=None,
+    expected_metadata=None,
+):
     if not os.path.exists(path):
         return None
     try:
@@ -63,6 +69,17 @@ def _load_prediction_checkpoint(path, expected_len, column, expected_ids=None):
                 f"[yellow]Ignoring {path}; checkpoint ids do not match test ids.[/yellow]"
             )
             return None
+    for meta_key, expected_value in (expected_metadata or {}).items():
+        if meta_key not in checkpoint_df.columns:
+            console.print(f"[yellow]Ignoring {path}; missing metadata '{meta_key}'.[/yellow]")
+            return None
+        actual_values = checkpoint_df[meta_key].astype(str).unique().tolist()
+        if actual_values != [str(expected_value)]:
+            console.print(
+                f"[yellow]Ignoring {path}; metadata '{meta_key}' is {actual_values}, "
+                f"expected {expected_value}.[/yellow]"
+            )
+            return None
 
     values = checkpoint_df[column].to_numpy(dtype=float)
     if not np.isfinite(values).all():
@@ -72,13 +89,15 @@ def _load_prediction_checkpoint(path, expected_len, column, expected_ids=None):
     return values
 
 
-def _save_prediction_checkpoint(path, ids, column, values):
+def _save_prediction_checkpoint(path, ids, column, values, metadata=None):
     checkpoint_dir = os.path.dirname(path)
     if checkpoint_dir:
         os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_df = pd.DataFrame({column: values})
     if ids is not None:
         checkpoint_df.insert(0, "id", ids)
+    for meta_key, meta_value in (metadata or {}).items():
+        checkpoint_df[meta_key] = meta_value
     checkpoint_df.to_csv(path, index=False)
     console.print(f"[green]Saved {column} checkpoint to {path}.[/green]")
 
@@ -108,8 +127,10 @@ def load_verifier_debug_map(log_path="logs/debug_llm_verifier.jsonl"):
                         reasons = "|".join(str(r) for r in reasons)
                     cache[key] = {
                         "p_llm_no_think": entry.get("p_llm_no_think"),
+                        "p_llm_final": entry.get("p_llm_final"),
                         "triggered_think": entry.get("triggered_think"),
                         "think_reasons": reasons,
+                        "thinking_cot": entry.get("thinking_cot"),
                         "is_c0": entry.get("is_c0"),
                         "is_c1": entry.get("is_c1"),
                         "is_c2": entry.get("is_c2"),
@@ -134,6 +155,7 @@ def main():
     predict_config = config.get("predict", {})
     use_checkpoints = bool(predict_config.get("use_checkpoints", True))
     force_recompute = bool(predict_config.get("force_recompute", False))
+    hardware_profile = config.get("runtime", {}).get("hardware_profile", "default")
 
     # 1. Load preprocessed test dataset
     test_processed_path = os.path.join(config["data"]["processed_dir"], "test.csv")
@@ -223,14 +245,27 @@ def main():
         config, "xlmr_predictions_path", "test_xlmr_preds.csv"
     )
     p_xlmr = None
+    xlmr_from_checkpoint = False
+    xlmr_metadata = {"checkpoint_source": "xlmr", "hardware_profile": hardware_profile}
     if use_checkpoints and not force_recompute:
         p_xlmr = _load_prediction_checkpoint(
-            xlmr_checkpoint_path, len(test_df), "p_xlmr", expected_ids=ids
+            xlmr_checkpoint_path,
+            len(test_df),
+            "p_xlmr",
+            expected_ids=ids,
+            expected_metadata=xlmr_metadata,
         )
+        xlmr_from_checkpoint = p_xlmr is not None
     if p_xlmr is None:
         p_xlmr = predict_test(test_df, config)
         if use_checkpoints:
-            _save_prediction_checkpoint(xlmr_checkpoint_path, ids, "p_xlmr", p_xlmr)
+            _save_prediction_checkpoint(
+                xlmr_checkpoint_path,
+                ids,
+                "p_xlmr",
+                p_xlmr,
+                metadata=xlmr_metadata,
+            )
 
     # Clean up GPU memory after Cross-Encoder prediction
     gc.collect()
@@ -247,10 +282,18 @@ def main():
             config, "llm_predictions_path", "test_llm_preds.csv"
         )
         p_llm = None
+        llm_from_checkpoint = False
+        llm_checkpoint_source = "gemma"
+        llm_metadata = {"checkpoint_source": "gemma", "hardware_profile": hardware_profile}
         if use_checkpoints and not force_recompute:
             p_llm = _load_prediction_checkpoint(
-                llm_checkpoint_path, len(test_df), "p_llm", expected_ids=ids
+                llm_checkpoint_path,
+                len(test_df),
+                "p_llm",
+                expected_ids=ids,
+                expected_metadata=llm_metadata,
             )
+            llm_from_checkpoint = p_llm is not None
         if p_llm is not None:
             console.print(
                 "[bold green]Skipping Gemma; verifier checkpoint is complete.[/bold green]"
@@ -275,7 +318,13 @@ def main():
                     use_cache=True,
                 )
                 if use_checkpoints:
-                    _save_prediction_checkpoint(llm_checkpoint_path, ids, "p_llm", p_llm)
+                    _save_prediction_checkpoint(
+                        llm_checkpoint_path,
+                        ids,
+                        "p_llm",
+                        p_llm,
+                        metadata=llm_metadata,
+                    )
             except Exception as e:
                 if fail_on_model_error(config):
                     raise RuntimeError(
@@ -286,16 +335,28 @@ def main():
                     "[yellow]Falling back to XLM-R-only scores because fail_on_model_error=false.[/yellow]"
                 )
                 p_llm = p_xlmr.copy()
+                llm_checkpoint_source = "xlmr_fallback_error"
     else:
         console.print(
             "[yellow]LLM verifier disabled. Using XLM-R scores as Gemma fallback.[/yellow]"
         )
         p_llm = p_xlmr.copy()
+        llm_from_checkpoint = False
+        llm_checkpoint_source = "xlmr_fallback_disabled"
         llm_checkpoint_path = _prediction_checkpoint_path(
             config, "llm_predictions_path", "test_llm_preds.csv"
         )
         if use_checkpoints:
-            _save_prediction_checkpoint(llm_checkpoint_path, ids, "p_llm", p_llm)
+            _save_prediction_checkpoint(
+                llm_checkpoint_path,
+                ids,
+                "p_llm",
+                p_llm,
+                metadata={
+                    "checkpoint_source": "xlmr_fallback",
+                    "hardware_profile": hardware_profile,
+                },
+            )
 
     test_df["p_llm"] = p_llm
     test_df.to_csv(
@@ -346,56 +407,176 @@ def main():
     debug_df["label"] = preds
     debug_df["threshold"] = decision.threshold
     debug_df["threshold_metric"] = decision.threshold_metric
+    debug_df["threshold_margin"] = debug_df["p_final"] - float(decision.threshold)
+    debug_df["threshold_abs_margin"] = debug_df["threshold_margin"].abs()
     debug_df["used_llm_verifier"] = bool(config.get("runtime", {}).get("use_llm_verifier", True))
     debug_df["encoder_disagree"] = (debug_df["p_xlmr"] - debug_df["p_llm"]).abs()
+    debug_df["llm_minus_xlmr"] = debug_df["p_llm"] - debug_df["p_xlmr"]
+    debug_df["xlmr_label_at_threshold"] = (debug_df["p_xlmr"] >= decision.threshold).astype(int)
+    debug_df["llm_label_at_threshold"] = (debug_df["p_llm"] >= decision.threshold).astype(int)
+    debug_df["xlmr_llm_label_disagree"] = (
+        debug_df["xlmr_label_at_threshold"] != debug_df["llm_label_at_threshold"]
+    )
     debug_df["rag_filled"] = (debug_df["context_original"] == "[NULL]") & (
         debug_df["context"] != "[NULL]"
     )
+    debug_df["evidence_is_null"] = (
+        debug_df["context"].astype(str).str.strip().isin(("[NULL]", "", "None", "nan"))
+    )
+    debug_df["context_original_is_null"] = (
+        debug_df["context_original"].astype(str).str.strip().isin(("[NULL]", "", "None", "nan"))
+    )
+    debug_df["context_char_len"] = debug_df["context"].astype(str).str.len()
+    debug_df["context_word_len"] = debug_df["context"].astype(str).str.split().str.len()
+    debug_df["prompt_char_len"] = debug_df["prompt_bn"].astype(str).str.len()
+    debug_df["response_char_len"] = debug_df["response_bn"].astype(str).str.len()
+    debug_df["prompt_response_char_len"] = (
+        debug_df["prompt_char_len"] + debug_df["response_char_len"]
+    )
+
+    xlmr_config = resolve_section(config, "xlmr")
+    gemma_config = resolve_section(config, "gemma")
+    rag_config = resolve_section(config, "rag")
+    debug_df["run_timestamp"] = run_ts
+    debug_df["hardware_profile"] = hardware_profile
+    debug_df["num_folds"] = config.get("num_folds")
+    debug_df["seed"] = config.get("seed")
+    debug_df["use_checkpoints"] = use_checkpoints
+    debug_df["force_recompute"] = force_recompute
+    debug_df["xlmr_from_checkpoint"] = xlmr_from_checkpoint
+    debug_df["llm_from_checkpoint"] = llm_from_checkpoint
+    debug_df["llm_checkpoint_source"] = llm_checkpoint_source
+    debug_df["xlmr_checkpoint_path"] = xlmr_checkpoint_path
+    debug_df["llm_checkpoint_path"] = llm_checkpoint_path
+    debug_df["verifier_debug_log_path"] = verifier.debug_log_path
+    debug_df["threshold_path"] = threshold_path
+    debug_df["submission_path"] = submission_path
+    debug_df["debug_path"] = debug_path
+    debug_df["xlmr_model_name"] = xlmr_config.get("model_name")
+    debug_df["xlmr_max_length"] = xlmr_config.get("max_length")
+    debug_df["xlmr_batch_size"] = xlmr_config.get("batch_size")
+    debug_df["gemma_model_name"] = gemma_config.get("model_name")
+    debug_df["gemma_device_map"] = gemma_config.get("device_map")
+    debug_df["gemma_cuda_max_memory"] = gemma_config.get("cuda_max_memory")
+    debug_df["gemma_max_input_tokens"] = gemma_config.get("max_input_tokens")
+    debug_df["gemma_max_think_tokens"] = gemma_config.get("max_think_tokens")
+    debug_df["gemma_exemplar_top_k"] = gemma_config.get("exemplar_top_k")
+    debug_df["gemma_load_in_4bit"] = gemma_config.get("load_in_4bit")
+    debug_df["rag_query_mode"] = rag_config.get("query_mode")
+    debug_df["rag_top_k"] = rag_config.get("top_k")
+    debug_df["rag_similarity_threshold"] = rag_config.get("similarity_threshold")
+    debug_df["rag_max_evidence_tokens"] = rag_config.get("max_evidence_tokens")
+
+    debug_df["p_llm_no_think"] = np.nan
+    debug_df["p_llm_from_log"] = np.nan
+    debug_df["p_llm_log_delta"] = np.nan
+    debug_df["triggered_think"] = False
+    debug_df["think_reasons"] = ""
+    debug_df["thinking_cot"] = ""
+    debug_df["is_c0"] = np.nan
+    debug_df["is_c1"] = np.nan
+    debug_df["is_c2"] = np.nan
+    debug_df["think_changed_probability"] = np.nan
+    debug_df["think_changed_label"] = False
 
     verifier_map = load_verifier_debug_map()
     if verifier_map:
-        debug_df["p_llm_no_think"] = np.nan
-        debug_df["triggered_think"] = False
-        debug_df["think_reasons"] = ""
-        debug_df["is_c0"] = np.nan
-        debug_df["is_c1"] = np.nan
-        debug_df["is_c2"] = np.nan
         for i, row in debug_df.iterrows():
             key = (str(row["prompt_bn"]), str(row["response_bn"]))
             if key in verifier_map:
                 meta = verifier_map[key]
                 debug_df.at[i, "p_llm_no_think"] = meta.get("p_llm_no_think")
+                debug_df.at[i, "p_llm_from_log"] = meta.get("p_llm_final")
                 debug_df.at[i, "triggered_think"] = bool(meta.get("triggered_think"))
                 debug_df.at[i, "think_reasons"] = meta.get("think_reasons", "")
+                debug_df.at[i, "thinking_cot"] = meta.get("thinking_cot") or ""
                 debug_df.at[i, "is_c0"] = meta.get("is_c0")
                 debug_df.at[i, "is_c1"] = meta.get("is_c1")
                 debug_df.at[i, "is_c2"] = meta.get("is_c2")
+        has_no_think = debug_df["p_llm_no_think"].notna()
+        has_log_prob = debug_df["p_llm_from_log"].notna()
+        debug_df.loc[has_log_prob, "p_llm_log_delta"] = (
+            debug_df.loc[has_log_prob, "p_llm"] - debug_df.loc[has_log_prob, "p_llm_from_log"]
+        )
+        debug_df.loc[has_no_think, "think_changed_probability"] = (
+            debug_df.loc[has_no_think, "p_llm"] - debug_df.loc[has_no_think, "p_llm_no_think"]
+        )
+        debug_df.loc[has_no_think, "think_changed_label"] = (
+            debug_df.loc[has_no_think, "p_llm"] >= decision.threshold
+        ) != (debug_df.loc[has_no_think, "p_llm_no_think"] >= decision.threshold)
 
     preferred_cols = [
         "id",
+        "label",
+        "p_final",
+        "threshold",
+        "threshold_margin",
+        "threshold_abs_margin",
+        "threshold_metric",
+        "p_llm",
+        "p_llm_no_think",
+        "p_llm_from_log",
+        "p_llm_log_delta",
+        "p_xlmr",
+        "llm_minus_xlmr",
+        "encoder_disagree",
+        "xlmr_label_at_threshold",
+        "llm_label_at_threshold",
+        "xlmr_llm_label_disagree",
+        "triggered_think",
+        "think_reasons",
+        "think_changed_probability",
+        "think_changed_label",
+        "is_c0",
+        "is_c1",
+        "is_c2",
         "has_context",
+        "evidence_is_null",
+        "context_original_is_null",
+        "rag_filled",
+        "n_retrieved",
+        "retrieval_sim_max",
+        "retrieval_sim_mean",
+        "context_char_len",
+        "context_word_len",
+        "prompt_char_len",
+        "response_char_len",
+        "prompt_response_char_len",
         "context_original",
         "context",
         "prompt_bn",
         "response_bn",
-        "n_retrieved",
-        "retrieval_sim_max",
-        "retrieval_sim_mean",
-        "rag_filled",
-        "p_xlmr",
-        "p_llm_no_think",
-        "p_llm",
-        "p_final",
-        "threshold",
-        "threshold_metric",
-        "encoder_disagree",
-        "triggered_think",
-        "think_reasons",
-        "is_c0",
-        "is_c1",
-        "is_c2",
+        "thinking_cot",
+        "run_timestamp",
+        "hardware_profile",
         "used_llm_verifier",
-        "label",
+        "llm_checkpoint_source",
+        "xlmr_from_checkpoint",
+        "llm_from_checkpoint",
+        "use_checkpoints",
+        "force_recompute",
+        "num_folds",
+        "seed",
+        "xlmr_model_name",
+        "xlmr_max_length",
+        "xlmr_batch_size",
+        "gemma_model_name",
+        "gemma_device_map",
+        "gemma_cuda_max_memory",
+        "gemma_max_input_tokens",
+        "gemma_max_think_tokens",
+        "gemma_exemplar_top_k",
+        "gemma_load_in_4bit",
+        "rag_query_mode",
+        "rag_top_k",
+        "rag_similarity_threshold",
+        "rag_max_evidence_tokens",
+        "xlmr_checkpoint_path",
+        "llm_checkpoint_path",
+        "verifier_debug_log_path",
+        "threshold_path",
+        "submission_path",
+        "debug_path",
     ]
     ordered = [c for c in preferred_cols if c in debug_df.columns]
     ordered += [c for c in debug_df.columns if c not in ordered]
