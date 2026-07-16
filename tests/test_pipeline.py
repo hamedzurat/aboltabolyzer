@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from src.blender import ThresholdDecision
-from src.config_utils import resolve_section
+from src.config_utils import resolve_quantization_mode, resolve_section, validate_config
 from src.llm_verifier import _resolve_torch_dtype
 from src.predict import _load_prediction_checkpoint, _save_prediction_checkpoint
 from src.preprocess import clean_text
@@ -75,6 +75,7 @@ def test_hardware_profile_overlays_gemma_memory_settings():
             "device_map": "cuda:0",
             "cuda_max_memory": "14GiB",
             "exemplar_top_k": 3,
+            "load_in": "4bit",
         },
         "hardware_profiles": {
             "8gb": {
@@ -82,6 +83,8 @@ def test_hardware_profile_overlays_gemma_memory_settings():
                     "device_map": "auto",
                     "cuda_max_memory": "6GiB",
                     "exemplar_top_k": 0,
+                    "load_in": "8bit",
+                    "llm_int8_enable_fp32_cpu_offload": True,
                 }
             }
         },
@@ -92,6 +95,8 @@ def test_hardware_profile_overlays_gemma_memory_settings():
     assert gemma_config["device_map"] == "auto"
     assert gemma_config["cuda_max_memory"] == "6GiB"
     assert gemma_config["exemplar_top_k"] == 0
+    assert gemma_config["load_in"] == "8bit"
+    assert gemma_config["llm_int8_enable_fp32_cpu_offload"] is True
 
 
 def test_prediction_checkpoint_round_trip(tmp_path):
@@ -130,6 +135,57 @@ def test_resolve_torch_dtype_rejects_unknown_dtype():
     assert _resolve_torch_dtype("bf16", torch.float32) is torch.bfloat16
     with pytest.raises(ValueError):
         _resolve_torch_dtype("tinyfloat", torch.float32)
+
+
+def test_resolve_quantization_mode_accepts_single_load_in():
+    import pytest
+
+    assert resolve_quantization_mode({"load_in": "4bit"}) == "4bit"
+    assert resolve_quantization_mode({"load_in": "4"}) == "4bit"
+    assert resolve_quantization_mode({"load_in": "8bit"}) == "8bit"
+    assert resolve_quantization_mode({"load_in": "none"}) == "none"
+    assert resolve_quantization_mode({"load_in_4bit": True}) == "4bit"
+    with pytest.raises(ValueError):
+        resolve_quantization_mode({"load_in": "2bit"})
+
+
+def test_validate_config_rejects_4bit_auto_offload():
+    import pytest
+
+    config = {
+        "seed": 42,
+        "num_folds": 2,
+        "runtime": {"hardware_profile": "bad"},
+        "rag": {"query_mode": "prompt"},
+        "xlmr": {"batch_size": 1, "max_length": 16},
+        "gemma": {
+            "load_in": "4bit",
+            "device_map": "auto",
+            "llm_int8_enable_fp32_cpu_offload": False,
+        },
+        "hardware_profiles": {"bad": {}},
+    }
+
+    with pytest.raises(ValueError, match='load_in="4bit"'):
+        validate_config(config)
+
+
+def test_validate_config_accepts_8bit_auto_offload():
+    config = {
+        "seed": 42,
+        "num_folds": 2,
+        "runtime": {"hardware_profile": "8gb"},
+        "rag": {"query_mode": "prompt"},
+        "xlmr": {"batch_size": 1, "max_length": 16},
+        "gemma": {
+            "load_in": "8bit",
+            "device_map": "auto",
+            "llm_int8_enable_fp32_cpu_offload": True,
+        },
+        "hardware_profiles": {"8gb": {}},
+    }
+
+    validate_config(config)
 
 
 def test_dense_rag():

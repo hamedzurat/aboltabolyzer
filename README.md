@@ -29,7 +29,7 @@ dataset/sample_submission.csv
 
 ```toml
 [runtime]
-hardware_profile = "8gb"   # RTX 5060 mobile 8GB: fits Gemma with CPU offload
+hardware_profile = "8gb"   # RTX 5060 mobile 8GB: int8 Gemma with CPU offload
 # hardware_profile = "16gb" # RTX 5060 16GB: faster all-GPU Gemma
 use_llm_verifier = true
 ```
@@ -155,6 +155,7 @@ use_checkpoints = true
 force_recompute = false
 
 [hardware_profiles.16gb.gemma]
+load_in = "4bit"
 device_map = "cuda:0"
 exemplar_top_k = 3
 max_input_tokens = 3072
@@ -204,8 +205,9 @@ plus a think pass on triggered rows.
 
 **Machine:** RTX 5060 mobile 8GB or any GPU too small for all-GPU Gemma.
 
-Use this when avoiding OOM matters more than raw speed. Gemma is 4-bit, capped
-to part of VRAM, and allowed to offload to CPU RAM. This is slower than 16GB.
+Use this when avoiding OOM matters more than raw speed. Gemma uses 8-bit
+quantization with fp32 CPU offload, capped GPU placement, shorter prompts, and
+no dynamic exemplars. This is slower than 16GB.
 
 **Set in `configs/config.toml`:**
 
@@ -220,6 +222,8 @@ use_checkpoints = true
 force_recompute = false
 
 [hardware_profiles.8gb.gemma]
+load_in = "8bit"
+llm_int8_enable_fp32_cpu_offload = true
 device_map = "auto"
 cuda_max_memory = "6GiB"
 max_input_tokens = 1536
@@ -244,10 +248,9 @@ just first-run-8gb
 
 Or step by step: `just sync` → `just prepare-full` → `just preprocess` → `just train` → `just predict`
 
-This profile keeps Gemma in 4-bit but lets Transformers/Accelerate offload model
-parts to CPU RAM, caps CUDA placement to leave headroom, truncates long prompts,
-and disables dynamic exemplars during prediction. It is slower than the 16GB
-profile, but it should resume cleanly if the run is interrupted.
+This profile uses the bitsandbytes int8 CPU-offload path because 4-bit
+quantization cannot be auto-dispatched to CPU/disk on this stack. It should
+resume cleanly if the run is interrupted.
 
 For a pure XLM-R debug run without loading Gemma, set:
 
@@ -328,12 +331,16 @@ The defaults are conservative. Tune in `configs/config.toml`:
 | `num_workers`, `pin_memory`, `prefetch_factor` | `[hardware_profiles.*.xlmr]`  | Improves DataLoader throughput                                  |
 | `query_batch_size`                             | `[hardware_profiles.*.rag]`   | Batch-encodes RAG queries; bigger is faster until embedding OOM |
 | `device_map`                                   | `[hardware_profiles.*.gemma]` | `"cuda:0"` is fastest; `"auto"` allows CPU offload              |
+| `load_in`                                      | `[hardware_profiles.*.gemma]` | `"4bit"` for 16GB all-GPU; `"8bit"` for 8GB CPU offload         |
 | `cuda_max_memory`                              | `[hardware_profiles.*.gemma]` | Lower to avoid OOM on 8GB; raise on larger cards                |
 | `max_input_tokens`                             | `[hardware_profiles.*.gemma]` | Lower saves memory/time but may truncate evidence               |
 | `exemplar_top_k`                               | `[hardware_profiles.*.gemma]` | More examples may help quality but increases prompt cost        |
 
 For 8GB, do not expect Gemma to saturate the GPU: CPU offload is a fit-first
 mode. For 16GB, keep `device_map = "cuda:0"` for best throughput.
+The config is validated before training/prediction, so unsupported combinations
+such as `load_in = "4bit"` with `device_map = "auto"` fail early with a clear
+message.
 
 ---
 
@@ -428,16 +435,16 @@ Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **c
 
 The debug CSV is intentionally wide. Key groups:
 
-| Group            | Useful columns                                                                                                                                      |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Final decision   | `label`, `p_final`, `threshold`, `threshold_margin`, `threshold_abs_margin`, `threshold_metric`                                                     |
-| Model scores     | `p_xlmr`, `p_llm`, `llm_minus_xlmr`, `encoder_disagree`, `xlmr_llm_label_disagree`                                                                  |
-| Gemma think pass | `p_llm_no_think`, `p_llm_from_log`, `p_llm_log_delta`, `triggered_think`, `think_reasons`, `thinking_cot`, `think_changed_label`                    |
-| Cultural routing | `is_c0`, `is_c1`, `is_c2`                                                                                                                           |
-| RAG/evidence     | `has_context`, `evidence_is_null`, `rag_filled`, `n_retrieved`, `retrieval_sim_max`, `retrieval_sim_mean`, `context_word_len`                       |
-| Run provenance   | `run_timestamp`, `hardware_profile`, `used_llm_verifier`, `llm_checkpoint_source`, `xlmr_from_checkpoint`, `llm_from_checkpoint`                    |
-| Config snapshot  | `xlmr_model_name`, `xlmr_batch_size`, `xlmr_use_amp`, `gemma_device_map`, `gemma_cuda_max_memory`, `gemma_max_input_tokens`, `rag_query_batch_size` |
-| Artifact paths   | `submission_path`, `debug_path`, `xlmr_checkpoint_path`, `llm_checkpoint_path`, `verifier_debug_log_path`                                           |
+| Group            | Useful columns                                                                                                                                                       |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Final decision   | `label`, `p_final`, `threshold`, `threshold_margin`, `threshold_abs_margin`, `threshold_metric`                                                                      |
+| Model scores     | `p_xlmr`, `p_llm`, `llm_minus_xlmr`, `encoder_disagree`, `xlmr_llm_label_disagree`                                                                                   |
+| Gemma think pass | `p_llm_no_think`, `p_llm_from_log`, `p_llm_log_delta`, `triggered_think`, `think_reasons`, `thinking_cot`, `think_changed_label`                                     |
+| Cultural routing | `is_c0`, `is_c1`, `is_c2`                                                                                                                                            |
+| RAG/evidence     | `has_context`, `evidence_is_null`, `rag_filled`, `n_retrieved`, `retrieval_sim_max`, `retrieval_sim_mean`, `context_word_len`                                        |
+| Run provenance   | `run_timestamp`, `hardware_profile`, `used_llm_verifier`, `llm_checkpoint_source`, `xlmr_from_checkpoint`, `llm_from_checkpoint`                                     |
+| Config snapshot  | `xlmr_model_name`, `xlmr_batch_size`, `xlmr_use_amp`, `gemma_load_in`, `gemma_device_map`, `gemma_cuda_max_memory`, `gemma_max_input_tokens`, `rag_query_batch_size` |
+| Artifact paths   | `submission_path`, `debug_path`, `xlmr_checkpoint_path`, `llm_checkpoint_path`, `verifier_debug_log_path`                                                            |
 
 Start with `threshold_abs_margin` to find borderline decisions, then inspect
 `encoder_disagree`, `triggered_think`, and `rag_filled` for likely error modes.
@@ -515,7 +522,7 @@ corpus/*.jsonl                 # { "text": "..." } or { "passage": "..." }
 2. **C0/C1/C2 bands** — LLM-guessed, only used to trigger think; can misfire on edge cases.
 3. **Wiki-only RAG** — weak on math, spelling MCQs, recent news; think-pass is the fallback.
 4. **Expensive OOF Gemma training** — one verifier pass per configured CV fold; plan GPU time accordingly.
-5. **8GB Gemma is fit-first** — CPU offload avoids OOM but is much slower than all-GPU 16GB inference.
+5. **8GB Gemma is fit-first** — int8 CPU offload avoids OOM but is much slower than all-GPU 16GB inference.
 6. **Cached evidence CSVs** — if you change corpus/index/config RAG knobs, delete `*_with_evidence.csv` before re-running.
 7. **Kaggle packaging not automated** — fold checkpoints, index, and exemplars must be bundled manually as a Dataset for offline submit.
 

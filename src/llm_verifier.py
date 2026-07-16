@@ -15,7 +15,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from transformers import AutoModelForMultimodalLM, AutoProcessor, BitsAndBytesConfig
 
-from src.config_utils import resolve_section
+from src.config_utils import resolve_quantization_mode, resolve_section
 
 # Suppress Hugging Face warnings/load reports for a cleaner UI
 transformers.utils.logging.set_verbosity_error()
@@ -147,11 +147,14 @@ class GemmaVerifier:
         gemma_config = resolve_section(self.config, "gemma")
 
         self.model_name = gemma_config["model_name"]
-        self.load_in_4bit = gemma_config["load_in_4bit"]
+        self.load_in = resolve_quantization_mode(gemma_config)
         self.device_map = gemma_config.get("device_map", "cuda:0")
         self.cuda_max_memory = gemma_config.get("cuda_max_memory")
         self.cpu_max_memory = gemma_config.get("cpu_max_memory", "32GiB")
         self.offload_folder = gemma_config.get("offload_folder", "models/offload/gemma")
+        self.llm_int8_enable_fp32_cpu_offload = gemma_config.get(
+            "llm_int8_enable_fp32_cpu_offload", False
+        )
         self.torch_dtype_name = gemma_config.get("torch_dtype", "bfloat16")
         self.bnb_compute_dtype_name = gemma_config.get("bnb_4bit_compute_dtype", "bfloat16")
         self.clear_cuda_before_load = gemma_config.get("clear_cuda_before_load", True)
@@ -165,6 +168,7 @@ class GemmaVerifier:
         self.debug_log_path = "logs/debug_llm_verifier.jsonl"
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.input_device = None
         self.model = None
         self.processor = None
         self.tokenizer = None
@@ -206,7 +210,7 @@ class GemmaVerifier:
             self.token_h_ids = list(set(h_ids))
 
         quant_config = None
-        if self.load_in_4bit and torch.cuda.is_available():
+        if self.load_in == "4bit" and torch.cuda.is_available():
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=_resolve_torch_dtype(
@@ -214,6 +218,11 @@ class GemmaVerifier:
                 ),
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
+            )
+        elif self.load_in == "8bit" and torch.cuda.is_available():
+            quant_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_enable_fp32_cpu_offload=self.llm_int8_enable_fp32_cpu_offload,
             )
 
         torch_dtype = _resolve_torch_dtype(
@@ -241,8 +250,16 @@ class GemmaVerifier:
         ):
             self.model = AutoModelForMultimodalLM.from_pretrained(resolved_name, **load_kwargs)
             self.model.eval()
+            self.input_device = self._infer_input_device()
 
         console.print("[green]✔ Gemma 4 model loaded successfully![/green]")
+
+    def _infer_input_device(self):
+        if torch.cuda.is_available():
+            for param in self.model.parameters():
+                if param.device.type == "cuda":
+                    return param.device
+        return self.model.device
 
     def _prepare_inputs(self, prompt):
         tokenizer = getattr(self.processor, "tokenizer", None)
@@ -259,7 +276,7 @@ class GemmaVerifier:
         finally:
             if tokenizer is not None and original_truncation_side is not None:
                 tokenizer.truncation_side = original_truncation_side
-        return {k: v.to(self.model.device) for k, v in inputs.items()}
+        return {k: v.to(self.input_device or self.model.device) for k, v in inputs.items()}
 
     def predict_cultural_band(self, prompt_bn):
         """Classifies the prompt into C0, C1, or C2 based on next-token logits."""

@@ -1,8 +1,8 @@
 # =============================================================================
 # Aboltabolyzer — runtime configuration
 # =============================================================================
-# Edit this file, then run: just run / just submit / just first-run-16gb
-# All knob meanings are documented here (not in README).
+# Edit this file first, then run: just first-run-8gb / just first-run-16gb
+# Profile-specific blocks at the bottom override the base sections.
 
 # Random seed for fold splits and model init reproducibility.
 seed = 42
@@ -14,15 +14,15 @@ num_folds = 10
 # Runtime — which machine profile and verifier mode to use
 # -----------------------------------------------------------------------------
 [runtime]
-# Active hardware profile. Values "8gb" or "16gb" override [xlmr] and [gemma]
-# sections below with matching [hardware_profiles.*] blocks.
+# Active hardware profile. Values "8gb" or "16gb" override [xlmr], [gemma],
+# and [rag] with matching [hardware_profiles.*] blocks.
 hardware_profile = "8gb"
 
 # If true, training/predict abort when Gemma fails instead of faking scores.
 fail_on_model_error = true
 
 # If true, Gemma is the final verdict source (p_llm). If false, p_llm = p_xlmr
-# and the pipeline skips Gemma — useful for 8GB smoke tests without loading LLM.
+# and the pipeline skips Gemma — useful for smoke tests without loading the LLM.
 use_llm_verifier = true
 
 # Runtime performance knobs. Leave thread counts at 0 to let PyTorch choose.
@@ -94,8 +94,9 @@ similarity_threshold = 0.5
 #   "prompt_response" — question + answer (experimental; can retrieve false-claim evidence)
 query_mode = "prompt"
 
-# Batch size for SentenceTransformer encoding (prevents OOM on smaller GPUs).
+# Batch size for SentenceTransformer corpus indexing.
 batch_size = 32
+# Batch size for batched RAG query retrieval during train/predict.
 query_batch_size = 32
 
 # Max sequence length for the embedding model to limit GPU memory usage.
@@ -131,15 +132,16 @@ early_stopping_patience = 8
 # -----------------------------------------------------------------------------
 [gemma]
 model_name = "google/gemma-4-E4B-it"
-load_in_4bit = true
+load_in = "4bit"                     # "4bit", "8bit", or "none"
 
-# Load placement. 16GB can use "cuda:0"; 8GB should use "auto" with CPU offload.
+# Load placement. Base defaults are for all-GPU 16GB-style loading.
 device_map = "cuda:0"
 cuda_max_memory = "14GiB"
 cpu_max_memory = "32GiB"
 offload_folder = "models/offload/gemma"
+llm_int8_enable_fp32_cpu_offload = false
 
-# Quant/compute dtype knobs. 8GB can switch to float16 if bf16 is unstable.
+# Quant/compute dtype knobs for 4-bit mode.
 torch_dtype = "bfloat16"
 bnb_4bit_compute_dtype = "bfloat16"
 clear_cuda_before_load = true
@@ -178,7 +180,7 @@ threshold_metric = "macro_f1"
 # Saved to models/blender_config.pkl (legacy filename; stores threshold only).
 
 # -----------------------------------------------------------------------------
-# Hardware profile: RTX 5060 8GB — low-VRAM Gemma with CPU offload
+# Hardware profile: RTX 5060 8GB — supported int8 Gemma CPU offload
 # -----------------------------------------------------------------------------
 [hardware_profiles.8gb.xlmr]
 model_name = "FacebookAI/xlm-roberta-base"
@@ -193,7 +195,11 @@ use_amp = false
 early_stopping_patience = 8
 
 [hardware_profiles.8gb.gemma]
+load_in = "8bit"                        # bitsandbytes int8 supports CPU offload; 4bit+auto does not.
+llm_int8_enable_fp32_cpu_offload = true
 device_map = "auto"
+# Keep below total 8GB VRAM so activations, CUDA context, and other allocations
+# have headroom. Lower this if Gemma still OOMs during load.
 cuda_max_memory = "6GiB"
 cpu_max_memory = "48GiB"
 max_input_tokens = 1536
@@ -220,6 +226,8 @@ grad_accum_steps = 4
 use_amp = true
 
 [hardware_profiles.16gb.gemma]
+load_in = "4bit"
+llm_int8_enable_fp32_cpu_offload = false
 device_map = "cuda:0"
 cuda_max_memory = "14GiB"
 max_input_tokens = 3072

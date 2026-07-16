@@ -14,7 +14,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from sklearn.model_selection import StratifiedKFold
 
 from src.blender import ThresholdDecision
-from src.config_utils import apply_runtime_settings, fail_on_model_error
+from src.config_utils import apply_runtime_settings, fail_on_model_error, validate_config
 from src.evaluate import compute_metrics
 from src.llm_verifier import GemmaVerifier
 from src.preprocess import main as run_preprocess
@@ -46,6 +46,7 @@ def main():
 
     with open("configs/config.toml", "rb") as f:
         config = tomllib.load(f)
+    validate_config(config)
     apply_runtime_settings(config)
 
     # 1. Preprocess raw data

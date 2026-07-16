@@ -3,7 +3,6 @@ from copy import deepcopy
 
 import torch
 
-
 _INTEROP_THREADS_CONFIGURED = False
 
 
@@ -17,6 +16,73 @@ def resolve_section(config, section_name):
     profile_overrides = config.get("hardware_profiles", {}).get(profile, {}).get(section_name, {})
     section.update(profile_overrides)
     return section
+
+
+def resolve_quantization_mode(gemma_config):
+    mode = gemma_config.get("load_in")
+    if mode is not None:
+        normalized = str(mode).lower().replace("-", "").replace("_", "")
+        aliases = {
+            "4": "4bit",
+            "4bit": "4bit",
+            "8": "8bit",
+            "8bit": "8bit",
+            "none": "none",
+            "false": "none",
+            "no": "none",
+        }
+        if normalized not in aliases:
+            raise ValueError(f"Unsupported Gemma load_in mode: {mode}")
+        return aliases[normalized]
+
+    # Backward-compatible fallback for old config files.
+    load_in_4bit = bool(gemma_config.get("load_in_4bit", False))
+    load_in_8bit = bool(gemma_config.get("load_in_8bit", False))
+    if load_in_4bit and load_in_8bit:
+        raise ValueError("Gemma config cannot set both load_in_4bit and load_in_8bit.")
+    if load_in_4bit:
+        return "4bit"
+    if load_in_8bit:
+        return "8bit"
+    return "none"
+
+
+def validate_config(config):
+    profile = config.get("runtime", {}).get("hardware_profile")
+    if profile and profile not in config.get("hardware_profiles", {}):
+        raise ValueError(f"Unknown hardware_profile '{profile}'.")
+
+    num_folds = int(config.get("num_folds", 0))
+    if num_folds < 2:
+        raise ValueError("num_folds must be at least 2.")
+
+    query_mode = resolve_section(config, "rag").get("query_mode")
+    if query_mode not in ("prompt", "prompt_response"):
+        raise ValueError("rag.query_mode must be 'prompt' or 'prompt_response'.")
+
+    gemma_config = resolve_section(config, "gemma")
+    load_in = resolve_quantization_mode(gemma_config)
+    device_map = gemma_config.get("device_map")
+    int8_offload = bool(gemma_config.get("llm_int8_enable_fp32_cpu_offload", False))
+
+    if load_in == "4bit" and device_map == "auto":
+        raise ValueError(
+            'Gemma load_in="4bit" cannot use device_map="auto" when CPU/disk '
+            'dispatch may occur. Use load_in="8bit" with '
+            "llm_int8_enable_fp32_cpu_offload=true for 8GB, or device_map='cuda:0' "
+            "for all-GPU loading."
+        )
+    if load_in == "8bit" and device_map == "auto" and not int8_offload:
+        raise ValueError(
+            'Gemma load_in="8bit" with device_map="auto" requires '
+            "llm_int8_enable_fp32_cpu_offload=true."
+        )
+
+    xlmr_config = resolve_section(config, "xlmr")
+    if int(xlmr_config.get("batch_size", 0)) < 1:
+        raise ValueError("xlmr.batch_size must be at least 1.")
+    if int(xlmr_config.get("max_length", 0)) < 1:
+        raise ValueError("xlmr.max_length must be at least 1.")
 
 
 def fail_on_model_error(config):

@@ -4,7 +4,7 @@ import tomllib
 
 from huggingface_hub import snapshot_download
 
-from src.config_utils import resolve_section
+from src.config_utils import resolve_section, validate_config
 
 
 def unique(items):
@@ -40,6 +40,7 @@ def main():
 
     with open("configs/config.toml", "rb") as f:
         config = tomllib.load(f)
+    validate_config(config)
 
     xlmr_config = resolve_section(config, "xlmr")
     model_names = [xlmr_config["model_name"], config["rag"]["model_name"]]

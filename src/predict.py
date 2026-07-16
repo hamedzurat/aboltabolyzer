@@ -15,7 +15,13 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from src.blender import ThresholdDecision
-from src.config_utils import apply_runtime_settings, fail_on_model_error, resolve_section
+from src.config_utils import (
+    apply_runtime_settings,
+    fail_on_model_error,
+    resolve_quantization_mode,
+    resolve_section,
+    validate_config,
+)
 from src.llm_verifier import GemmaVerifier
 from src.rag import BanglaRAG
 from src.xlmr_encoder import predict_test
@@ -152,6 +158,7 @@ def main():
 
     with open("configs/config.toml", "rb") as f:
         config = tomllib.load(f)
+    validate_config(config)
     apply_runtime_settings(config)
     predict_config = config.get("predict", {})
     use_checkpoints = bool(predict_config.get("use_checkpoints", True))
@@ -287,7 +294,11 @@ def main():
         p_llm = None
         llm_from_checkpoint = False
         llm_checkpoint_source = "gemma"
-        llm_metadata = {"checkpoint_source": "gemma", "hardware_profile": hardware_profile}
+        llm_metadata = {
+            "checkpoint_source": "gemma",
+            "hardware_profile": hardware_profile,
+            "gemma_load_in": resolve_quantization_mode(resolve_section(config, "gemma")),
+        }
         if use_checkpoints and not force_recompute:
             p_llm = _load_prediction_checkpoint(
                 llm_checkpoint_path,
@@ -467,7 +478,8 @@ def main():
     debug_df["gemma_max_input_tokens"] = gemma_config.get("max_input_tokens")
     debug_df["gemma_max_think_tokens"] = gemma_config.get("max_think_tokens")
     debug_df["gemma_exemplar_top_k"] = gemma_config.get("exemplar_top_k")
-    debug_df["gemma_load_in_4bit"] = gemma_config.get("load_in_4bit")
+    debug_df["gemma_load_in"] = resolve_quantization_mode(gemma_config)
+    debug_df["gemma_int8_cpu_offload"] = gemma_config.get("llm_int8_enable_fp32_cpu_offload")
     debug_df["rag_query_mode"] = rag_config.get("query_mode")
     debug_df["rag_top_k"] = rag_config.get("top_k")
     debug_df["rag_query_batch_size"] = rag_config.get("query_batch_size")
@@ -576,7 +588,8 @@ def main():
         "gemma_max_input_tokens",
         "gemma_max_think_tokens",
         "gemma_exemplar_top_k",
-        "gemma_load_in_4bit",
+        "gemma_load_in",
+        "gemma_int8_cpu_offload",
         "rag_query_mode",
         "rag_top_k",
         "rag_query_batch_size",
