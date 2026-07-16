@@ -191,7 +191,7 @@ class GemmaVerifier:
             self.model = AutoModelForMultimodalLM.from_pretrained(
                 resolved_name,
                 quantization_config=quant_config,
-                device_map="auto" if torch.cuda.is_available() else None,
+                device_map="cuda:0" if torch.cuda.is_available() else None,
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             )
             self.model.eval()

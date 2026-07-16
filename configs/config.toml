@@ -8,7 +8,7 @@
 seed = 42
 
 # Stratified CV folds for XLM-R training and fold-isolated Gemma OOF.
-num_folds = 5
+num_folds = 10
 
 # -----------------------------------------------------------------------------
 # Runtime — which machine profile and verifier mode to use
@@ -86,14 +86,18 @@ model_name = "FacebookAI/xlm-roberta-large"
 max_length = 512
 batch_size = 16
 grad_accum_steps = 1
-use_amp = true
-epochs = 15
-lr = 4e-5
+use_amp = false
+epochs = 20
+lr = 2e-4
 weight_decay = 0.01
 lora_r = 8
 lora_alpha = 16
 lora_dropout = 0.1
-early_stopping_patience = 5
+# Focal loss focusing parameter (0 = plain BCE, 2 = standard focal).
+focal_gamma = 2.0
+# Label smoothing: 0 = hard labels, 0.1 = soft (helps stop overconfident collapse).
+label_smoothing = 0.1
+early_stopping_patience = 8
 
 # -----------------------------------------------------------------------------
 # Gemma verifier — final judge with XLM-R encoder prior in the prompt
@@ -136,7 +140,8 @@ model_name = "FacebookAI/xlm-roberta-base"
 max_length = 384
 batch_size = 2
 grad_accum_steps = 4
-use_amp = true
+use_amp = false
+early_stopping_patience = 8
 
 [hardware_profiles.8gb.gemma]
 max_think_tokens = 128

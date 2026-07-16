@@ -70,8 +70,9 @@ flowchart TD
     AE --> AI["Grid-search threshold on OOF p_llm<br/>macro_f1 or f1_class_0"]
     AI --> AJ["label = 1 if p_llm >= threshold else 0"]
 
-    AJ --> AK["submissions/submission.csv"]
-    AJ --> AL["submissions/submission_debug.csv<br/>RAG scores · p_xlmr · p_llm · think meta · label"]
+    AJ --> AK["submissions/<timestamp>/submission.csv"]
+    AJ --> AL["submissions/<timestamp>/submission_debug.csv<br/>RAG scores · p_xlmr · p_llm · think meta · label"]
+    AK --> AM["submissions/latest → <timestamp>/ (symlink)"]
 ```
 
 ---
@@ -127,9 +128,10 @@ just predict
 **Commands (after assets exist):**
 
 ```bash
-just submit                   # train + predict
+just submit                   # train (fresh) + predict
+just submit-continue          # resume from existing checkpoints + predict
 # or, if raw data changed:
-just run                      # preprocess + train + predict
+just run                      # preprocess + fresh train + predict
 ```
 
 **Notes:** Training runs Gemma ~5× on the 299 train rows (one OOF fold pass each). Inference is one Gemma pass per test row (+ think on a subset).
@@ -160,6 +162,9 @@ just first-run-8gb
 ```
 
 Or step by step: `just sync` → `just prepare-lite` → `just preprocess` → `just train` → `just predict`
+
+> **Tip:** `just train` always wipes `models/xlmr/` and retrains from scratch.
+> Use `just train-continue` to resume — it skips folds whose checkpoint already exists.
 
 Use this to debug preprocessing, RAG, and cross-encoder training without loading Gemma.
 
@@ -196,13 +201,14 @@ Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **c
 
 ### Workflows (start here)
 
-| Command               | What it does                                                  |
-| --------------------- | ------------------------------------------------------------- |
-| `just first-run-16gb` | sync → prepare-full → preprocess → train → predict            |
-| `just first-run-8gb`  | sync → prepare-lite → preprocess → train → predict (no Gemma) |
-| `just run`            | preprocess → train → predict                                  |
-| `just submit`         | train → predict (data already preprocessed)                   |
-| `just smoke-rag`      | small wiki → index → train → predict                          |
+| Command               | What it does                                                            |
+| --------------------- | ----------------------------------------------------------------------- |
+| `just first-run-16gb` | sync → prepare-full → preprocess → **fresh train** → predict            |
+| `just first-run-8gb`  | sync → prepare-lite → preprocess → **fresh train** → predict (no Gemma) |
+| `just run`            | preprocess → fresh train → predict                                      |
+| `just submit`         | **fresh train** → predict (data already preprocessed)                   |
+| `just submit-continue`| resume existing checkpoints → predict                                   |
+| `just smoke-rag`      | small wiki → index → fresh train → predict                              |
 
 ### Setup
 
@@ -222,11 +228,12 @@ Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **c
 
 ### Pipeline
 
-| Command           | What it does                                           |
-| ----------------- | ------------------------------------------------------ |
-| `just preprocess` | Clean data → `dataset/processed/train.csv`, `test.csv` |
-| `just train`      | Full training pipeline                                 |
-| `just predict`    | Test inference → `submissions/`                        |
+| Command              | What it does                                                 |
+| -------------------- | ------------------------------------------------------------ |
+| `just preprocess`    | Clean data → `dataset/processed/train.csv`, `test.csv`       |
+| `just train`         | Wipe `models/xlmr/` + full training pipeline (fresh start)   |
+| `just train-continue`| Resume training — keeps existing fold checkpoints            |
+| `just predict`       | Test inference → `submissions/<timestamp>/`                  |
 
 ### Cache
 
@@ -264,13 +271,14 @@ Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **c
 
 ### Prediction (`just predict`)
 
-| Path                                       | Contents                         |
-| ------------------------------------------ | -------------------------------- |
-| `submissions/submission.csv`               | `id, label` — upload this        |
-| `submissions/submission_debug.csv`         | Full trace for error analysis    |
-| `dataset/processed/test_with_evidence.csv` | Test after RAG                   |
-| `dataset/processed/test_with_preds.csv`    | Test with `p_xlmr`, `p_llm`      |
-| `logs/debug_llm_verifier.jsonl`            | Per-row Gemma debug at inference |
+| Path                                       | Contents                                          |
+| ------------------------------------------ | ------------------------------------------------- |
+| `submissions/<timestamp>/submission.csv`   | `id, label` — upload this                         |
+| `submissions/<timestamp>/submission_debug.csv` | Full trace for error analysis                 |
+| `submissions/latest`                       | Symlink → most recent timestamped run dir         |
+| `dataset/processed/test_with_evidence.csv` | Test after RAG                                    |
+| `dataset/processed/test_with_preds.csv`    | Test with `p_xlmr`, `p_llm`                       |
+| `logs/debug_llm_verifier.jsonl`            | Per-row Gemma debug at inference                  |
 
 ### `submission_debug.csv` columns
 

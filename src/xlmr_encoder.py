@@ -4,6 +4,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F  # noqa: N812
 import transformers
 from huggingface_hub.utils import disable_progress_bars
 from peft import LoraConfig, TaskType, get_peft_model
@@ -28,6 +29,42 @@ disable_progress_bars()
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 console = Console()
+
+
+class FocalLossWithSmoothing(torch.nn.Module):
+    """Binary focal loss with label smoothing for BCEWithLogitsLoss drop-in.
+
+    - gamma: focusing parameter (0 = plain BCE). gamma=2 is the standard.
+    - smoothing: label smoothing in [0, 0.5). 0.1 is a safe default.
+    - pos_weight: scalar weight for positive class (corrects class imbalance).
+    """
+
+    def __init__(self, gamma: float = 2.0, smoothing: float = 0.1, pos_weight: float = 1.0):
+        super().__init__()
+        self.gamma = gamma
+        self.smoothing = smoothing
+        self.pos_weight = pos_weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Smooth labels: 0 → smoothing, 1 → 1 - smoothing
+        targets_smooth = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
+
+        # Per-sample BCE (no reduction)
+        bce = F.binary_cross_entropy_with_logits(logits, targets_smooth, reduction="none")
+
+        # Class-imbalance correction: upweight positive class loss
+        weight = torch.where(
+            targets >= 0.5, torch.full_like(bce, self.pos_weight), torch.ones_like(bce)
+        )
+        bce = bce * weight
+
+        # Focal modulation: (1 - p_t)^gamma
+        probs = torch.sigmoid(logits)
+        p_t = torch.where(targets >= 0.5, probs, 1.0 - probs)
+        focal_weight = (1.0 - p_t).pow(self.gamma)
+
+        loss = (focal_weight * bce).mean()
+        return loss
 
 
 class BanglaDataset(Dataset):
@@ -87,7 +124,7 @@ def get_model(model_name, lora_r, lora_alpha, lora_dropout, device):
         r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        target_modules=["query", "value"],
+        target_modules=["query", "key", "value", "dense"],
     )
 
     model = get_peft_model(model, peft_config)
@@ -161,11 +198,16 @@ def evaluate(model, dataloader, device):
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
 
-    preds_binary = (all_preds >= 0.5).astype(int)
-    macro_f1 = f1_score(all_labels, preds_binary, average="macro")
-    f1_class_0 = f1_score(all_labels, preds_binary, pos_label=0)
+    best_macro_f1 = -1.0
+    best_f1_class_0 = -1.0
+    for threshold in np.linspace(0.05, 0.95, 181):
+        preds_binary = (all_preds >= threshold).astype(int)
+        macro_f1 = f1_score(all_labels, preds_binary, average="macro", zero_division=0)
+        if macro_f1 > best_macro_f1:
+            best_macro_f1 = macro_f1
+            best_f1_class_0 = f1_score(all_labels, preds_binary, pos_label=0, zero_division=0)
 
-    return macro_f1, f1_class_0, all_preds
+    return best_macro_f1, best_f1_class_0, all_preds
 
 
 def train_cross_validation(train_df, config):
@@ -248,7 +290,16 @@ def train_cross_validation(train_df, config):
                 lr=float(xlmr_config["lr"]),
                 weight_decay=xlmr_config["weight_decay"],
             )
-            criterion = torch.nn.BCEWithLogitsLoss()
+            # Compute class-imbalance pos_weight from this fold's train split
+            n_pos = fold_train_df["label"].sum()
+            n_neg = len(fold_train_df) - n_pos
+            fold_pos_weight = float(n_neg) / max(float(n_pos), 1.0)
+
+            criterion = FocalLossWithSmoothing(
+                gamma=float(xlmr_config.get("focal_gamma", 2.0)),
+                smoothing=float(xlmr_config.get("label_smoothing", 0.1)),
+                pos_weight=fold_pos_weight,
+            )
 
             epochs = xlmr_config["epochs"]
             grad_accum_steps = max(1, int(xlmr_config.get("grad_accum_steps", 1)))
@@ -400,4 +451,14 @@ def predict_test(test_df, config):
         os.path.join(config["data"]["processed_dir"], "preds_test_xlmr.csv"), index=False
     )
     console.print("[green]✔ Cross-encoder test set inference complete and saved.[/green]")
+
+    # Explicitly free tokenizer and dataloader so VRAM is fully released before
+    # Gemma loads (critical on 8GB cards where fragmentation causes OOM).
+    del tokenizer, test_loader
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    gc.collect()
+
     return mean_preds

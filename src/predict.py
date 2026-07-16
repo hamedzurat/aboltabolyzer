@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import tomllib
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -225,9 +226,18 @@ def main():
     console.print("\n[bold cyan]Step 4: Final Threshold Decision[/bold cyan]")
     p_final, preds = decision.predict(p_llm)
 
-    # 7. Create submission file
-    submission_path = config["data"]["submission_output_path"]
-    os.makedirs(os.path.dirname(submission_path), exist_ok=True)
+    # 7. Create submission file — timestamped run folder
+    base_submission_path = config["data"][
+        "submission_output_path"
+    ]  # e.g. submissions/submission.csv
+    submissions_dir = os.path.dirname(base_submission_path)  # e.g. submissions/
+    basename = os.path.basename(base_submission_path)  # e.g. submission.csv
+
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(submissions_dir, run_ts)
+    os.makedirs(run_dir, exist_ok=True)
+
+    submission_path = os.path.join(run_dir, basename)
 
     submission_df = pd.DataFrame(
         {
@@ -301,6 +311,12 @@ def main():
     debug_df = debug_df[ordered]
     debug_df.to_csv(debug_path, index=False)
     console.print(f"Saved detailed debug submission to: [bold white]{debug_path}[/bold white]")
+
+    # Create/update 'latest' symlink for convenience  (submissions/latest -> 20250716_123456/)
+    latest_link = os.path.join(submissions_dir, "latest")
+    if os.path.islink(latest_link) or os.path.exists(latest_link):
+        os.remove(latest_link)
+    os.symlink(os.path.abspath(run_dir), latest_link)
 
     console.print(
         Panel(

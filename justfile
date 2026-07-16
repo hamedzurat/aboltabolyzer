@@ -2,6 +2,9 @@
 # Run `just` to list recipes by group. Config: configs/config.toml
 
 export PYTHONPATH := "."
+# Prevent PyTorch allocator from holding reserved-but-free VRAM between XLM-R
+# and Gemma model loads. Without this, 5+ GiB stays "reserved" and Gemma OOMs.
+export PYTORCH_CUDA_ALLOC_CONF := "expandable_segments:True"
 
 default:
     @just --list
@@ -61,23 +64,27 @@ prepare-lite: download-models
 
 # ── Workflows (match README hardware profiles) ───────────────────────────────
 
-[doc('16GB first run: sync → all assets → preprocess → train → predict')]
+[doc('16GB first run: sync → all assets → preprocess → fresh train → predict')]
 [group('workflows')]
 first-run-16gb: sync prepare-full preprocess train predict
 
-[doc('8GB first run: sync → lite assets → preprocess → train → predict (no Gemma)')]
+[doc('8GB first run: sync → lite assets → preprocess → fresh train → predict (no Gemma)')]
 [group('workflows')]
 first-run-8gb: sync prepare-lite preprocess train predict
 
-[doc('Full pipeline: preprocess → train → predict')]
+[doc('Full pipeline: preprocess → fresh train → predict')]
 [group('workflows')]
 run: preprocess train predict
 
-[doc('Retrain + submit when data is already preprocessed')]
+[doc('Retrain from scratch + submit (data already preprocessed)')]
 [group('workflows')]
 submit: train predict
 
-[doc('RAG smoke test: small corpus → index → train → predict')]
+[doc('Continue from existing checkpoints + submit (skip deleted folds)')]
+[group('workflows')]
+submit-continue: train-continue predict
+
+[doc('RAG smoke test: small corpus → index → fresh train → predict')]
 [group('workflows')]
 smoke-rag: download-corpus-small build-index train predict
 
@@ -88,12 +95,18 @@ smoke-rag: download-corpus-small build-index train predict
 preprocess:
     uv run python src/preprocess.py
 
-[doc('XLM-R OOF + fold-isolated Gemma OOF + threshold tune')]
+[doc('Clean XLM-R checkpoints, then run full training pipeline (fresh start)')]
 [group('pipeline')]
 train:
+    rm -rf models/xlmr
     uv run python src/train.py
 
-[doc('Test inference → submissions/submission.csv + submission_debug.csv')]
+[doc('Resume training — keeps existing fold checkpoints (skips already-done folds)')]
+[group('pipeline')]
+train-continue:
+    uv run python src/train.py
+
+[doc('Test inference → submissions/<timestamp>/ + latest symlink')]
 [group('pipeline')]
 predict:
     uv run python src/predict.py

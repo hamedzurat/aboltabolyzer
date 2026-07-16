@@ -16,15 +16,10 @@ models/
 *.safetensors
 
 # Data and index files
-dataset/processed/
-dataset/train_with_evidence.csv
-dataset/train_with_preds.csv
-dataset/test_with_evidence.csv
-dataset/test_with_preds.csv
+dataset/
 corpus/
 indexes/
-submissions/*.csv
-!submissions/sample_submission.csv
+submissions/
 
 # IDEs & OS files
 .idea/
