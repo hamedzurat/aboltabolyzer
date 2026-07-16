@@ -15,7 +15,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
 from src.blender import ThresholdDecision
-from src.config_utils import fail_on_model_error, resolve_section
+from src.config_utils import apply_runtime_settings, fail_on_model_error, resolve_section
 from src.llm_verifier import GemmaVerifier
 from src.rag import BanglaRAG
 from src.xlmr_encoder import predict_test
@@ -152,6 +152,7 @@ def main():
 
     with open("configs/config.toml", "rb") as f:
         config = tomllib.load(f)
+    apply_runtime_settings(config)
     predict_config = config.get("predict", {})
     use_checkpoints = bool(predict_config.get("use_checkpoints", True))
     force_recompute = bool(predict_config.get("force_recompute", False))
@@ -203,10 +204,8 @@ def main():
                 rag = BanglaRAG()
                 rag.load_index()
 
-                retrieved_contexts = []
-                n_retrieved = []
-                sim_max = []
-                sim_mean = []
+                null_rows = test_df[null_mask]
+                queries = [build_rag_query(row, query_mode) for _, row in null_rows.iterrows()]
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
@@ -215,15 +214,19 @@ def main():
                     transient=True,
                 ) as progress:
                     task = progress.add_task(description="Retrieving facts...", total=num_nulls)
-                    for idx, row in test_df[null_mask].iterrows():
-                        query = build_rag_query(row, query_mode)
-                        hits = rag.retrieve(query)
-                        evidence, n_hits, max_score, mean_score = rag.format_evidence(hits)
-                        retrieved_contexts.append(evidence)
-                        n_retrieved.append(n_hits)
-                        sim_max.append(max_score)
-                        sim_mean.append(mean_score)
-                        progress.advance(task)
+                    hits_by_query = rag.retrieve_many(queries)
+                    progress.advance(task, num_nulls)
+
+                retrieved_contexts = []
+                n_retrieved = []
+                sim_max = []
+                sim_mean = []
+                for hits in hits_by_query:
+                    evidence, n_hits, max_score, mean_score = rag.format_evidence(hits)
+                    retrieved_contexts.append(evidence)
+                    n_retrieved.append(n_hits)
+                    sim_max.append(max_score)
+                    sim_mean.append(mean_score)
 
                 test_df.loc[null_mask, "context"] = retrieved_contexts
                 test_df.loc[null_mask, "n_retrieved"] = n_retrieved
@@ -455,6 +458,9 @@ def main():
     debug_df["xlmr_model_name"] = xlmr_config.get("model_name")
     debug_df["xlmr_max_length"] = xlmr_config.get("max_length")
     debug_df["xlmr_batch_size"] = xlmr_config.get("batch_size")
+    debug_df["xlmr_use_amp"] = xlmr_config.get("use_amp")
+    debug_df["xlmr_num_workers"] = xlmr_config.get("num_workers")
+    debug_df["xlmr_pin_memory"] = xlmr_config.get("pin_memory")
     debug_df["gemma_model_name"] = gemma_config.get("model_name")
     debug_df["gemma_device_map"] = gemma_config.get("device_map")
     debug_df["gemma_cuda_max_memory"] = gemma_config.get("cuda_max_memory")
@@ -464,6 +470,7 @@ def main():
     debug_df["gemma_load_in_4bit"] = gemma_config.get("load_in_4bit")
     debug_df["rag_query_mode"] = rag_config.get("query_mode")
     debug_df["rag_top_k"] = rag_config.get("top_k")
+    debug_df["rag_query_batch_size"] = rag_config.get("query_batch_size")
     debug_df["rag_similarity_threshold"] = rag_config.get("similarity_threshold")
     debug_df["rag_max_evidence_tokens"] = rag_config.get("max_evidence_tokens")
 
@@ -560,6 +567,9 @@ def main():
         "xlmr_model_name",
         "xlmr_max_length",
         "xlmr_batch_size",
+        "xlmr_use_amp",
+        "xlmr_num_workers",
+        "xlmr_pin_memory",
         "gemma_model_name",
         "gemma_device_map",
         "gemma_cuda_max_memory",
@@ -569,6 +579,7 @@ def main():
         "gemma_load_in_4bit",
         "rag_query_mode",
         "rag_top_k",
+        "rag_query_batch_size",
         "rag_similarity_threshold",
         "rag_max_evidence_tokens",
         "xlmr_checkpoint_path",

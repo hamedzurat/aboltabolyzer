@@ -20,7 +20,7 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 
-from src.config_utils import resolve_section
+from src.config_utils import apply_runtime_settings, resolve_section
 
 # Suppress Hugging Face warnings/load reports for a cleaner UI
 transformers.utils.logging.set_verbosity_error()
@@ -29,6 +29,23 @@ disable_progress_bars()
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 console = Console()
+
+
+def _dataloader_kwargs(config, device):
+    num_workers = int(config.get("num_workers", 0) or 0)
+    pin_memory = bool(config.get("pin_memory", False)) and device.type == "cuda"
+    kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = bool(config.get("persistent_workers", True))
+        kwargs["prefetch_factor"] = int(config.get("prefetch_factor", 2) or 2)
+    return kwargs
+
+
+def _to_device(tensor, device):
+    return tensor.to(device, non_blocking=device.type == "cuda")
 
 
 class FocalLossWithSmoothing(torch.nn.Module):
@@ -150,9 +167,9 @@ def train_epoch(
     optimizer.zero_grad()
 
     for step, batch in enumerate(dataloader, start=1):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device).unsqueeze(1)
+        input_ids = _to_device(batch["input_ids"], device)
+        attention_mask = _to_device(batch["attention_mask"], device)
+        labels = _to_device(batch["labels"], device).unsqueeze(1)
 
         amp_enabled = use_amp and device.type == "cuda"
         with torch.autocast(device_type="cuda", enabled=amp_enabled):
@@ -177,18 +194,20 @@ def train_epoch(
     return total_loss / total_steps
 
 
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, use_amp=False):
     model.eval()
     all_preds = []
     all_labels = []
 
-    with torch.no_grad():
+    amp_enabled = use_amp and device.type == "cuda"
+    with torch.inference_mode():
         for batch in dataloader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            input_ids = _to_device(batch["input_ids"], device)
+            attention_mask = _to_device(batch["attention_mask"], device)
             labels = batch["labels"].cpu().numpy()
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            with torch.autocast(device_type="cuda", enabled=amp_enabled):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits.squeeze(1)
             probs = torch.sigmoid(logits).cpu().numpy()
 
@@ -211,6 +230,7 @@ def evaluate(model, dataloader, device):
 
 
 def train_cross_validation(train_df, config):
+    apply_runtime_settings(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     xlmr_config = resolve_section(config, "xlmr")
     console.print(f"[bold cyan]Selected training hardware device:[/bold cyan] {device}")
@@ -245,8 +265,19 @@ def train_cross_validation(train_df, config):
         train_dataset = BanglaDataset(fold_train_df, tokenizer, xlmr_config["max_length"])
         val_dataset = BanglaDataset(fold_val_df, tokenizer, xlmr_config["max_length"])
 
-        train_loader = DataLoader(train_dataset, batch_size=xlmr_config["batch_size"], shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=xlmr_config["batch_size"], shuffle=False)
+        loader_kwargs = _dataloader_kwargs(xlmr_config, device)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=xlmr_config["batch_size"],
+            shuffle=True,
+            **loader_kwargs,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=xlmr_config["batch_size"],
+            shuffle=False,
+            **loader_kwargs,
+        )
 
         state_dict_path = f"models/xlmr/best_fold_{fold}.pt"
         if os.path.exists(state_dict_path):
@@ -266,7 +297,12 @@ def train_cross_validation(train_df, config):
                 model.load_state_dict(
                     torch.load(state_dict_path, map_location=device, weights_only=True)
                 )
-            val_macro_f1, val_f1_0, val_probs = evaluate(model, val_loader, device)
+            val_macro_f1, val_f1_0, val_probs = evaluate(
+                model,
+                val_loader,
+                device,
+                use_amp=bool(xlmr_config.get("use_amp", True)),
+            )
             console.print(
                 f"[bold green]Loaded Fold {fold + 1} from checkpoint.[/bold green] | "
                 f"Val Macro-F1: [bold green]{val_macro_f1:.4f}[/bold green] | "
@@ -341,7 +377,12 @@ def train_cross_validation(train_df, config):
                         use_amp=bool(xlmr_config.get("use_amp", True)),
                     )
 
-                val_macro_f1, val_f1_0, val_probs = evaluate(model, val_loader, device)
+                val_macro_f1, val_f1_0, val_probs = evaluate(
+                    model,
+                    val_loader,
+                    device,
+                    use_amp=bool(xlmr_config.get("use_amp", True)),
+                )
 
                 # Print epoch report
                 console.print(
@@ -386,6 +427,7 @@ def train_cross_validation(train_df, config):
 
 
 def predict_test(test_df, config):
+    apply_runtime_settings(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     xlmr_config = resolve_section(config, "xlmr")
     from src.config_utils import resolve_model_path
@@ -394,7 +436,12 @@ def predict_test(test_df, config):
     tokenizer = AutoTokenizer.from_pretrained(resolved_tokenizer_name)
 
     test_dataset = BanglaDataset(test_df, tokenizer, xlmr_config["max_length"], has_labels=False)
-    test_loader = DataLoader(test_dataset, batch_size=xlmr_config["batch_size"], shuffle=False)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=xlmr_config["batch_size"],
+        shuffle=False,
+        **_dataloader_kwargs(xlmr_config, device),
+    )
 
     all_fold_preds = []
     num_folds = config["num_folds"]
@@ -428,12 +475,14 @@ def predict_test(test_df, config):
             model.eval()
             fold_preds = []
 
-            with torch.no_grad():
+            amp_enabled = bool(xlmr_config.get("use_amp", False)) and device.type == "cuda"
+            with torch.inference_mode():
                 for batch in test_loader:
-                    input_ids = batch["input_ids"].to(device)
-                    attention_mask = batch["attention_mask"].to(device)
+                    input_ids = _to_device(batch["input_ids"], device)
+                    attention_mask = _to_device(batch["attention_mask"], device)
 
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    with torch.autocast(device_type="cuda", enabled=amp_enabled):
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                     logits = outputs.logits.squeeze(1)
                     probs = torch.sigmoid(logits).cpu().numpy()
                     fold_preds.extend(probs)

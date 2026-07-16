@@ -11,6 +11,8 @@ from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from sentence_transformers import SentenceTransformer
 
+from src.config_utils import apply_runtime_settings
+
 console = Console()
 
 
@@ -28,6 +30,7 @@ class BanglaRAG:
     def __init__(self, config_path="configs/config.toml"):
         with open(config_path, "rb") as f:
             self.config = tomllib.load(f)
+        apply_runtime_settings(self.config)
 
         from src.config_utils import resolve_section
 
@@ -40,6 +43,7 @@ class BanglaRAG:
         self.similarity_threshold = self.rag_config.get("similarity_threshold", 0.5)
         self.max_evidence_tokens = self.rag_config.get("max_evidence_tokens", 512)
         self.batch_size = self.rag_config.get("batch_size", 32)
+        self.query_batch_size = self.rag_config.get("query_batch_size", self.batch_size)
         self.max_seq_length = self.rag_config.get("max_seq_length", None)
 
         self.model = None
@@ -229,6 +233,46 @@ class BanglaRAG:
             if score >= similarity_threshold:
                 results.append({"text": self.passages[i], "score": score})
         return results
+
+    def retrieve_many(self, queries, top_k=None, similarity_threshold=None):
+        """Batch-encode queries, then retrieve hits for each query."""
+        queries = list(queries)
+        if not queries:
+            return []
+        if self.embeddings is None:
+            if not self.load_index():
+                return [[] for _ in queries]
+
+        self.load_model()
+
+        if top_k is None:
+            top_k = self.top_k
+        if similarity_threshold is None:
+            similarity_threshold = self.similarity_threshold
+
+        query_embeddings = self.model.encode(
+            queries,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+            batch_size=self.query_batch_size,
+        )
+
+        all_results = []
+        for query_embedding in query_embeddings:
+            similarities = np.dot(self.embeddings, query_embedding)
+            if top_k < len(similarities):
+                candidate_indices = np.argpartition(similarities, -top_k)[-top_k:]
+                top_indices = candidate_indices[np.argsort(similarities[candidate_indices])[::-1]]
+            else:
+                top_indices = np.argsort(similarities)[::-1]
+
+            results = []
+            for i in top_indices[:top_k]:
+                score = float(similarities[i])
+                if score >= similarity_threshold:
+                    results.append({"text": self.passages[i], "score": score})
+            all_results.append(results)
+        return all_results
 
     def format_evidence(self, hits):
         """Join retrieved hits and truncate to max_evidence_tokens."""

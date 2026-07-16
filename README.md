@@ -12,7 +12,50 @@ Bangla hallucination detection for competition submission.
 
 **Architecture:** XLM-R (LoRA) produces an encoder prior → Gemma gives the final verdict → one OOF-tuned threshold on `p_llm` decides the label. No RandomForest blender.
 
-**Config:** all knobs are documented in [`configs/config.toml`](configs/config.toml).
+**Config:** choose the machine profile in [`configs/config.toml`](configs/config.toml),
+then run the matching `just` workflow.
+
+## Quick Start
+
+1. Put the competition files in `dataset/`:
+
+```text
+dataset/sample_dataset.json
+dataset/.3_testset.csv
+dataset/sample_submission.csv
+```
+
+2. Pick a profile in `configs/config.toml`:
+
+```toml
+[runtime]
+hardware_profile = "8gb"   # RTX 5060 mobile 8GB: fits Gemma with CPU offload
+# hardware_profile = "16gb" # RTX 5060 16GB: faster all-GPU Gemma
+use_llm_verifier = true
+```
+
+3. Run one command:
+
+```bash
+just first-run-8gb   # 8GB, slower but designed to fit
+# or
+just first-run-16gb  # 16GB, faster full pipeline
+```
+
+4. Upload:
+
+```text
+submissions/latest/submission.csv
+```
+
+Inspect:
+
+```text
+submissions/latest/submission_debug.csv
+```
+
+Gemma may require Hugging Face access. If the Gemma repository is gated, log in
+with `huggingface-cli login` before `just prepare-full`.
 
 ---
 
@@ -41,7 +84,7 @@ flowchart TD
     L --> M
 
     M --> N["text = context/evidence<br/>text_pair = prompt_bn + response_bn"]
-    N --> O["XLM-R + LoRA · 5-fold CV<br/>8gb: roberta-base · 16gb: roberta-large"]
+    N --> O["XLM-R + LoRA · configured CV folds<br/>8gb: roberta-base · 16gb: roberta-large"]
 
     O --> P["p_xlmr = P(faithful)"]
     P --> Q["OOF → dataset/processed/oof_xlmr.csv"]
@@ -50,7 +93,7 @@ flowchart TD
     R -->|"No"| S["p_llm = p_xlmr"]
     R -->|"Yes"| T["Fold-isolated exemplar index<br/>few-shot from train fold only"]
 
-    T --> U["Retrieve 3 similar train exemplars"]
+    T --> U["Retrieve similar train exemplars<br/>8gb default: 0 · 16gb default: 3"]
     U --> V["Cultural band C0/C1/C2<br/>routes think-pass only"]
 
     Q --> X["Gemma prompt<br/>encoder prior + evidence + Q/A + exemplars"]
@@ -96,6 +139,9 @@ Pick one profile, edit **`configs/config.toml` `[runtime]`**, then run the comma
 
 **Machine:** RTX 5060 16GB, Kaggle P100/T4, or similar.
 
+Use this when Gemma can fit fully on GPU. It is the faster path and keeps
+dynamic Gemma exemplars enabled.
+
 **Set in `configs/config.toml`:**
 
 ```toml
@@ -104,8 +150,22 @@ hardware_profile = "16gb"
 use_llm_verifier = true
 fail_on_model_error = true
 
+[predict]
+use_checkpoints = true
+force_recompute = false
+
+[hardware_profiles.16gb.gemma]
+device_map = "cuda:0"
+exemplar_top_k = 3
+max_input_tokens = 3072
+
+[hardware_profiles.16gb.xlmr]
+use_amp = true
+batch_size = 4
+
 [hardware_profiles.16gb.rag]
 batch_size = 64
+query_batch_size = 64
 max_seq_length = 512
 ```
 
@@ -134,13 +194,18 @@ just submit-continue          # resume from existing checkpoints + predict
 just run                      # preprocess + fresh train + predict
 ```
 
-**Notes:** Training runs Gemma ~5× on the 299 train rows (one OOF fold pass each). Inference is one Gemma pass per test row (+ think on a subset).
+**Notes:** Training runs Gemma once per CV fold for OOF scoring, then builds a
+full exemplar index for inference. Inference is one Gemma fast pass per test row,
+plus a think pass on triggered rows.
 
 ---
 
 ### Profile B — 8GB low-VRAM Gemma
 
 **Machine:** RTX 5060 mobile 8GB or any GPU too small for all-GPU Gemma.
+
+Use this when avoiding OOM matters more than raw speed. Gemma is 4-bit, capped
+to part of VRAM, and allowed to offload to CPU RAM. This is slower than 16GB.
 
 **Set in `configs/config.toml`:**
 
@@ -150,14 +215,24 @@ hardware_profile = "8gb"
 use_llm_verifier = true
 fail_on_model_error = true
 
+[predict]
+use_checkpoints = true
+force_recompute = false
+
 [hardware_profiles.8gb.gemma]
 device_map = "auto"
 cuda_max_memory = "6GiB"
 max_input_tokens = 1536
 exemplar_top_k = 0
 
+[hardware_profiles.8gb.xlmr]
+model_name = "FacebookAI/xlm-roberta-base"
+batch_size = 2
+use_amp = false
+
 [hardware_profiles.8gb.rag]
 batch_size = 32
+query_batch_size = 32
 max_seq_length = 512
 ```
 
@@ -174,7 +249,7 @@ parts to CPU RAM, caps CUDA placement to leave headroom, truncates long prompts,
 and disables dynamic exemplars during prediction. It is slower than the 16GB
 profile, but it should resume cleanly if the run is interrupted.
 
-For a pure XLM-R debug run, set:
+For a pure XLM-R debug run without loading Gemma, set:
 
 ```toml
 [runtime]
@@ -204,26 +279,61 @@ Compare `submission_debug.csv` columns `n_retrieved`, `retrieval_sim_max`, `rag_
 
 ### OOM / stability
 
-| Symptom          | Fix                                                                                   |
-| ---------------- | ------------------------------------------------------------------------------------- |
-| XLM-R OOM        | Lower `batch_size` or `max_length` in active hardware profile (`configs/config.toml`) |
+| Symptom          | Fix                                                                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------- |
+| XLM-R OOM        | Lower `batch_size` or `max_length` in active hardware profile (`configs/config.toml`)                               |
 | Gemma OOM        | Use the `8gb` profile, lower `cuda_max_memory`, `max_input_tokens`, `max_think_tokens`, or set `exemplar_top_k = 0` |
-| RAG Indexing OOM | Lower `batch_size` or `max_seq_length` in `[rag]` or profile-specific `[hardware_profiles.<profile>.rag]` section |
-| Stale RAG scores | `just clean-rag-cache` then re-run `just train` / `just predict`                      |
+| RAG Indexing OOM | Lower `batch_size` or `max_seq_length` in `[rag]` or profile-specific `[hardware_profiles.<profile>.rag]` section   |
+| Stale RAG scores | `just clean-rag-cache` then re-run `just train` / `just predict`                                                    |
 
 ### Prediction resume
 
 `just predict` writes stage checkpoints:
 
-| File                                      | Stage                                      |
-| ----------------------------------------- | ------------------------------------------ |
-| `dataset/processed/test_with_evidence.csv`| RAG-filled test contexts                   |
-| `dataset/processed/test_xlmr_preds.csv`   | XLM-R ensemble probabilities               |
-| `logs/debug_llm_verifier.jsonl`           | Row-level Gemma verifier cache             |
-| `dataset/processed/test_llm_preds.csv`    | Complete Gemma probability vector          |
+| File                                       | Stage                             |
+| ------------------------------------------ | --------------------------------- |
+| `dataset/processed/test_with_evidence.csv` | RAG-filled test contexts          |
+| `dataset/processed/test_xlmr_preds.csv`    | XLM-R ensemble probabilities      |
+| `logs/debug_llm_verifier.jsonl`            | Row-level Gemma verifier cache    |
+| `dataset/processed/test_llm_preds.csv`     | Complete Gemma probability vector |
 
 Leave `[predict].use_checkpoints = true` to resume after an OOM or interruption.
 Set `[predict].force_recompute = true` for one clean rerun without deleting files.
+
+### Daily workflow
+
+Use these once assets and preprocessing already exist:
+
+| Goal                      | Command                                                     | Notes                                                              |
+| ------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------ |
+| Resume fold training      | `just train-continue`                                       | Keeps `models/xlmr/best_fold_*.pt` and skips completed folds       |
+| Fresh train, then predict | `just submit`                                               | Deletes XLM-R fold checkpoints first because `just train` is fresh |
+| Resume training + predict | `just submit-continue`                                      | Best after an interrupted training run                             |
+| Re-run prediction only    | `just predict`                                              | Reuses RAG, XLM-R, and Gemma prediction checkpoints when valid     |
+| Force clean prediction    | Set `[predict].force_recompute = true`, then `just predict` | Does not delete files; ignores checkpoint reuse for that run       |
+| Rebuild RAG evidence      | `just clean-rag-cache`                                      | Use after changing corpus, RAG index, or RAG knobs                 |
+
+Checkpoint CSVs include metadata for `hardware_profile` and checkpoint source.
+If you switch between `8gb` and `16gb`, incompatible prediction checkpoints are
+ignored instead of silently reused.
+
+### Performance tuning
+
+The defaults are conservative. Tune in `configs/config.toml`:
+
+| Knob                                           | Where                         | Effect                                                          |
+| ---------------------------------------------- | ----------------------------- | --------------------------------------------------------------- |
+| `batch_size`                                   | `[hardware_profiles.*.xlmr]`  | Bigger is faster until XLM-R OOMs                               |
+| `use_amp`                                      | `[hardware_profiles.*.xlmr]`  | Faster/lower VRAM on newer GPUs; enabled for 16GB by default    |
+| `num_workers`, `pin_memory`, `prefetch_factor` | `[hardware_profiles.*.xlmr]`  | Improves DataLoader throughput                                  |
+| `query_batch_size`                             | `[hardware_profiles.*.rag]`   | Batch-encodes RAG queries; bigger is faster until embedding OOM |
+| `device_map`                                   | `[hardware_profiles.*.gemma]` | `"cuda:0"` is fastest; `"auto"` allows CPU offload              |
+| `cuda_max_memory`                              | `[hardware_profiles.*.gemma]` | Lower to avoid OOM on 8GB; raise on larger cards                |
+| `max_input_tokens`                             | `[hardware_profiles.*.gemma]` | Lower saves memory/time but may truncate evidence               |
+| `exemplar_top_k`                               | `[hardware_profiles.*.gemma]` | More examples may help quality but increases prompt cost        |
+
+For 8GB, do not expect Gemma to saturate the GPU: CPU offload is a fit-first
+mode. For 16GB, keep `device_map = "cuda:0"` for best throughput.
 
 ---
 
@@ -233,14 +343,14 @@ Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **c
 
 ### Workflows (start here)
 
-| Command               | What it does                                                            |
-| --------------------- | ----------------------------------------------------------------------- |
-| `just first-run-16gb` | sync → prepare-full → preprocess → **fresh train** → predict            |
-| `just first-run-8gb`  | sync → prepare-full → preprocess → **fresh train** → predict (low-VRAM Gemma) |
-| `just run`            | preprocess → fresh train → predict                                      |
-| `just submit`         | **fresh train** → predict (data already preprocessed)                   |
-| `just submit-continue`| resume existing checkpoints → predict                                   |
-| `just smoke-rag`      | small wiki → index → fresh train → predict                              |
+| Command                | What it does                                                                  |
+| ---------------------- | ----------------------------------------------------------------------------- |
+| `just first-run-16gb`  | sync → prepare-full → preprocess → **fresh train** → predict                  |
+| `just first-run-8gb`   | sync → prepare-full → preprocess → **fresh train** → predict (low-VRAM Gemma) |
+| `just run`             | preprocess → fresh train → predict                                            |
+| `just submit`          | **fresh train** → predict (data already preprocessed)                         |
+| `just submit-continue` | resume existing checkpoints → predict                                         |
+| `just smoke-rag`       | small wiki → index → fresh train → predict                                    |
 
 ### Setup
 
@@ -260,12 +370,12 @@ Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **c
 
 ### Pipeline
 
-| Command              | What it does                                                 |
-| -------------------- | ------------------------------------------------------------ |
-| `just preprocess`    | Clean data → `dataset/processed/train.csv`, `test.csv`       |
-| `just train`         | Wipe `models/xlmr/` + full training pipeline (fresh start)   |
-| `just train-continue`| Resume training — keeps existing fold checkpoints            |
-| `just predict`       | Test inference → `submissions/<timestamp>/`                  |
+| Command               | What it does                                               |
+| --------------------- | ---------------------------------------------------------- |
+| `just preprocess`     | Clean data → `dataset/processed/train.csv`, `test.csv`     |
+| `just train`          | Wipe `models/xlmr/` + full training pipeline (fresh start) |
+| `just train-continue` | Resume training — keeps existing fold checkpoints          |
+| `just predict`        | Test inference → `submissions/<timestamp>/`                |
 
 ### Cache
 
@@ -296,25 +406,41 @@ Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **c
 | `dataset/processed/train_with_evidence.csv` | Train rows after RAG (+ retrieval score columns) |
 | `dataset/processed/oof_xlmr.csv`            | OOF XLM-R probabilities                          |
 | `dataset/processed/train_with_preds.csv`    | OOF `p_xlmr` + OOF `p_llm`                       |
-| `models/xlmr/best_fold_*.pt`                | LoRA checkpoints (5 folds)                       |
+| `models/xlmr/best_fold_*.pt`                | LoRA checkpoints, one per configured CV fold     |
 | `models/blender_config.pkl`                 | Tuned threshold (legacy filename)                |
 | `indexes/exemplar_index.pkl`                | Full train exemplars for inference               |
 | `logs/debug_llm_verifier_oof_fold_*.jsonl`  | Per-fold Gemma debug during training             |
 
 ### Prediction (`just predict`)
 
-| Path                                       | Contents                                          |
-| ------------------------------------------ | ------------------------------------------------- |
-| `submissions/<timestamp>/submission.csv`   | `id, label` — upload this                         |
-| `submissions/<timestamp>/submission_debug.csv` | Full trace for error analysis                 |
-| `submissions/latest`                       | Symlink → most recent timestamped run dir         |
-| `dataset/processed/test_with_evidence.csv` | Test after RAG                                    |
-| `dataset/processed/test_with_preds.csv`    | Test with `p_xlmr`, `p_llm`                       |
-| `logs/debug_llm_verifier.jsonl`            | Per-row Gemma debug at inference                  |
+| Path                                           | Contents                                    |
+| ---------------------------------------------- | ------------------------------------------- |
+| `submissions/<timestamp>/submission.csv`       | `id, label` — upload this                   |
+| `submissions/<timestamp>/submission_debug.csv` | Full trace for error analysis               |
+| `submissions/latest`                           | Symlink → most recent timestamped run dir   |
+| `dataset/processed/test_with_evidence.csv`     | Test after RAG                              |
+| `dataset/processed/test_xlmr_preds.csv`        | Resumable XLM-R test probabilities          |
+| `dataset/processed/test_llm_preds.csv`         | Resumable Gemma/fallback test probabilities |
+| `dataset/processed/test_with_preds.csv`        | Test with `p_xlmr`, `p_llm`                 |
+| `logs/debug_llm_verifier.jsonl`                | Per-row Gemma debug at inference            |
 
 ### `submission_debug.csv` columns
 
-`id`, `has_context`, `context_original`, `context`, `prompt_bn`, `response_bn`, `n_retrieved`, `retrieval_sim_max`, `retrieval_sim_mean`, `rag_filled`, `p_xlmr`, `p_llm_no_think`, `p_llm`, `p_final`, `threshold`, `threshold_metric`, `encoder_disagree`, `triggered_think`, `think_reasons`, `is_c0`, `is_c1`, `is_c2`, `used_llm_verifier`, `label`
+The debug CSV is intentionally wide. Key groups:
+
+| Group            | Useful columns                                                                                                                                      |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Final decision   | `label`, `p_final`, `threshold`, `threshold_margin`, `threshold_abs_margin`, `threshold_metric`                                                     |
+| Model scores     | `p_xlmr`, `p_llm`, `llm_minus_xlmr`, `encoder_disagree`, `xlmr_llm_label_disagree`                                                                  |
+| Gemma think pass | `p_llm_no_think`, `p_llm_from_log`, `p_llm_log_delta`, `triggered_think`, `think_reasons`, `thinking_cot`, `think_changed_label`                    |
+| Cultural routing | `is_c0`, `is_c1`, `is_c2`                                                                                                                           |
+| RAG/evidence     | `has_context`, `evidence_is_null`, `rag_filled`, `n_retrieved`, `retrieval_sim_max`, `retrieval_sim_mean`, `context_word_len`                       |
+| Run provenance   | `run_timestamp`, `hardware_profile`, `used_llm_verifier`, `llm_checkpoint_source`, `xlmr_from_checkpoint`, `llm_from_checkpoint`                    |
+| Config snapshot  | `xlmr_model_name`, `xlmr_batch_size`, `xlmr_use_amp`, `gemma_device_map`, `gemma_cuda_max_memory`, `gemma_max_input_tokens`, `rag_query_batch_size` |
+| Artifact paths   | `submission_path`, `debug_path`, `xlmr_checkpoint_path`, `llm_checkpoint_path`, `verifier_debug_log_path`                                           |
+
+Start with `threshold_abs_margin` to find borderline decisions, then inspect
+`encoder_disagree`, `triggered_think`, and `rag_filled` for likely error modes.
 
 ---
 
@@ -355,13 +481,13 @@ corpus/*.jsonl                 # { "text": "..." } or { "passage": "..." }
 | ----------------- | ---------------------------------------------------------------------- |
 | `preprocess.py`   | Bengali text cleanup, `[NULL]` handling, `has_context`                 |
 | `rag.py`          | BGE-M3 dense index, scored retrieval, `max_evidence_tokens` truncation |
-| `xlmr_encoder.py` | LoRA fine-tune, 5-fold OOF, test ensemble                              |
+| `xlmr_encoder.py` | LoRA fine-tune, configured-fold OOF, test ensemble                     |
 | `llm_verifier.py` | Gemma verifier — encoder prior, fast/think passes, C0/C1/C2 routing    |
 | `blender.py`      | `ThresholdDecision` — OOF threshold on `p_llm` only                    |
 | `train.py`        | Orchestrates preprocess → RAG → XLM-R → OOF Gemma → threshold          |
 | `predict.py`      | Orchestrates RAG → XLM-R → Gemma → threshold → submission + debug CSV  |
 | `evaluate.py`     | Macro F1, per-class F1, confusion matrix                               |
-| `config_utils.py` | Hardware profile resolution, model path cache                          |
+| `config_utils.py` | Hardware profile resolution, model path cache, runtime torch settings  |
 
 ### `scripts/`
 
@@ -388,9 +514,10 @@ corpus/*.jsonl                 # { "text": "..." } or { "passage": "..." }
 1. **Small labeled set (299)** — threshold and LoRA both fit on little data; treat train metrics as noisy.
 2. **C0/C1/C2 bands** — LLM-guessed, only used to trigger think; can misfire on edge cases.
 3. **Wiki-only RAG** — weak on math, spelling MCQs, recent news; think-pass is the fallback.
-4. **Expensive OOF Gemma training** — ~5× full verifier passes on train; plan GPU time accordingly.
-5. **Cached evidence CSVs** — if you change corpus/index/config RAG knobs, delete `*_with_evidence.csv` before re-running.
-6. **Kaggle packaging not automated** — fold checkpoints, index, and exemplars must be bundled manually as a Dataset for offline submit.
+4. **Expensive OOF Gemma training** — one verifier pass per configured CV fold; plan GPU time accordingly.
+5. **8GB Gemma is fit-first** — CPU offload avoids OOM but is much slower than all-GPU 16GB inference.
+6. **Cached evidence CSVs** — if you change corpus/index/config RAG knobs, delete `*_with_evidence.csv` before re-running.
+7. **Kaggle packaging not automated** — fold checkpoints, index, and exemplars must be bundled manually as a Dataset for offline submit.
 
 ---
 
@@ -403,6 +530,9 @@ corpus/*.jsonl                 # { "text": "..." } or { "passage": "..." }
 - [x] Think triggers: uncertainty, encoder disagreement, C0+NULL, C2
 - [x] `max_evidence_tokens` + retrieval scores in debug CSV
 - [x] 8GB / 16GB hardware profiles
+- [x] Resumable prediction checkpoints with profile/source metadata
+- [x] Wide debug submission CSV with score, RAG, checkpoint, and config provenance
+- [x] Batched RAG query retrieval and faster XLM-R inference settings
 - [x] `just` recipes for assets, train, predict
 
 **Next**

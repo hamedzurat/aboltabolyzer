@@ -14,7 +14,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 from sklearn.model_selection import StratifiedKFold
 
 from src.blender import ThresholdDecision
-from src.config_utils import fail_on_model_error
+from src.config_utils import apply_runtime_settings, fail_on_model_error
 from src.evaluate import compute_metrics
 from src.llm_verifier import GemmaVerifier
 from src.preprocess import main as run_preprocess
@@ -46,6 +46,7 @@ def main():
 
     with open("configs/config.toml", "rb") as f:
         config = tomllib.load(f)
+    apply_runtime_settings(config)
 
     # 1. Preprocess raw data
     train_processed_path = os.path.join(config["data"]["processed_dir"], "train.csv")
@@ -91,10 +92,8 @@ def main():
                 rag = BanglaRAG()
                 rag.load_index()
 
-                retrieved_contexts = []
-                n_retrieved = []
-                sim_max = []
-                sim_mean = []
+                null_rows = train_df[null_mask]
+                queries = [build_rag_query(row, query_mode) for _, row in null_rows.iterrows()]
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
@@ -103,15 +102,19 @@ def main():
                     transient=True,
                 ) as progress:
                     task = progress.add_task(description="Retrieving facts...", total=num_nulls)
-                    for idx, row in train_df[null_mask].iterrows():
-                        query = build_rag_query(row, query_mode)
-                        hits = rag.retrieve(query)
-                        evidence, n_hits, max_score, mean_score = rag.format_evidence(hits)
-                        retrieved_contexts.append(evidence)
-                        n_retrieved.append(n_hits)
-                        sim_max.append(max_score)
-                        sim_mean.append(mean_score)
-                        progress.advance(task)
+                    hits_by_query = rag.retrieve_many(queries)
+                    progress.advance(task, num_nulls)
+
+                retrieved_contexts = []
+                n_retrieved = []
+                sim_max = []
+                sim_mean = []
+                for hits in hits_by_query:
+                    evidence, n_hits, max_score, mean_score = rag.format_evidence(hits)
+                    retrieved_contexts.append(evidence)
+                    n_retrieved.append(n_hits)
+                    sim_max.append(max_score)
+                    sim_mean.append(mean_score)
 
                 train_df.loc[null_mask, "context"] = retrieved_contexts
                 train_df.loc[null_mask, "n_retrieved"] = n_retrieved

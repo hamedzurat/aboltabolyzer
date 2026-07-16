@@ -285,7 +285,7 @@ class GemmaVerifier:
 
         inputs = self._prepare_inputs(prompt)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.model(**inputs)
             logits = outputs.logits
 
@@ -445,7 +445,7 @@ class GemmaVerifier:
 
         inputs = self._prepare_inputs(prompt)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.model(**inputs)
             logits = outputs.logits
 
@@ -502,7 +502,7 @@ class GemmaVerifier:
 
             think_inputs = self._prepare_inputs(think_prompt)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 gen_outputs = self.model.generate(
                     **think_inputs,
                     max_new_tokens=self.max_think_tokens,

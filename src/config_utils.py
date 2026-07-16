@@ -1,6 +1,11 @@
 import os
 from copy import deepcopy
 
+import torch
+
+
+_INTEROP_THREADS_CONFIGURED = False
+
 
 def resolve_section(config, section_name):
     """Return a config section with the active hardware profile overlaid."""
@@ -16,6 +21,30 @@ def resolve_section(config, section_name):
 
 def fail_on_model_error(config):
     return bool(config.get("runtime", {}).get("fail_on_model_error", True))
+
+
+def apply_runtime_settings(config):
+    global _INTEROP_THREADS_CONFIGURED
+
+    runtime = config.get("runtime", {})
+
+    torch_num_threads = int(runtime.get("torch_num_threads", 0) or 0)
+    if torch_num_threads > 0:
+        torch.set_num_threads(torch_num_threads)
+
+    torch_interop_threads = int(runtime.get("torch_interop_threads", 0) or 0)
+    if torch_interop_threads > 0 and not _INTEROP_THREADS_CONFIGURED:
+        torch.set_num_interop_threads(torch_interop_threads)
+        _INTEROP_THREADS_CONFIGURED = True
+
+    matmul_precision = runtime.get("float32_matmul_precision")
+    if matmul_precision:
+        torch.set_float32_matmul_precision(str(matmul_precision))
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = bool(runtime.get("cuda_benchmark", False))
+        torch.backends.cuda.matmul.allow_tf32 = bool(runtime.get("allow_tf32", True))
+        torch.backends.cudnn.allow_tf32 = bool(runtime.get("allow_tf32", True))
 
 
 def resolve_model_path(model_name, models_dir="models/hf"):

@@ -25,6 +25,13 @@ fail_on_model_error = true
 # and the pipeline skips Gemma — useful for 8GB smoke tests without loading LLM.
 use_llm_verifier = true
 
+# Runtime performance knobs. Leave thread counts at 0 to let PyTorch choose.
+torch_num_threads = 0
+torch_interop_threads = 0
+float32_matmul_precision = "high"
+allow_tf32 = true
+cuda_benchmark = false
+
 # -----------------------------------------------------------------------------
 # Prediction checkpoints — resume `just predict` after OOMs/interruptions
 # -----------------------------------------------------------------------------
@@ -89,6 +96,7 @@ query_mode = "prompt"
 
 # Batch size for SentenceTransformer encoding (prevents OOM on smaller GPUs).
 batch_size = 32
+query_batch_size = 32
 
 # Max sequence length for the embedding model to limit GPU memory usage.
 max_seq_length = 512
@@ -100,6 +108,10 @@ max_seq_length = 512
 model_name = "FacebookAI/xlm-roberta-large"
 max_length = 512
 batch_size = 16
+num_workers = 2
+pin_memory = true
+prefetch_factor = 2
+persistent_workers = true
 grad_accum_steps = 1
 use_amp = false
 epochs = 20
@@ -172,6 +184,10 @@ threshold_metric = "macro_f1"
 model_name = "FacebookAI/xlm-roberta-base"
 max_length = 384
 batch_size = 2
+num_workers = 2
+pin_memory = true
+prefetch_factor = 2
+persistent_workers = true
 grad_accum_steps = 4
 use_amp = false
 early_stopping_patience = 8
@@ -186,6 +202,7 @@ max_think_tokens = 128
 
 [hardware_profiles.8gb.rag]
 batch_size = 32
+query_batch_size = 32
 max_seq_length = 512
 
 # -----------------------------------------------------------------------------
@@ -195,6 +212,10 @@ max_seq_length = 512
 model_name = "FacebookAI/xlm-roberta-large"
 max_length = 512
 batch_size = 4
+num_workers = 2
+pin_memory = true
+prefetch_factor = 2
+persistent_workers = true
 grad_accum_steps = 4
 use_amp = true
 
@@ -207,4 +228,5 @@ max_think_tokens = 256
 
 [hardware_profiles.16gb.rag]
 batch_size = 64
+query_batch_size = 64
 max_seq_length = 512
