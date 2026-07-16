@@ -163,6 +163,7 @@ class GemmaVerifier:
         self.classify_cultural_band_enabled = gemma_config.get("classify_cultural_band", True)
         self.enable_think_pass = gemma_config.get("enable_think_pass", True)
         self.use_inputs_embeds_for_forward = gemma_config.get("use_inputs_embeds_for_forward", False)
+        self.use_language_model_direct = gemma_config.get("use_language_model_direct", False)
         self.conf_threshold = gemma_config["confidence_threshold"]
         self.disagree_threshold = gemma_config.get("disagree_threshold", 0.25)
         self.force_think_c0_null = gemma_config.get("force_think_c0_null", True)
@@ -254,6 +255,15 @@ class GemmaVerifier:
             self.model = AutoModelForMultimodalLM.from_pretrained(resolved_name, **load_kwargs)
             self.model.eval()
             self.input_device = self._infer_input_device()
+            if self.use_language_model_direct and not (
+                hasattr(self.model, "model")
+                and hasattr(self.model.model, "language_model")
+                and hasattr(self.model, "lm_head")
+            ):
+                raise ValueError(
+                    "use_language_model_direct=true requires a Gemma-style multimodal "
+                    "model with model.language_model and lm_head."
+                )
 
         console.print("[green]✔ Gemma 4 model loaded successfully![/green]")
 
@@ -284,11 +294,32 @@ class GemmaVerifier:
         inputs = {k: v.to(target_device) for k, v in inputs.items()}
         if use_inputs_embeds is None:
             use_inputs_embeds = self.use_inputs_embeds_for_forward
-        if use_inputs_embeds and "input_ids" in inputs:
+        if use_inputs_embeds and not self.use_language_model_direct and "input_ids" in inputs:
             input_ids = inputs.pop("input_ids")
             with torch.inference_mode():
                 inputs["inputs_embeds"] = self.model.get_input_embeddings()(input_ids)
         return inputs
+
+    def _forward_logits(self, inputs):
+        if not self.use_language_model_direct:
+            outputs = self.model(**inputs, logits_to_keep=1)
+            return outputs.logits
+
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs.get("attention_mask")
+        text_outputs = self.model.model.language_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        hidden_states = text_outputs.last_hidden_state[:, -1:, :]
+        logits = self.model.lm_head(hidden_states)
+        final_logit_softcapping = self.model.config.get_text_config().final_logit_softcapping
+        if final_logit_softcapping is not None:
+            logits = logits / final_logit_softcapping
+            logits = torch.tanh(logits)
+            logits = logits * final_logit_softcapping
+        return logits
 
     def predict_cultural_band(self, prompt_bn):
         """Classifies the prompt into C0, C1, or C2 based on next-token logits."""
@@ -315,8 +346,7 @@ class GemmaVerifier:
         inputs = self._prepare_inputs(prompt)
 
         with torch.inference_mode():
-            outputs = self.model(**inputs)
-            logits = outputs.logits
+            logits = self._forward_logits(inputs)
 
         next_token_logits = logits[0, -1, :]
         probs = torch.softmax(next_token_logits, dim=-1)
@@ -479,8 +509,7 @@ class GemmaVerifier:
         inputs = self._prepare_inputs(prompt)
 
         with torch.inference_mode():
-            outputs = self.model(**inputs)
-            logits = outputs.logits
+            logits = self._forward_logits(inputs)
 
         next_token_logits = logits[0, -1, :]
         probs = torch.softmax(next_token_logits, dim=-1)

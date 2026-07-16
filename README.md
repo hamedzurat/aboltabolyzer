@@ -230,6 +230,7 @@ device_map = "auto"
 cuda_max_memory = "6GiB"
 max_input_tokens = 1536
 use_inputs_embeds_for_forward = true
+use_language_model_direct = true
 classify_cultural_band = false
 enable_think_pass = false
 exemplar_top_k = 0
@@ -255,9 +256,9 @@ Or step by step: `just sync` → `just prepare-full` → `just preprocess` → `
 
 This profile uses the bitsandbytes int8 CPU-offload path because 4-bit
 quantization cannot be auto-dispatched to CPU/disk on this stack. It uses
-precomputed text embeddings for forward passes to avoid Gemma 4 meta-tensor
-embedding issues under CPU offload. It should resume cleanly if the run is
-interrupted.
+Gemma's underlying text language model directly for fast-pass scoring, bypassing
+the multimodal wrapper path that can touch meta tensors under CPU offload. It
+should resume cleanly if the run is interrupted.
 
 For a pure XLM-R debug run without loading Gemma, set:
 
@@ -341,7 +342,8 @@ The defaults are conservative. Tune in `configs/config.toml`:
 | `load_in`                                      | `[hardware_profiles.*.gemma]` | `"4bit"` for 16GB all-GPU; `"8bit"` for 8GB CPU offload         |
 | `cuda_max_memory`                              | `[hardware_profiles.*.gemma]` | Lower to avoid OOM on 8GB; raise on larger cards                |
 | `max_input_tokens`                             | `[hardware_profiles.*.gemma]` | Lower saves memory/time but may truncate evidence               |
-| `use_inputs_embeds_for_forward`                | `[hardware_profiles.*.gemma]` | Helps Gemma 4 text forwards work under CPU offload              |
+| `use_language_model_direct`                    | `[hardware_profiles.*.gemma]` | Bypasses Gemma 4 multimodal wrapper for text-only offload runs  |
+| `use_inputs_embeds_for_forward`                | `[hardware_profiles.*.gemma]` | Optional text-embedding workaround for non-direct forwards      |
 | `classify_cultural_band`, `enable_think_pass`  | `[hardware_profiles.*.gemma]` | Extra Gemma calls; enabled on 16GB, disabled on 8GB by default  |
 | `exemplar_top_k`                               | `[hardware_profiles.*.gemma]` | More examples may help quality but increases prompt cost        |
 
@@ -452,7 +454,7 @@ The debug CSV is intentionally wide. Key groups:
 | Cultural routing | `is_c0`, `is_c1`, `is_c2`                                                                                                                                                                                                              |
 | RAG/evidence     | `has_context`, `evidence_is_null`, `rag_filled`, `n_retrieved`, `retrieval_sim_max`, `retrieval_sim_mean`, `context_word_len`                                                                                                          |
 | Run provenance   | `run_timestamp`, `hardware_profile`, `used_llm_verifier`, `llm_checkpoint_source`, `xlmr_from_checkpoint`, `llm_from_checkpoint`                                                                                                       |
-| Config snapshot  | `xlmr_model_name`, `xlmr_batch_size`, `xlmr_use_amp`, `gemma_load_in`, `gemma_device_map`, `gemma_cuda_max_memory`, `gemma_max_input_tokens`, `gemma_use_inputs_embeds_for_forward`, `gemma_enable_think_pass`, `rag_query_batch_size` |
+| Config snapshot  | `xlmr_model_name`, `xlmr_batch_size`, `xlmr_use_amp`, `gemma_load_in`, `gemma_device_map`, `gemma_cuda_max_memory`, `gemma_max_input_tokens`, `gemma_use_language_model_direct`, `gemma_enable_think_pass`, `rag_query_batch_size` |
 | Artifact paths   | `submission_path`, `debug_path`, `xlmr_checkpoint_path`, `llm_checkpoint_path`, `verifier_debug_log_path`                                                                                                                              |
 
 Start with `threshold_abs_margin` to find borderline decisions, then inspect

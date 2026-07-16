@@ -153,6 +153,7 @@ max_input_tokens = 3072
 # Gemma 4 CPU-offload profiles where direct embedding weight indexing can hit a
 # meta tensor.
 use_inputs_embeds_for_forward = false
+use_language_model_direct = false
 
 # Extra verifier passes. Disable on constrained/offload profiles for stability.
 classify_cultural_band = true
@@ -213,6 +214,7 @@ cuda_max_memory = "6GiB"
 cpu_max_memory = "48GiB"
 max_input_tokens = 1536
 use_inputs_embeds_for_forward = true
+use_language_model_direct = true
 classify_cultural_band = false
 enable_think_pass = false
 exemplar_top_k = 0
@@ -244,6 +246,7 @@ device_map = "cuda:0"
 cuda_max_memory = "14GiB"
 max_input_tokens = 3072
 use_inputs_embeds_for_forward = false
+use_language_model_direct = false
 classify_cultural_band = true
 enable_think_pass = true
 exemplar_top_k = 3

@@ -483,6 +483,7 @@ def main():
     debug_df["gemma_use_inputs_embeds_for_forward"] = gemma_config.get(
         "use_inputs_embeds_for_forward"
     )
+    debug_df["gemma_use_language_model_direct"] = gemma_config.get("use_language_model_direct")
     debug_df["gemma_classify_cultural_band"] = gemma_config.get("classify_cultural_band")
     debug_df["gemma_enable_think_pass"] = gemma_config.get("enable_think_pass")
     debug_df["rag_query_mode"] = rag_config.get("query_mode")
@@ -596,6 +597,7 @@ def main():
         "gemma_load_in",
         "gemma_int8_cpu_offload",
         "gemma_use_inputs_embeds_for_forward",
+        "gemma_use_language_model_direct",
         "gemma_classify_cultural_band",
         "gemma_enable_think_pass",
         "rag_query_mode",
