@@ -16,7 +16,7 @@ num_folds = 10
 [runtime]
 # Active hardware profile. Values "8gb" or "16gb" override [runtime], [xlmr],
 # [gemma], and [rag] with matching [hardware_profiles.*] blocks.
-hardware_profile = "8gb"
+hardware_profile = "16gb"
 
 # If true, training/predict abort when Gemma fails instead of faking scores.
 fail_on_model_error = true
@@ -241,12 +241,14 @@ fail_on_model_error = true
 [hardware_profiles.16gb.xlmr]
 model_name = "FacebookAI/xlm-roberta-large"
 max_length = 512
-batch_size = 4
-num_workers = 2
+# batch_size * grad_accum_steps is the effective batch. Keep the product at 16:
+# with ~269 train rows per fold, a larger effective batch leaves too few steps.
+batch_size = 8
+num_workers = 4
 pin_memory = true
-prefetch_factor = 2
+prefetch_factor = 4
 persistent_workers = true
-grad_accum_steps = 4
+grad_accum_steps = 2
 use_amp = true
 
 [hardware_profiles.16gb.gemma]
@@ -263,6 +265,6 @@ exemplar_top_k = 3
 max_think_tokens = 256
 
 [hardware_profiles.16gb.rag]
-batch_size = 64
-query_batch_size = 64
+batch_size = 128
+query_batch_size = 128
 max_seq_length = 512

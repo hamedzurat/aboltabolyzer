@@ -79,7 +79,10 @@ class BanglaRAG:
 
             for file_path in jsonl_files:
                 progress.update(task, description=f"Reading {os.path.basename(file_path)}...")
-                with open(file_path, "r", encoding="utf-8") as f:
+                skipped = 0
+                # errors="replace" so one corrupt byte run cannot abort the whole
+                # corpus read; damaged lines then fail json.loads and are counted below.
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
                         if line.strip():
                             try:
@@ -89,7 +92,13 @@ class BanglaRAG:
                                 elif "passage" in obj:
                                     passages.append(obj["passage"])
                             except json.JSONDecodeError:
+                                skipped += 1
                                 continue
+                if skipped:
+                    console.print(
+                        f"[yellow]Skipped {skipped} unreadable line(s) in "
+                        f"{os.path.basename(file_path)} — corpus file may be corrupt.[/yellow]"
+                    )
                 progress.advance(task)
 
         # Sort passages by length to optimize encoder performance

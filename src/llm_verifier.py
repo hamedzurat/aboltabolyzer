@@ -208,9 +208,7 @@ class GemmaVerifier:
                 self.processor = AutoProcessor.from_pretrained(resolved_name)
                 self.tokenizer = self.processor.tokenizer
             else:
-                raise ValueError(
-                    "gemma.model_loader must be 'causal_lm' or 'multimodal_lm'."
-                )
+                raise ValueError("gemma.model_loader must be 'causal_lm' or 'multimodal_lm'.")
 
             f_variants = ["F", " F", "faithful", " Faithful"]
             h_variants = ["H", " H", "hallucinated", " Hallucinated"]

@@ -29,8 +29,8 @@ dataset/sample_submission.csv
 
 ```toml
 [runtime]
-hardware_profile = "8gb"   # RTX 5060 mobile 8GB: ungated Qwen verifier
-# hardware_profile = "16gb" # RTX 5060 16GB: full Gemma 4 verifier
+hardware_profile = "16gb"  # RTX 5060 Ti 16GB: full Gemma 4 verifier (default)
+# hardware_profile = "8gb" # RTX 5060 mobile 8GB: ungated Qwen verifier
 ```
 
 3. Run one command:
@@ -161,11 +161,12 @@ max_input_tokens = 3072
 
 [hardware_profiles.16gb.xlmr]
 use_amp = true
-batch_size = 4
+batch_size = 8
+grad_accum_steps = 2
 
 [hardware_profiles.16gb.rag]
-batch_size = 64
-query_batch_size = 64
+batch_size = 128
+query_batch_size = 128
 max_seq_length = 512
 ```
 
