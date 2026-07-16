@@ -149,6 +149,15 @@ clear_cuda_before_load = true
 # Truncate Gemma inputs before they get too large. Null means tokenizer default.
 max_input_tokens = 3072
 
+# Use precomputed text embeddings for normal forward passes. This is useful for
+# Gemma 4 CPU-offload profiles where direct embedding weight indexing can hit a
+# meta tensor.
+use_inputs_embeds_for_forward = false
+
+# Extra verifier passes. Disable on constrained/offload profiles for stability.
+classify_cultural_band = true
+enable_think_pass = true
+
 # Dynamic few-shot examples. Lower this to reduce prompt length and avoid loading
 # the exemplar embedding model during prediction.
 exemplar_top_k = 3
@@ -203,6 +212,9 @@ device_map = "auto"
 cuda_max_memory = "6GiB"
 cpu_max_memory = "48GiB"
 max_input_tokens = 1536
+use_inputs_embeds_for_forward = true
+classify_cultural_band = false
+enable_think_pass = false
 exemplar_top_k = 0
 max_think_tokens = 128
 
@@ -231,6 +243,9 @@ llm_int8_enable_fp32_cpu_offload = false
 device_map = "cuda:0"
 cuda_max_memory = "14GiB"
 max_input_tokens = 3072
+use_inputs_embeds_for_forward = false
+classify_cultural_band = true
+enable_think_pass = true
 exemplar_top_k = 3
 max_think_tokens = 256
 

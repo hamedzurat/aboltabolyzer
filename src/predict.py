@@ -480,6 +480,11 @@ def main():
     debug_df["gemma_exemplar_top_k"] = gemma_config.get("exemplar_top_k")
     debug_df["gemma_load_in"] = resolve_quantization_mode(gemma_config)
     debug_df["gemma_int8_cpu_offload"] = gemma_config.get("llm_int8_enable_fp32_cpu_offload")
+    debug_df["gemma_use_inputs_embeds_for_forward"] = gemma_config.get(
+        "use_inputs_embeds_for_forward"
+    )
+    debug_df["gemma_classify_cultural_band"] = gemma_config.get("classify_cultural_band")
+    debug_df["gemma_enable_think_pass"] = gemma_config.get("enable_think_pass")
     debug_df["rag_query_mode"] = rag_config.get("query_mode")
     debug_df["rag_top_k"] = rag_config.get("top_k")
     debug_df["rag_query_batch_size"] = rag_config.get("query_batch_size")
@@ -590,6 +595,9 @@ def main():
         "gemma_exemplar_top_k",
         "gemma_load_in",
         "gemma_int8_cpu_offload",
+        "gemma_use_inputs_embeds_for_forward",
+        "gemma_classify_cultural_band",
+        "gemma_enable_think_pass",
         "rag_query_mode",
         "rag_top_k",
         "rag_query_batch_size",

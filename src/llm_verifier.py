@@ -160,6 +160,9 @@ class GemmaVerifier:
         self.clear_cuda_before_load = gemma_config.get("clear_cuda_before_load", True)
         self.max_input_tokens = gemma_config.get("max_input_tokens")
         self.exemplar_top_k = int(gemma_config.get("exemplar_top_k", 3))
+        self.classify_cultural_band_enabled = gemma_config.get("classify_cultural_band", True)
+        self.enable_think_pass = gemma_config.get("enable_think_pass", True)
+        self.use_inputs_embeds_for_forward = gemma_config.get("use_inputs_embeds_for_forward", False)
         self.conf_threshold = gemma_config["confidence_threshold"]
         self.disagree_threshold = gemma_config.get("disagree_threshold", 0.25)
         self.force_think_c0_null = gemma_config.get("force_think_c0_null", True)
@@ -261,7 +264,7 @@ class GemmaVerifier:
                     return param.device
         return self.model.device
 
-    def _prepare_inputs(self, prompt):
+    def _prepare_inputs(self, prompt, use_inputs_embeds=None):
         tokenizer = getattr(self.processor, "tokenizer", None)
         original_truncation_side = getattr(tokenizer, "truncation_side", None)
         if tokenizer is not None and self.max_input_tokens is not None:
@@ -276,7 +279,16 @@ class GemmaVerifier:
         finally:
             if tokenizer is not None and original_truncation_side is not None:
                 tokenizer.truncation_side = original_truncation_side
-        return {k: v.to(self.input_device or self.model.device) for k, v in inputs.items()}
+
+        target_device = self.input_device or self.model.device
+        inputs = {k: v.to(target_device) for k, v in inputs.items()}
+        if use_inputs_embeds is None:
+            use_inputs_embeds = self.use_inputs_embeds_for_forward
+        if use_inputs_embeds and "input_ids" in inputs:
+            input_ids = inputs.pop("input_ids")
+            with torch.inference_mode():
+                inputs["inputs_embeds"] = self.model.get_input_embeddings()(input_ids)
+        return inputs
 
     def predict_cultural_band(self, prompt_bn):
         """Classifies the prompt into C0, C1, or C2 based on next-token logits."""
@@ -416,8 +428,12 @@ class GemmaVerifier:
         if self.model is None:
             self.load_model()
 
-        # 1. Classify the cultural band
-        is_c0, is_c1, is_c2 = self.predict_cultural_band(prompt_bn)
+        # 1. Classify the cultural band. On low-VRAM offload profiles this extra
+        # forward pass is disabled because it is only used to route the think pass.
+        if self.classify_cultural_band_enabled:
+            is_c0, is_c1, is_c2 = self.predict_cultural_band(prompt_bn)
+        else:
+            is_c0, is_c1, is_c2 = 0.0, 1.0, 0.0
 
         # 2. Retrieve training exemplars for dynamic few-shot prompting
         if self.exemplar_top_k > 0:
@@ -493,6 +509,10 @@ class GemmaVerifier:
         p_llm_no_think = p_llm
         generated_text = ""
 
+        if triggered_think and not self.enable_think_pass:
+            think_reasons.append("think_pass_disabled")
+            triggered_think = False
+
         if triggered_think:
             if not silent:
                 reason_str = ", ".join(think_reasons) if think_reasons else "unknown"
@@ -517,7 +537,7 @@ class GemmaVerifier:
                 think_messages, tokenize=False, add_generation_prompt=True
             )
 
-            think_inputs = self._prepare_inputs(think_prompt)
+            think_inputs = self._prepare_inputs(think_prompt, use_inputs_embeds=False)
 
             with torch.inference_mode():
                 gen_outputs = self.model.generate(

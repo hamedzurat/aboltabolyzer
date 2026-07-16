@@ -207,7 +207,9 @@ plus a think pass on triggered rows.
 
 Use this when avoiding OOM matters more than raw speed. Gemma uses 8-bit
 quantization with fp32 CPU offload, capped GPU placement, shorter prompts, and
-no dynamic exemplars. This is slower than 16GB.
+no dynamic exemplars. It also disables the extra cultural-band and think-pass
+Gemma calls by default. This is slower and less feature-complete than 16GB, but
+it is the fit-first profile.
 
 **Set in `configs/config.toml`:**
 
@@ -227,6 +229,9 @@ llm_int8_enable_fp32_cpu_offload = true
 device_map = "auto"
 cuda_max_memory = "6GiB"
 max_input_tokens = 1536
+use_inputs_embeds_for_forward = true
+classify_cultural_band = false
+enable_think_pass = false
 exemplar_top_k = 0
 
 [hardware_profiles.8gb.xlmr]
@@ -249,8 +254,10 @@ just first-run-8gb
 Or step by step: `just sync` → `just prepare-full` → `just preprocess` → `just train` → `just predict`
 
 This profile uses the bitsandbytes int8 CPU-offload path because 4-bit
-quantization cannot be auto-dispatched to CPU/disk on this stack. It should
-resume cleanly if the run is interrupted.
+quantization cannot be auto-dispatched to CPU/disk on this stack. It uses
+precomputed text embeddings for forward passes to avoid Gemma 4 meta-tensor
+embedding issues under CPU offload. It should resume cleanly if the run is
+interrupted.
 
 For a pure XLM-R debug run without loading Gemma, set:
 
@@ -334,6 +341,8 @@ The defaults are conservative. Tune in `configs/config.toml`:
 | `load_in`                                      | `[hardware_profiles.*.gemma]` | `"4bit"` for 16GB all-GPU; `"8bit"` for 8GB CPU offload         |
 | `cuda_max_memory`                              | `[hardware_profiles.*.gemma]` | Lower to avoid OOM on 8GB; raise on larger cards                |
 | `max_input_tokens`                             | `[hardware_profiles.*.gemma]` | Lower saves memory/time but may truncate evidence               |
+| `use_inputs_embeds_for_forward`                | `[hardware_profiles.*.gemma]` | Helps Gemma 4 text forwards work under CPU offload              |
+| `classify_cultural_band`, `enable_think_pass`  | `[hardware_profiles.*.gemma]` | Extra Gemma calls; enabled on 16GB, disabled on 8GB by default  |
 | `exemplar_top_k`                               | `[hardware_profiles.*.gemma]` | More examples may help quality but increases prompt cost        |
 
 For 8GB, do not expect Gemma to saturate the GPU: CPU offload is a fit-first
@@ -435,16 +444,16 @@ Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **c
 
 The debug CSV is intentionally wide. Key groups:
 
-| Group            | Useful columns                                                                                                                                                       |
-| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Final decision   | `label`, `p_final`, `threshold`, `threshold_margin`, `threshold_abs_margin`, `threshold_metric`                                                                      |
-| Model scores     | `p_xlmr`, `p_llm`, `llm_minus_xlmr`, `encoder_disagree`, `xlmr_llm_label_disagree`                                                                                   |
-| Gemma think pass | `p_llm_no_think`, `p_llm_from_log`, `p_llm_log_delta`, `triggered_think`, `think_reasons`, `thinking_cot`, `think_changed_label`                                     |
-| Cultural routing | `is_c0`, `is_c1`, `is_c2`                                                                                                                                            |
-| RAG/evidence     | `has_context`, `evidence_is_null`, `rag_filled`, `n_retrieved`, `retrieval_sim_max`, `retrieval_sim_mean`, `context_word_len`                                        |
-| Run provenance   | `run_timestamp`, `hardware_profile`, `used_llm_verifier`, `llm_checkpoint_source`, `xlmr_from_checkpoint`, `llm_from_checkpoint`                                     |
-| Config snapshot  | `xlmr_model_name`, `xlmr_batch_size`, `xlmr_use_amp`, `gemma_load_in`, `gemma_device_map`, `gemma_cuda_max_memory`, `gemma_max_input_tokens`, `rag_query_batch_size` |
-| Artifact paths   | `submission_path`, `debug_path`, `xlmr_checkpoint_path`, `llm_checkpoint_path`, `verifier_debug_log_path`                                                            |
+| Group            | Useful columns                                                                                                                                                                                                                         |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Final decision   | `label`, `p_final`, `threshold`, `threshold_margin`, `threshold_abs_margin`, `threshold_metric`                                                                                                                                        |
+| Model scores     | `p_xlmr`, `p_llm`, `llm_minus_xlmr`, `encoder_disagree`, `xlmr_llm_label_disagree`                                                                                                                                                     |
+| Gemma think pass | `p_llm_no_think`, `p_llm_from_log`, `p_llm_log_delta`, `triggered_think`, `think_reasons`, `thinking_cot`, `think_changed_label`                                                                                                       |
+| Cultural routing | `is_c0`, `is_c1`, `is_c2`                                                                                                                                                                                                              |
+| RAG/evidence     | `has_context`, `evidence_is_null`, `rag_filled`, `n_retrieved`, `retrieval_sim_max`, `retrieval_sim_mean`, `context_word_len`                                                                                                          |
+| Run provenance   | `run_timestamp`, `hardware_profile`, `used_llm_verifier`, `llm_checkpoint_source`, `xlmr_from_checkpoint`, `llm_from_checkpoint`                                                                                                       |
+| Config snapshot  | `xlmr_model_name`, `xlmr_batch_size`, `xlmr_use_amp`, `gemma_load_in`, `gemma_device_map`, `gemma_cuda_max_memory`, `gemma_max_input_tokens`, `gemma_use_inputs_embeds_for_forward`, `gemma_enable_think_pass`, `rag_query_batch_size` |
+| Artifact paths   | `submission_path`, `debug_path`, `xlmr_checkpoint_path`, `llm_checkpoint_path`, `verifier_debug_log_path`                                                                                                                              |
 
 Start with `threshold_abs_margin` to find borderline decisions, then inspect
 `encoder_disagree`, `triggered_think`, and `rag_filled` for likely error modes.
