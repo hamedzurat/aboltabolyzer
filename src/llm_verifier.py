@@ -212,6 +212,7 @@ class GemmaVerifier:
         self.max_input_tokens = gemma_config.get("max_input_tokens")
         self.exemplar_top_k = int(gemma_config.get("exemplar_top_k", 3))
         self.enable_think_pass = gemma_config.get("enable_think_pass", True)
+        self.force_think_all = bool(gemma_config.get("force_think_all", False))
         self.use_inputs_embeds_for_forward = gemma_config.get(
             "use_inputs_embeds_for_forward", False
         )
@@ -245,6 +246,7 @@ class GemmaVerifier:
             "load_in": self.load_in,
             "max_input_tokens": self.max_input_tokens,
             "enable_think_pass": self.enable_think_pass,
+            "force_think_all": self.force_think_all,
             "exemplar_top_k": self.exemplar_top_k,
             "think_conf_low": self.conf_low,
             "think_conf_high": self.conf_high,
@@ -409,42 +411,17 @@ class GemmaVerifier:
     def _think_instruction(self, task_type: str):
         """English reasoning instruction for the think pass."""
         return (
-            "Write exactly this format, with the verdict first:\n"
+            "Instruction: Assess if candidate response 'A' to question 'Q' is correct and faithful (verdict: Faithful) "
+            "or wrong/hallucinated (verdict: Hallucinated) based on the Rule and Evidence.\n"
+            "At the end of your response, write exactly this format:\n"
             "verdict: Faithful|Hallucinated\n"
             "confidence: strong|likely|uncertain\n"
             "reason: <one short English sentence>"
         )
 
     def _think_token_budget(self, task_type: str, think_reasons: list[str]):
-        """Use the configured cap only for cases that usually need room."""
-        cap = int(self.max_think_tokens)
-        reason_set = set(think_reasons or [])
-
-        if task_type in {
-            "math_work_rate",
-            "math_speed_distance",
-            "math_profit_loss",
-            "math_average",
-            "calendar_arithmetic",
-            "famous_bn_fact_null",
-        }:
-            return cap
-
-        if "multi_entity_context" in reason_set:
-            return cap
-
-        if task_type in {
-            "idiom_meaning_null",
-            "literal_meaning_null",
-            "bangla_grammar",
-            "translation_or_bilingual",
-        }:
-            return min(cap, 256)
-
-        if reason_set == {"near_threshold"}:
-            return min(cap, 256)
-
-        return min(cap, 384)
+        """Use the configured cap to ensure the model has enough room to reason and format its verdict."""
+        return int(self.max_think_tokens)
 
     def _apply_chat_template(self, messages, *, enable_thinking=None):
         kwargs = {
@@ -461,18 +438,41 @@ class GemmaVerifier:
 
     @staticmethod
     def _parse_think_output(generated_text: str):
+        verdict = None
         verdict_match = re.search(
-            r"verdict\s*:\s*(Faithful|Hallucinated)",
+            r"verdict\s*[:=is\s]*\s*(faithful|hallucinated|correct|wrong|truthful|false|f|h)",
             generated_text,
             re.IGNORECASE,
         )
+        if verdict_match:
+            val = verdict_match.group(1).lower()
+            if val in ("faithful", "correct", "truthful", "f"):
+                verdict = "Faithful"
+            elif val in ("hallucinated", "wrong", "false", "h"):
+                verdict = "Hallucinated"
+
+        if not verdict:
+            last_part = generated_text[-150:].lower()
+            if "faithful" in last_part or "correct" in last_part:
+                verdict = "Faithful"
+            elif "hallucinated" in last_part or "wrong" in last_part:
+                verdict = "Hallucinated"
+
         confidence_match = re.search(
-            r"confidence\s*:\s*(strong|likely|uncertain)",
+            r"confidence\s*[:=is\s]*\s*(strong|likely|uncertain|high|medium|low)",
             generated_text,
             re.IGNORECASE,
         )
-        verdict = verdict_match.group(1) if verdict_match else None
-        confidence = confidence_match.group(1) if confidence_match else None
+        confidence = "likely"
+        if confidence_match:
+            val = confidence_match.group(1).lower()
+            if val in ("strong", "high"):
+                confidence = "strong"
+            elif val in ("uncertain", "low"):
+                confidence = "uncertain"
+            else:
+                confidence = "likely"
+
         score = map_think_verdict(verdict, confidence) if verdict else None
         return verdict, confidence, score
 
@@ -523,15 +523,21 @@ class GemmaVerifier:
                 f"V: {ex_label_str}\n\n"
             )
 
+        evidence_clean = str(evidence).strip()
+        if evidence_clean in ("", "[NULL]", "None", "nan"):
+            evidence_str = "No evidence provided. Use your internal knowledge to judge the correctness of the answer based on the Rule."
+        else:
+            evidence_str = f"<evidence>\n{evidence_clean}\n</evidence>"
+
         user_content = (
             f"{prompt_exemplars}"
             f"Task: {task_type}\n"
             f"Rule: {instruction}\n"
-            f"<evidence>\n{evidence}\n</evidence>\n"
+            f"{evidence_str}\n"
             f"Q: {prompt_bn}\n"
             f"A: {response_bn}\n"
-            "Return one token only: F = faithful/correct/label 1; "
-            "H = hallucinated/wrong/label 0.\n"
+            f"Return one token only: F = faithful/correct/label 1; "
+            f"H = hallucinated/wrong/label 0.\n"
         )
 
         messages = [{"role": "user", "content": user_content}]
@@ -567,6 +573,7 @@ class GemmaVerifier:
             conf_low=self.conf_low,
             conf_high=self.conf_high,
             think_reasons=think_reasons,
+            force_think_all=self.force_think_all,
         )
         p_llm_no_think = p_llm
         generated_text = ""
@@ -587,7 +594,7 @@ class GemmaVerifier:
                 f"{prompt_exemplars}"
                 f"Task: {task_type}\n"
                 f"Rule: {instruction}\n"
-                f"<evidence>\n{evidence}\n</evidence>\n"
+                f"{evidence_str}\n"
                 f"Q: {prompt_bn}\n"
                 f"A: {response_bn}\n"
                 f"{self._think_instruction(task_type)}"

@@ -16,13 +16,13 @@ allow_tf32 = true
 
 [predict]
 use_checkpoints = true
-force_recompute = false
+force_recompute = true
 partial_flush_every = 25
 llm_predictions_path = "generated/processed/test_llm_preds.csv"
 
 [data]
 sample_path = "dataset/sample_dataset.json"
-test_path = "dataset/testset.csv"
+test_path = "dataset/testset_audit_200.csv"
 processed_dir = "generated/processed"
 submission_output_path = "submissions/submission.csv"
 
@@ -72,8 +72,9 @@ cuda_max_memory = "14GiB"
 cpu_max_memory = "32GiB"
 max_input_tokens = 3072
 enable_think_pass = true
+force_think_all = true
 exemplar_top_k = 3
-max_think_tokens = 512
+max_think_tokens = 1024
 
 [hardware_profiles.16gb.rag]
 batch_size = 128
@@ -92,8 +93,9 @@ cuda_max_memory = "7GiB"
 cpu_max_memory = "16GiB"
 max_input_tokens = 1536
 enable_think_pass = true
+force_think_all = true
 exemplar_top_k = 0
-max_think_tokens = 512
+max_think_tokens = 1024
 chat_template_enable_thinking_fast = false
 chat_template_enable_thinking_think = true
 

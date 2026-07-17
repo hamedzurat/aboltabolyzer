@@ -62,6 +62,20 @@ just predict
 
 Set it back to `false` afterward.
 
+## Evaluate Accuracy
+
+To evaluate predictions against the ground-truth test labels and see errors broken down by task type:
+
+```bash
+just analyze
+```
+
+Or evaluate a specific prediction folder:
+
+```bash
+just analyze submissions/20260718_032339
+```
+
 ## Outputs
 
 Upload:

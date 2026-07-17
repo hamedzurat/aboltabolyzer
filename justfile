@@ -71,6 +71,11 @@ predict:
 [group('pipeline')]
 run: preprocess predict
 
+[doc('Analyze predictions accuracy against ground truth: just analyze [path_to_submission]')]
+[group('pipeline')]
+analyze *args:
+    uv run python scripts/analyze_submission.py {{args}}
+
 [doc('Full first run for the active hardware_profile: setup → preprocess → predict')]
 [group('pipeline')]
 first-run: setup preprocess predict

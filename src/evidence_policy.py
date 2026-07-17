@@ -64,11 +64,13 @@ TASK_INSTRUCTIONS = {
     ),
     "general_fact_null": (
         "Check the fact carefully. Watch for swapped people, dates, places, nearby "
-        "events, and total-vs-part numbers."
+        "events, and total-vs-part numbers. If the evidence is missing or silent on "
+        "the fact, rely on your general knowledge to verify if the statement is correct."
     ),
     "famous_bn_fact_null": (
         "Check the Bangladesh/literature fact carefully. Watch for swapped people, "
-        "dates, places, and nearby events."
+        "dates, places, and nearby events. If the evidence is missing or silent on "
+        "the fact, rely on your general knowledge to verify if the statement is correct."
     ),
     "bangla_grammar": (
         "Judge by Bangla grammar rules. Use evidence if helpful, but missing evidence "
@@ -183,17 +185,23 @@ def should_trigger_think(
     conf_low: float = 0.35,
     conf_high: float = 0.65,
     think_reasons: list[str] | None = None,
+    force_think_all: bool = False,
 ) -> bool:
     """Decide whether to run the think pass for a routed row."""
     reasons = think_reasons if think_reasons is not None else []
+
+    if force_think_all:
+        reasons.append("force_think_all")
+        return True
+
     triggered = False
 
     if conf_low <= float(p_fast) <= conf_high:
         reasons.append("near_threshold")
         triggered = True
 
-    if task_type == "famous_bn_fact_null":
-        reasons.append("famous_bn_fact_null")
+    if task_type in ("famous_bn_fact_null", "famous_bn_fact_context"):
+        reasons.append("famous_bn_fact")
         triggered = True
 
     if task_type == "context_grounded_fact" and context_has_multiple_entities(context_original):

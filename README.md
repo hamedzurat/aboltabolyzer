@@ -206,6 +206,7 @@ After assets exist:
 ```bash
 just run               # preprocess → predict
 just predict           # prediction only (resumes checkpoints when valid)
+just analyze           # evaluate latest prediction run against test ground truth
 ```
 
 ---
@@ -341,27 +342,28 @@ Layout, JSONL examples, writing guidance, and starter filenames: [`corpus/README
 
 Run `just` to list recipes.
 
-| Command                        | What it does                                     |
-| ------------------------------ | ------------------------------------------------ |
-| `just sync`                    | Install deps                                     |
-| `just show-profile`            | Print active `hardware_profile` + resolved knobs |
-| `just download-models`         | BGE-M3                                           |
-| `just download-models-gemma`   | BGE-M3 + verifier for active profile             |
+| Command                        | What it does                                       |
+| ------------------------------ | -------------------------------------------------- |
+| `just sync`                    | Install deps                                       |
+| `just show-profile`            | Print active `hardware_profile` + resolved knobs   |
+| `just download-models`         | BGE-M3                                             |
+| `just download-models-gemma`   | BGE-M3 + verifier for active profile               |
 | `just download-corpus`         | Wiki → `generated/wiki/` (downloads & categorizes) |
 | `just download-english-corpus` | Fetch English counterparts to `generated/wiki_en/` |
-| `just sort-corpus file.jsonl`  | LLM-sort JSONL rows into typed corpus folders    |
-| `just make-rag`                | Build `indexes/<source>.pkl` from corpus folders |
-| `just setup`                   | sync + models + corpus + make-rag                |
-| `just preprocess`              | Clean → `generated/processed/`                   |
-| `just predict`                 | Routed inference → `submissions/<timestamp>/`    |
-| `just run`                     | preprocess → predict                             |
-| `just first-run`               | setup → preprocess → predict (uses profile)      |
-| `just first-run-16gb` / `8gb`  | Aliases of `first-run` (set profile in config)   |
-| `just clean-rag`               | Drop evidence CSVs + indexes                     |
-| `just clean-processed`         | Drop `generated/processed/`                      |
-| `just clean-logs`              | Drop verifier JSONL logs                         |
-| `just clean-all`               | All cleans                                       |
-| `just test` / `lint` / `check` | Dev helpers                                      |
+| `just sort-corpus file.jsonl`  | LLM-sort JSONL rows into typed corpus folders      |
+| `just make-rag`                | Build `indexes/<source>.pkl` from corpus folders   |
+| `just setup`                   | sync + models + corpus + make-rag                  |
+| `just preprocess`              | Clean → `generated/processed/`                     |
+| `just predict`                 | Routed inference → `submissions/<timestamp>/`      |
+| `just run`                     | preprocess → predict                               |
+| `just analyze`                 | Evaluate predictions against test ground truth     |
+| `just first-run`               | setup → preprocess → predict (uses profile)        |
+| `just first-run-16gb` / `8gb`  | Aliases of `first-run` (set profile in config)     |
+| `just clean-rag`               | Drop evidence CSVs + indexes                       |
+| `just clean-processed`         | Drop `generated/processed/`                        |
+| `just clean-logs`              | Drop verifier JSONL logs                           |
+| `just clean-all`               | All cleans                                         |
+| `just test` / `lint` / `check` | Dev helpers                                        |
 
 ---
 

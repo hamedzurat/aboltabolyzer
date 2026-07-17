@@ -27,6 +27,15 @@ GRAMMAR_PATTERNS = (
     "ধাতু",
     "ক্রিয়া পদের",
     "ক্রিয়া পদের",
+    "স্বরধ্বনি",
+    "ব্যঞ্জনধ্বনি",
+    "উচ্চারণ",
+    "বর্ণ",
+    "বানান",
+    "ধ্বনি",
+    "প্রত্যয়",
+    "প্রকৃতি",
+    "শুদ্ধ",
 )
 
 MATH_WORK_RATE = (
@@ -38,7 +47,7 @@ MATH_WORK_RATE = (
     "নির্মাণ প্রকল্প",
 )
 MATH_SPEED = ("গতিবেগ", "ঘণ্টায়", "ঘণ্টায়", "দূরত্ব")
-MATH_PROFIT = ("ক্রয়মূল্য", "ক্রয়মূল্য", "বিক্রয়মূল্য", "বিক্রয়মূল্য", "লাভ", "ক্ষতি")
+MATH_PROFIT = ("ক্রয়মূল্য", "ক্রয়মূল্য", "বিক্রয়মূল্য", "বিক্রয়মূল্য", "লাভ", "ক্ষতি", "শতকরা লাভ", "শতকরা ক্ষতি")
 MATH_AVERAGE = ("গড়", "গড়মান", "অ্যাভারেজ")
 CALENDAR = ("বার হলে", "সপ্তাহের কোন দিন", "সপ্তাহের কোন")
 
@@ -111,8 +120,13 @@ def route_row(context: str, prompt_bn: str, response_bn: str = "") -> str:
     if "শাব্দিক অর্থ" in prompt_bn:
         return "literal_meaning_null"
 
-    if _contains_any(prompt_bn, MATH_WORK_RATE) and (
-        "কাজ" in prompt_bn or "দিন" in prompt_bn or "ঘণ্টা" in prompt_bn or "ঘন্টা" in prompt_bn
+    if (
+        _contains_any(prompt_bn, MATH_WORK_RATE)
+        and ("কাজ" in prompt_bn or "দিন" in prompt_bn or "ঘণ্টা" in prompt_bn or "ঘন্টা" in prompt_bn)
+    ) or (
+        ("লোক" in prompt_bn or "জন" in prompt_bn)
+        and ("দিন" in prompt_bn or "ঘণ্টা" in prompt_bn or "ঘন্টা" in prompt_bn)
+        and ("কাজ" in prompt_bn or "করতে" in prompt_bn or "সময়" in prompt_bn)
     ):
         return "math_work_rate"
     if _contains_any(prompt_bn, MATH_SPEED):
@@ -125,7 +139,11 @@ def route_row(context: str, prompt_bn: str, response_bn: str = "") -> str:
         return "calendar_arithmetic"
     if _contains_any(prompt_bn, GRAMMAR_PATTERNS):
         return "bangla_grammar"
-    if _is_translation_or_bilingual(prompt_bn, response_bn):
+    # Prioritize factual questions over translation/bilingual if prompt is factual and lacks explicit translation keywords
+    is_trans = _is_translation_or_bilingual(prompt_bn, response_bn)
+    if is_trans and not (
+        _is_factual(prompt_bn) and not _contains_any(prompt_bn.lower(), TRANSLATION_PATTERNS)
+    ):
         return "translation_or_bilingual"
     if _contains_any(prompt_bn, FAMOUS_ENTITY_PATTERNS):
         return "famous_bn_fact_null"
