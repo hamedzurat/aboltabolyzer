@@ -3,7 +3,11 @@ import json
 import logging
 import os
 import tomllib
+import warnings
 from datetime import datetime
+
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*_check_is_size.*")
+
 
 import numpy as np
 import pandas as pd
