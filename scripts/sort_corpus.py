@@ -68,7 +68,7 @@ def corpus_sort_prompt(text):
         "2. Prepend Story/Book Context: If the text is from a story, book, or poem (like 'তোতা-কাহিনি' or 'রবীন্দ্রনাথ ঠাকুরের কবিতা'), explicitly add this context to the fact (e.g., 'রবীন্দ্রনাথ ঠাকুরের তোতা-কাহিনি গল্পে রাজা পাখিটিকে শিক্ষা দেওয়ার নির্দেশ দেন।').\n"
         "3. Convert Questions/Blanks: Turn questions (e.g., 'পদ্মা নদীর শাখা নদী কোনটি?') and fill-in-the-blanks (e.g., 'বাংলাদেশ ______ সালে অলিম্পিকে অংশ নেয়') into direct, declarative facts (e.g., 'পদ্মা নদীর শাখা নদী হলো গড়াই ও ধলেশ্বরী।' or 'বাংলাদেশ ১৯৮৪ সালে অলিম্পিকে অংশগ্রহণ করে।').\n"
         "4. Handle Long/Messy Paragraphs: If the input is a long article or contains multiple paragraphs, extract all key factual statements (up to 5-10 facts). Split them so each fact is a single, short, atomic sentence.\n"
-        "5. Output Format: Return a list of reworded facts, with one fact per line prefixed by a dash (-). If it is a clean single fact, output just that one fact.\n\n"
+        "5. Output Format: Return a list of reworded facts, with one fact per line prefixed by a dash (-). If it is a clean single fact, output just that one fact. If the category is skip, do not reword anything (leave the reworded section empty).\n\n"
         "Categories:\n"
         "- wiki: General facts (science, global history/geography, global events), Bangladesh history, Bangla literature, Bangladeshi geography, famous Bengali personalities/events, and Bengali literary stories (e.g. তোতা-কাহিনি)\n"
         "- idioms: Bengali idioms, proverbs, or figurative meanings (ভাবার্থ, বাগধারা)\n"
@@ -78,7 +78,7 @@ def corpus_sort_prompt(text):
         "Output Format:\n"
         "bucket: <category>\n"
         "reworded:\n"
-        "- <Factual Sentence 1>\n"
+        "- <Factual Sentence 1> (leave empty if bucket is skip)\n"
         "- <Factual Sentence 2> (if multiple)\n\n"
         f"Input Text: {truncated_text}\n"
     )
@@ -230,26 +230,50 @@ def run_sort(args):
     if args.dry_run:
         warn("Dry run: no files will be written")
 
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / f"sort_corpus_{input_path.stem}.jsonl"
+
+    processed_lines = set()
+    counts = Counter()
+    if log_path.exists():
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                    if isinstance(obj, dict) and "line_no" in obj:
+                        processed_lines.add(obj["line_no"])
+                        bucket = obj.get("parsed_bucket")
+                        if bucket:
+                            counts[bucket] += 1
+                except json.JSONDecodeError:
+                    continue
+        if processed_lines:
+            info(
+                f"Resuming: found {len(processed_lines)} already processed lines in {log_path.name}"
+            )
+
+    is_append = args.append or bool(processed_lines)
+
     sorter = CorpusSorter()
     writers = None
     if not args.dry_run:
         writers = JsonlWriters(
             output_root=args.output_root,
             output_name=output_name,
-            append=args.append,
+            append=is_append,
             annotate=args.annotate,
             skipped_path=skipped_path,
         )
 
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    log_path = log_dir / "sort_corpus_debug.jsonl"
-    log_mode = "a" if args.append else "w"
+    log_mode = "a" if is_append else "w"
     log_file = open(log_path, log_mode, encoding="utf-8")
     last_log_flush = time.time()
 
     total_rows = count_jsonl_rows(input_path, args.limit)
-    counts = Counter()
     invalid_outputs = 0
     try:
         with pipeline_progress() as progress:
@@ -260,6 +284,10 @@ def run_sort(args):
             ):
                 if args.limit and row_idx > args.limit:
                     break
+
+                if line_no in processed_lines:
+                    progress.advance(task)
+                    continue
 
                 fact_lines = []
                 if row_error:
