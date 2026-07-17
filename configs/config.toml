@@ -47,9 +47,9 @@ index_dtype = "float16"
 top_k = 5
 max_evidence_tokens = 512
 similarity_threshold = 0.5
-query_mode = "prompt"                                           # "prompt" | "prompt_response"
-batch_size = 32                                                 # overridden per profile
-query_batch_size = 32                                           # overridden per profile
+query_mode = "prompt"                              # "prompt" | "prompt_response"
+batch_size = 32                                    # overridden per profile
+query_batch_size = 32                              # overridden per profile
 max_seq_length = 512
 
 [gemma]
@@ -84,6 +84,7 @@ query_batch_size = 128
 [hardware_profiles.8gb.gemma]
 # model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 model_name = "Qwen/Qwen2.5-7B-Instruct"
+# model_name = "Qwen/Qwen2.5-3B-Instruct"
 model_loader = "causal_lm"
 load_in = "4bit"
 device_map = "cuda:0"

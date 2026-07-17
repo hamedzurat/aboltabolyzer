@@ -84,6 +84,23 @@ def corpus_sort_prompt(text):
     )
 
 
+from transformers import StoppingCriteria, StoppingCriteriaList
+
+
+class StopOnString(StoppingCriteria):
+    def __init__(self, tokenizer, stop_strings):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.stop_strings = stop_strings
+
+    def __call__(self, input_ids, scores, **kwargs):
+        decoded = self.tokenizer.decode(input_ids[0][-16:])
+        for s in self.stop_strings:
+            if s in decoded:
+                return True
+        return False
+
+
 class CorpusSorter:
     def __init__(self):
         self.verifier = GemmaVerifier()
@@ -103,6 +120,12 @@ class CorpusSorter:
             enable_thinking=False,
         )
         inputs = self.verifier._prepare_inputs(rendered, use_inputs_embeds=False)
+
+        # Stop generation early if LLM starts repeating input prompts
+        stop_criteria = StoppingCriteriaList(
+            [StopOnString(self.verifier.tokenizer, ["Input Text:", "Input Text"])]
+        )
+
         with torch.inference_mode():
             outputs = self.verifier.model.generate(
                 **inputs,
@@ -110,6 +133,7 @@ class CorpusSorter:
                 do_sample=False,
                 temperature=None,
                 top_p=None,
+                stopping_criteria=stop_criteria,
             )
         input_len = inputs["input_ids"].shape[1]
         generated = self.verifier.tokenizer.decode(
@@ -123,6 +147,12 @@ class CorpusSorter:
         ).strip()
         # Strip markdown code blocks/fences (e.g. ```yaml or ```)
         cleaned_generated = re.sub(r"```[A-Za-z0-9_-]*", "", cleaned_generated).strip()
+
+        # Proactively truncate if the stop criteria or post-processing detects "Input Text:"
+        if "input text:" in cleaned_generated.lower():
+            cleaned_generated = re.split(
+                r"input\s+text\s*:", cleaned_generated, flags=re.IGNORECASE
+            )[0].strip()
 
         bucket = None
         reworded = text
