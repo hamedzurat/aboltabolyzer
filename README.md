@@ -322,7 +322,8 @@ Token budget is dynamic: hard cases can use the configured cap, while simple lex
 Four typed sources: `wiki`, `idioms`, `literal`, `grammar`. Empty folders are fine (`index_missing:<source>`).
 
 ```bash
-just download-corpus                 # → corpus/wiki/wiki_bn.jsonl
+just download-corpus                 # → generated/wiki/ (categorized JSONLs and titles)
+just download-english-corpus         # → generated/wiki_en/ (English counterparts for places/people)
 just sort-corpus data.jsonl          # LLM-sort rows into corpus/<source>/data.jsonl
 just sort-corpus data.jsonl -- --dry-run --limit 20
 uv run python scripts/sort_corpus.py --tui
@@ -346,7 +347,8 @@ Run `just` to list recipes.
 | `just show-profile`            | Print active `hardware_profile` + resolved knobs |
 | `just download-models`         | BGE-M3                                           |
 | `just download-models-gemma`   | BGE-M3 + verifier for active profile             |
-| `just download-corpus`         | Wiki → `corpus/wiki/` (extra args ok)            |
+| `just download-corpus`         | Wiki → `generated/wiki/` (downloads & categorizes) |
+| `just download-english-corpus` | Fetch English counterparts to `generated/wiki_en/` |
 | `just sort-corpus file.jsonl`  | LLM-sort JSONL rows into typed corpus folders    |
 | `just make-rag`                | Build `indexes/<source>.pkl` from corpus folders |
 | `just setup`                   | sync + models + corpus + make-rag                |

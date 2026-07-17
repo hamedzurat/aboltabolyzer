@@ -35,6 +35,12 @@ download-models-gemma:
 download-corpus *args:
     uv run python scripts/download_corpus.py {{args}}
 
+[doc('Download English counterparts for the wiki corpus')]
+[group('setup')]
+download-english-corpus:
+    uv run python scripts/download_english_corpus.py
+
+
 [doc('LLM-sort a JSONL file into corpus/<source>/ folders')]
 [group('setup')]
 sort-corpus input *args:

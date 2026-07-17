@@ -82,8 +82,8 @@ query_batch_size = 128
 # ── Profile: 8GB / small GPUs — ungated Qwen3 thinking model ─────────────────
 
 [hardware_profiles.8gb.gemma]
-# model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-model_name = "Qwen/Qwen2.5-7B-Instruct"
+model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+# model_name = "Qwen/Qwen2.5-7B-Instruct"
 # model_name = "Qwen/Qwen2.5-3B-Instruct"
 model_loader = "causal_lm"
 load_in = "4bit"
