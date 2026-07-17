@@ -17,10 +17,11 @@ import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.config_utils import describe_active_profile, validate_config
+from src.config_utils import apply_runtime_settings, describe_active_profile, validate_config
 from src.llm_verifier import GemmaVerifier
 from src.tui import banner, count_table, done_panel, info, pipeline_progress, warn
 
+BATCH_SIZE = 8
 BUCKETS = ("wiki", "idioms", "literal", "grammar", "skip")
 
 BUCKET_ALIASES = {
@@ -147,6 +148,80 @@ class CorpusSorter:
 
         return bucket, reworded, generated.strip()
 
+    def classify_batch(self, texts):
+        self.load()
+        prompts = [corpus_sort_prompt(text) for text in texts]
+
+        tokenizer = getattr(self.verifier.processor, "tokenizer", None) or self.verifier.tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+        original_truncation_side = getattr(tokenizer, "truncation_side", None)
+        if tokenizer is not None and self.verifier.max_input_tokens is not None:
+            tokenizer.truncation_side = "left"
+
+        try:
+            inputs = self.verifier.processor(
+                text=prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=self.verifier.max_input_tokens is not None,
+                max_length=self.verifier.max_input_tokens,
+            )
+        finally:
+            if tokenizer is not None and original_truncation_side is not None:
+                tokenizer.truncation_side = original_truncation_side
+
+        target_device = self.verifier.input_device or self.verifier.model.device
+        inputs = {k: v.to(target_device) for k, v in inputs.items()}
+
+        with torch.inference_mode():
+            outputs = self.verifier.model.generate(
+                **inputs,
+                max_new_tokens=1024,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+            )
+
+        results = []
+        input_len = inputs["input_ids"].shape[1]
+        for i, text in enumerate(texts):
+            generated = self.verifier.tokenizer.decode(
+                outputs[i][input_len:],
+                skip_special_tokens=True,
+            )
+
+            cleaned_generated = re.sub(
+                r"<think>.*?(?:</think>|$)", "", generated, flags=re.DOTALL
+            ).strip()
+            cleaned_generated = re.sub(r"```[A-Za-z0-9_-]*", "", cleaned_generated).strip()
+
+            bucket = None
+            reworded = text
+
+            bucket_match = re.search(r"bucket\s*[:=]\s*(\w+)", cleaned_generated, re.IGNORECASE)
+            if bucket_match:
+                bucket = parse_bucket(bucket_match.group(1))
+            else:
+                bucket = parse_bucket(cleaned_generated)
+
+            text_match = re.search(
+                r"reworded\s*[:=]\s*(.+)", cleaned_generated, re.IGNORECASE | re.DOTALL
+            )
+            if not text_match:
+                text_match = re.search(
+                    r"text\s*[:=]\s*(.+)", cleaned_generated, re.IGNORECASE | re.DOTALL
+                )
+            if text_match:
+                reworded = text_match.group(1).strip()
+                reworded = reworded.replace("\ufffd", "").strip()
+
+            results.append((bucket, reworded, generated.strip()))
+
+        return results
+
 
 def iter_jsonl(path, text_keys):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -223,6 +298,7 @@ def run_sort(args):
     with open(args.config, "rb") as f:
         config = tomllib.load(f)
     validate_config(config)
+    apply_runtime_settings(config)
     profile = describe_active_profile(config)
 
     banner("Sort corpus JSONL", f"{input_path} → {args.output_root}/<bucket>/{output_name}")
@@ -277,78 +353,101 @@ def run_sort(args):
     invalid_outputs = 0
     try:
         with pipeline_progress() as progress:
-            task = progress.add_task("Classifying", total=total_rows)
+            skipped_count = 0
             for row_idx, (line_no, obj, text, row_error) in enumerate(
                 iter_jsonl(input_path, text_keys),
                 start=1,
             ):
                 if args.limit and row_idx > args.limit:
                     break
-
                 if line_no in processed_lines:
-                    progress.advance(task)
-                    continue
+                    skipped_count += 1
 
-                fact_lines = []
-                if row_error:
-                    bucket = "skip"
-                    reworded = text
-                    raw_output = row_error
-                else:
-                    bucket, reworded, raw_output = sorter.classify(text)
-                    if bucket is None:
-                        invalid_outputs += 1
+            task = progress.add_task("Classifying", total=total_rows, completed=skipped_count)
+
+            buffer = []
+
+            def flush_buffer(buf):
+                nonlocal invalid_outputs, last_log_flush
+                if not buf:
+                    return
+
+                llm_items = []
+                for item in buf:
+                    l_no, o, t, r_err = item
+                    if not r_err:
+                        llm_items.append(item)
+
+                llm_results = {}
+                if llm_items:
+                    texts_to_classify = [item[2] for item in llm_items]
+                    batch_results = sorter.classify_batch(texts_to_classify)
+                    for (l_no, _, _, _), (bucket, reworded, raw_output) in zip(
+                        llm_items, batch_results
+                    ):
+                        llm_results[l_no] = (bucket, reworded, raw_output)
+
+                for l_no, o, t, r_err in buf:
+                    fact_lines = []
+                    if r_err:
                         bucket = "skip"
+                        reworded = t
+                        raw_output = r_err
+                    else:
+                        bucket, reworded, raw_output = llm_results[l_no]
+                        if bucket is None:
+                            invalid_outputs += 1
+                            bucket = "skip"
 
-                if bucket not in BUCKETS:
-                    bucket = "skip"
-                counts[bucket] += 1
+                    if bucket not in BUCKETS:
+                        bucket = "skip"
+                    counts[bucket] += 1
 
-                # Extract fact lines if valid
-                if not row_error and bucket != "skip" and reworded:
-                    fact_lines = [
-                        f.strip()
-                        for f in reworded.split("\n")
-                        if f.strip()
-                        and not f.strip().lower().startswith("reworded")
-                        and not f.strip().lower().startswith("bucket")
-                        and not f.strip().lower().startswith("category")
-                    ]
-                    # Clean bullet points/numbered prefixes
-                    fact_lines = [re.sub(r"^[-*•\d.]+\s*", "", f).strip() for f in fact_lines]
-                    fact_lines = [f for f in fact_lines if f]
+                    if not r_err and bucket != "skip" and reworded:
+                        fact_lines = [
+                            f.strip()
+                            for f in reworded.split("\n")
+                            if f.strip()
+                            and not f.strip().lower().startswith("reworded")
+                            and not f.strip().lower().startswith("bucket")
+                            and not f.strip().lower().startswith("category")
+                        ]
+                        fact_lines = [re.sub(r"^[-*•\d.]+\s*", "", f).strip() for f in fact_lines]
+                        fact_lines = [f for f in fact_lines if f]
 
-                # Write detailed logs
-                log_entry = {
-                    "line_no": line_no,
-                    "input_text": text,
-                    "parsed_bucket": bucket,
-                    "reworded_facts": fact_lines if fact_lines else [reworded],
-                    "raw_model_output": raw_output,
-                    "error": row_error or None,
-                }
-                log_file.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+                    log_entry = {
+                        "line_no": l_no,
+                        "input_text": t,
+                        "parsed_bucket": bucket,
+                        "reworded_facts": fact_lines if fact_lines else [reworded],
+                        "raw_model_output": raw_output,
+                        "error": r_err or None,
+                    }
+                    log_file.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+
+                    if writers is not None:
+                        meta = {
+                            "_sort_bucket": bucket,
+                            "_sort_line": l_no,
+                            "_sort_model_output": raw_output,
+                        }
+                        if bucket != "skip" and fact_lines:
+                            for fact in fact_lines:
+                                obj_to_write = dict(o)
+                                for key in text_keys:
+                                    if key in obj_to_write:
+                                        obj_to_write[key] = fact
+                                        break
+                                writers.write(bucket, obj_to_write, meta)
+                        else:
+                            writers.write(bucket, o, meta)
+
+                    progress.advance(task)
+
                 current_time = time.time()
                 if current_time - last_log_flush >= 60.0:
                     log_file.flush()
                     last_log_flush = current_time
-
-                if writers is not None:
-                    meta = {
-                        "_sort_bucket": bucket,
-                        "_sort_line": line_no,
-                        "_sort_model_output": raw_output,
-                    }
-                    if bucket != "skip" and fact_lines:
-                        for fact in fact_lines:
-                            obj_to_write = dict(obj)
-                            for key in text_keys:
-                                if key in obj_to_write:
-                                    obj_to_write[key] = fact
-                                    break
-                            writers.write(bucket, obj_to_write, meta)
-                    else:
-                        writers.write(bucket, obj, meta)
 
                 gpu_status = ""
                 if torch.cuda.is_available():
@@ -362,9 +461,24 @@ def run_sort(args):
                     if stats_str
                     else f"Classifying{gpu_status}"
                 )
-
                 progress.update(task, description=desc)
-                progress.advance(task)
+
+            for row_idx, (line_no, obj, text, row_error) in enumerate(
+                iter_jsonl(input_path, text_keys),
+                start=1,
+            ):
+                if args.limit and row_idx > args.limit:
+                    break
+                if line_no in processed_lines:
+                    continue
+
+                buffer.append((line_no, obj, text, row_error))
+                if len(buffer) >= BATCH_SIZE:
+                    flush_buffer(buffer)
+                    buffer = []
+
+            if buffer:
+                flush_buffer(buffer)
     finally:
         log_file.close()
         if writers is not None:
