@@ -6,14 +6,36 @@ import pickle
 import tomllib
 
 import numpy as np
-from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from sentence_transformers import SentenceTransformer
 
-from src.config_utils import apply_runtime_settings
+from src.config_utils import apply_runtime_settings, resolve_section
+from src.tui import banner, console, done_panel, info, kv_table, ok, pipeline_progress, warn
 
-console = Console()
+DEFAULT_RAG_SOURCES = {
+    "wiki": {"corpus_dir": "corpus/wiki", "index_path": "indexes/wiki.pkl"},
+    "famous_bn": {"corpus_dir": "corpus/famous_bn", "index_path": "indexes/famous_bn.pkl"},
+    "idioms": {"corpus_dir": "corpus/idioms", "index_path": "indexes/idioms.pkl"},
+    "literal": {"corpus_dir": "corpus/literal", "index_path": "indexes/literal.pkl"},
+    "grammar": {"corpus_dir": "corpus/grammar", "index_path": "indexes/grammar.pkl"},
+}
+
+RAG_INDEX_VERSION = 2
+
+
+def _resolve_numpy_dtype(dtype_name, default=np.float16):
+    if dtype_name in (None, "auto"):
+        return default
+    aliases = {
+        "float16": np.float16,
+        "fp16": np.float16,
+        "float32": np.float32,
+        "fp32": np.float32,
+    }
+    try:
+        return aliases[str(dtype_name).lower()]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported rag.index_dtype: {dtype_name}") from exc
 
 
 def truncate_evidence(text, max_tokens):
@@ -26,18 +48,78 @@ def truncate_evidence(text, max_tokens):
     return " ".join(tokens[:max_tokens])
 
 
+def resolve_rag_sources(config):
+    """Return {source_name: {corpus_dir, index_path}} for typed corpora."""
+    rag_config = resolve_section(config, "rag")
+    corpus_root = rag_config.get("corpus_root", "corpus")
+    index_root = rag_config.get("index_root", "indexes")
+    configured = rag_config.get("sources")
+
+    def _paths(name):
+        return {
+            "corpus_dir": os.path.join(corpus_root, name),
+            "index_path": os.path.join(index_root, f"{name}.pkl"),
+        }
+
+    # Prefer explicit list: sources = ["wiki", "idioms", ...]
+    if isinstance(configured, list) and configured:
+        return {str(name): _paths(str(name)) for name in configured}
+
+    # Or explicit table map: [rag.sources.wiki] corpus_dir=... index_path=...
+    if isinstance(configured, dict) and configured:
+        sources = {}
+        for name, spec in configured.items():
+            if isinstance(spec, dict):
+                sources[name] = {
+                    "corpus_dir": spec.get("corpus_dir") or _paths(name)["corpus_dir"],
+                    "index_path": spec.get("index_path") or _paths(name)["index_path"],
+                }
+            else:
+                sources[str(name)] = _paths(str(name))
+        return sources
+
+    return {name: _paths(name) for name in DEFAULT_RAG_SOURCES}
+
+
+def source_paths(config, source_name):
+    sources = resolve_rag_sources(config)
+    if source_name not in sources:
+        raise KeyError(f"Unknown RAG source '{source_name}'. Known: {sorted(sources)}")
+    return sources[source_name]
+
+
 class BanglaRAG:
-    def __init__(self, config_path="configs/config.toml"):
-        with open(config_path, "rb") as f:
-            self.config = tomllib.load(f)
+    def __init__(
+        self,
+        config_path="configs/config.toml",
+        config=None,
+        source_name=None,
+        corpus_dir=None,
+        index_path=None,
+    ):
+        if config is None:
+            with open(config_path, "rb") as f:
+                config = tomllib.load(f)
+        self.config = config
         apply_runtime_settings(self.config)
 
-        from src.config_utils import resolve_section
-
         self.rag_config = resolve_section(self.config, "rag")
+        self.source_name = source_name
 
-        self.corpus_dir = self.rag_config["corpus_dir"]
-        self.index_path = self.rag_config["index_path"]
+        if corpus_dir is not None and index_path is not None:
+            self.corpus_dir = corpus_dir
+            self.index_path = index_path
+        elif source_name is not None:
+            paths = source_paths(self.config, source_name)
+            self.corpus_dir = paths["corpus_dir"]
+            self.index_path = paths["index_path"]
+        else:
+            sources = resolve_rag_sources(self.config)
+            self.source_name = "wiki" if "wiki" in sources else next(iter(sources))
+            default = sources[self.source_name]
+            self.corpus_dir = default["corpus_dir"]
+            self.index_path = default["index_path"]
+
         self.model_name = self.rag_config["model_name"]
         self.top_k = self.rag_config["top_k"]
         self.similarity_threshold = self.rag_config.get("similarity_threshold", 0.5)
@@ -45,43 +127,61 @@ class BanglaRAG:
         self.batch_size = self.rag_config.get("batch_size", 32)
         self.query_batch_size = self.rag_config.get("query_batch_size", self.batch_size)
         self.max_seq_length = self.rag_config.get("max_seq_length", None)
+        self.index_dtype = _resolve_numpy_dtype(self.rag_config.get("index_dtype", "float16"))
 
         self.model = None
         self.passages = []
         self.embeddings = None
+        self.search_embeddings = None
 
-    def load_model(self):
+    def load_model(self, force_cpu=False):
         if self.model is None:
             from src.config_utils import resolve_model_path
 
             resolved_path = resolve_model_path(self.model_name)
-            with Console().status("Loading SentenceTransformer model...", spinner="aesthetic"):
-                self.model = SentenceTransformer(resolved_path)
+            with console.status("Loading SentenceTransformer model...", spinner="aesthetic"):
+                device = (
+                    "cpu" if force_cpu or os.environ.get("ABOLTABOLYZER_FORCE_CPU") == "1" else None
+                )
+                if device:
+                    self.model = SentenceTransformer(resolved_path, device=device)
+                else:
+                    self.model = SentenceTransformer(resolved_path)
             if self.max_seq_length is not None:
                 self.model.max_seq_length = self.max_seq_length
             if self.model.device.type == "cuda":
                 self.model = self.model.half()
 
+    def _jsonl_files(self, corpus_dir):
+        return sorted(glob.glob(os.path.join(corpus_dir, "*.jsonl")))
+
     def load_corpus(self):
         passages = []
-        jsonl_files = glob.glob(os.path.join(self.corpus_dir, "*.jsonl"))
+        jsonl_files = self._jsonl_files(self.corpus_dir)
+
+        # Legacy: typed wiki/ empty but flat corpus/*.jsonl still present.
+        if (
+            not jsonl_files
+            and self.source_name in (None, "wiki")
+            and os.path.basename(self.corpus_dir.rstrip("/")) == "wiki"
+        ):
+            legacy_root = os.path.dirname(self.corpus_dir.rstrip("/")) or "corpus"
+            jsonl_files = self._jsonl_files(legacy_root)
+            if jsonl_files:
+                warn(
+                    f"Typed corpus '{self.corpus_dir}' is empty; "
+                    f"falling back to flat files in {legacy_root}/"
+                )
 
         if not jsonl_files:
-            console.print(
-                f"[bold red]Warning: No corpus files (*.jsonl) found in directory '{self.corpus_dir}'[/bold red]"
-            )
+            warn(f"No corpus files (*.jsonl) in '{self.corpus_dir}'")
             return passages
 
-        with Progress(
-            SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True
-        ) as progress:
-            task = progress.add_task(description="Reading corpus files...", total=len(jsonl_files))
-
+        with pipeline_progress() as progress:
+            task = progress.add_task("Reading corpus", total=len(jsonl_files))
             for file_path in jsonl_files:
-                progress.update(task, description=f"Reading {os.path.basename(file_path)}...")
+                progress.update(task, description=f"Reading {os.path.basename(file_path)}")
                 skipped = 0
-                # errors="replace" so one corrupt byte run cannot abort the whole
-                # corpus read; damaged lines then fail json.loads and are counted below.
                 with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
                         if line.strip():
@@ -95,34 +195,42 @@ class BanglaRAG:
                                 skipped += 1
                                 continue
                 if skipped:
-                    console.print(
-                        f"[yellow]Skipped {skipped} unreadable line(s) in "
-                        f"{os.path.basename(file_path)} — corpus file may be corrupt.[/yellow]"
-                    )
+                    warn(f"Skipped {skipped} unreadable line(s) in {os.path.basename(file_path)}")
                 progress.advance(task)
 
-        # Sort passages by length to optimize encoder performance
-        passages = sorted(passages, key=len)
         return passages
 
+    def _compact_embeddings(self, embeddings):
+        return np.ascontiguousarray(embeddings, dtype=self.index_dtype)
+
+    def prepare_search_embeddings(self):
+        """Return a reusable float32 matrix for fast dot-product search."""
+        if self.embeddings is None:
+            if not self.load_index():
+                return None
+        if self.search_embeddings is None:
+            self.search_embeddings = np.ascontiguousarray(self.embeddings, dtype=np.float32)
+        return self.search_embeddings
+
     def build_index(self):
-        console.print("[bold cyan]Step 1:[/bold cyan] Loading corpus passages...")
+        import math
+
+        label = self.source_name or os.path.basename(self.corpus_dir.rstrip("/") or "default")
+        info(f"Building '{label}': {self.corpus_dir} → {self.index_path}")
         self.passages = self.load_corpus()
 
         if not self.passages:
-            console.print("[bold red]Corpus is empty. Cannot build index.[/bold red]")
+            warn(f"Corpus empty for '{label}' — skip index")
             return False
 
         total_p = len(self.passages)
-        console.print(f"Loaded {total_p} passages. Computing dense embeddings...")
+        info(f"Loaded {total_p} passages · encoding with batch_size={self.batch_size}")
 
         self.load_model()
 
-        import math
-
         chunk_size = 5000
         num_chunks = math.ceil(total_p / chunk_size)
-        chunks_dir = os.path.join(os.path.dirname(self.index_path), "chunks")
+        chunks_dir = os.path.join(os.path.dirname(self.index_path) or ".", "chunks", label)
         os.makedirs(chunks_dir, exist_ok=True)
 
         embeddings_chunks = [None] * num_chunks
@@ -140,19 +248,11 @@ class BanglaRAG:
                     os.remove(chunk_file)
 
         if completed_chunks > 0:
-            console.print(
-                f"Found [bold green]{completed_chunks}/{num_chunks}[/bold green] already completed chunks. Resuming..."
-            )
+            info(f"Resuming: {completed_chunks}/{num_chunks} chunks already encoded")
 
         batch_size = self.batch_size
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            transient=True,
-        ) as progress:
-            task = progress.add_task(description="Encoding passages...", total=num_chunks)
+        with pipeline_progress() as progress:
+            task = progress.add_task(f"Encode '{label}'", total=num_chunks)
             progress.advance(task, completed_chunks)
 
             for chunk_idx in range(num_chunks):
@@ -162,6 +262,12 @@ class BanglaRAG:
                 start_idx = chunk_idx * chunk_size
                 end_idx = min(start_idx + chunk_size, total_p)
                 chunk_passages = self.passages[start_idx:end_idx]
+                progress.update(
+                    task,
+                    description=(
+                        f"Encode '{label}' · passages {start_idx + 1}–{end_idx}/{total_p}"
+                    ),
+                )
 
                 chunk_embeddings = self.model.encode(
                     chunk_passages,
@@ -169,23 +275,40 @@ class BanglaRAG:
                     normalize_embeddings=True,
                     batch_size=batch_size,
                 )
+                chunk_embeddings = self._compact_embeddings(chunk_embeddings)
 
                 chunk_file = os.path.join(chunks_dir, f"chunk_{chunk_idx}.pkl")
                 with open(chunk_file, "wb") as f:
-                    pickle.dump({"embeddings": chunk_embeddings}, f)
+                    pickle.dump(
+                        {
+                            "index_version": RAG_INDEX_VERSION,
+                            "embedding_dtype": np.dtype(self.index_dtype).name,
+                            "embeddings": chunk_embeddings,
+                        },
+                        f,
+                    )
 
                 embeddings_chunks[chunk_idx] = chunk_embeddings
                 progress.advance(task, 1)
 
-        console.print("Merging all chunks...")
-        self.embeddings = np.vstack(embeddings_chunks)
+        info("Merging embedding chunks...")
+        self.embeddings = self._compact_embeddings(np.vstack(embeddings_chunks))
+        self.search_embeddings = None
 
-        console.print(f"Saving index to [italic]{self.index_path}[/italic]...")
-        os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
+        info(f"Saving index → {self.index_path}")
+        os.makedirs(os.path.dirname(self.index_path) or ".", exist_ok=True)
         with open(self.index_path, "wb") as f:
-            pickle.dump({"passages": self.passages, "embeddings": self.embeddings}, f)
+            pickle.dump(
+                {
+                    "index_version": RAG_INDEX_VERSION,
+                    "embedding_dtype": np.dtype(self.index_dtype).name,
+                    "model_name": self.model_name,
+                    "passages": self.passages,
+                    "embeddings": self.embeddings,
+                },
+                f,
+            )
 
-        # Cleanup chunk files
         try:
             for chunk_idx in range(num_chunks):
                 chunk_file = os.path.join(chunks_dir, f"chunk_{chunk_idx}.pkl")
@@ -193,27 +316,25 @@ class BanglaRAG:
                     os.remove(chunk_file)
             os.rmdir(chunks_dir)
         except Exception as e:
-            console.print(f"[yellow]Warning: Could not clean up temporary chunks: {e}[/yellow]")
+            warn(f"Could not clean up temporary chunks: {e}")
 
-        console.print(
-            Panel(
-                "[bold green]✔ Dense index built and saved successfully![/bold green]",
-                border_style="green",
-            )
-        )
+        ok(f"Dense index '{label}' ready ({total_p} passages)")
         return True
 
     def load_index(self):
         if not os.path.exists(self.index_path):
-            console.print(
-                f"[bold red]Index file {self.index_path} not found. Build the index first.[/bold red]"
-            )
+            warn(f"Index not found: {self.index_path} — run `just make-rag` first")
             return False
 
         with open(self.index_path, "rb") as f:
             data = pickle.load(f)
             self.passages = data["passages"]
-            self.embeddings = data["embeddings"]
+            self.embeddings = self._compact_embeddings(data["embeddings"])
+            self.search_embeddings = None
+        ok(
+            f"Loaded index '{self.source_name or self.index_path}' · "
+            f"{len(self.passages)} passages · {self.embeddings.dtype}"
+        )
         return True
 
     def retrieve(self, query, top_k=None, similarity_threshold=None):
@@ -229,11 +350,16 @@ class BanglaRAG:
         if similarity_threshold is None:
             similarity_threshold = self.similarity_threshold
 
-        query_embedding = self.model.encode(
-            [query], show_progress_bar=False, normalize_embeddings=True
-        )[0]
+        index = self.prepare_search_embeddings()
+        if index is None:
+            return []
 
-        similarities = np.dot(self.embeddings, query_embedding)
+        query_embedding = np.asarray(
+            self.model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0],
+            dtype=np.float32,
+        )
+
+        similarities = np.dot(index, query_embedding)
         top_indices = np.argsort(similarities)[::-1][:top_k]
 
         results = []
@@ -242,46 +368,6 @@ class BanglaRAG:
             if score >= similarity_threshold:
                 results.append({"text": self.passages[i], "score": score})
         return results
-
-    def retrieve_many(self, queries, top_k=None, similarity_threshold=None):
-        """Batch-encode queries, then retrieve hits for each query."""
-        queries = list(queries)
-        if not queries:
-            return []
-        if self.embeddings is None:
-            if not self.load_index():
-                return [[] for _ in queries]
-
-        self.load_model()
-
-        if top_k is None:
-            top_k = self.top_k
-        if similarity_threshold is None:
-            similarity_threshold = self.similarity_threshold
-
-        query_embeddings = self.model.encode(
-            queries,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-            batch_size=self.query_batch_size,
-        )
-
-        all_results = []
-        for query_embedding in query_embeddings:
-            similarities = np.dot(self.embeddings, query_embedding)
-            if top_k < len(similarities):
-                candidate_indices = np.argpartition(similarities, -top_k)[-top_k:]
-                top_indices = candidate_indices[np.argsort(similarities[candidate_indices])[::-1]]
-            else:
-                top_indices = np.argsort(similarities)[::-1]
-
-            results = []
-            for i in top_indices[:top_k]:
-                score = float(similarities[i])
-                if score >= similarity_threshold:
-                    results.append({"text": self.passages[i], "score": score})
-            all_results.append(results)
-        return all_results
 
     def format_evidence(self, hits):
         """Join retrieved hits and truncate to max_evidence_tokens."""
@@ -294,25 +380,78 @@ class BanglaRAG:
         return evidence, len(hits), float(max(scores)), float(np.mean(scores))
 
 
+def build_all_indexes(config_path="configs/config.toml", sources=None):
+    with open(config_path, "rb") as f:
+        config = tomllib.load(f)
+    all_sources = resolve_rag_sources(config)
+    names = list(sources) if sources else list(all_sources)
+
+    status = {}
+    for name in names:
+        if name not in all_sources:
+            status[name] = "unknown"
+            continue
+        corpus_dir = all_sources[name]["corpus_dir"]
+        n_files = len(glob.glob(os.path.join(corpus_dir, "*.jsonl")))
+        status[name] = f"{n_files} jsonl" if n_files else "empty"
+    kv_table("Corpus folders", status, key_header="source")
+
+    built = []
+    skipped = []
+    for i, name in enumerate(names, start=1):
+        if name not in all_sources:
+            warn(f"[{i}/{len(names)}] Unknown source '{name}' — skip")
+            skipped.append(name)
+            continue
+        info(f"[{i}/{len(names)}] Building source '{name}'")
+        rag = BanglaRAG(config=config, source_name=name)
+        if rag.build_index():
+            built.append(name)
+            ok(f"Built indexes/{name}.pkl")
+        else:
+            skipped.append(name)
+            warn(f"Skipped '{name}' (empty or missing corpus)")
+
+    done_panel(
+        "Typed RAG indexes",
+        [
+            f"Built: [bold green]{', '.join(built) if built else 'none'}[/bold green]",
+            f"Skipped: [bold yellow]{', '.join(skipped) if skipped else 'none'}[/bold yellow]",
+        ],
+    )
+    return built, skipped
+
+
 def main():
     parser = argparse.ArgumentParser(description="Bangla RAG Dense Indexer and Retriever")
     parser.add_argument(
-        "--build-index", action="store_true", help="Build Dense index from corpus directory"
+        "--make-rag",
+        "--build-index",
+        dest="make_rag",
+        action="store_true",
+        help="Build typed dense indexes from corpus/<source>/ folders",
+    )
+    parser.add_argument(
+        "--source",
+        action="append",
+        dest="sources",
+        help="Build/query only this source (repeatable). Default: all sources.",
     )
     parser.add_argument("--query", type=str, help="Query to search")
     args = parser.parse_args()
 
-    rag = BanglaRAG()
-    if args.build_index:
-        console.print(
-            Panel("[bold yellow]Dense RAG Indexer Phase[/bold yellow]", border_style="yellow")
-        )
-        rag.build_index()
+    if args.make_rag:
+        banner("Make RAG indexes", "corpus/<source>/*.jsonl → indexes/<source>.pkl")
+        build_all_indexes(sources=args.sources)
     elif args.query:
+        source = (args.sources or ["wiki"])[0]
+        info(f"Querying source '{source}'")
+        rag = BanglaRAG(source_name=source)
         if rag.load_index():
             results = rag.retrieve(args.query)
-            console.print(f"\n[bold cyan]Query:[/bold cyan] {args.query}")
-            console.print(f"[bold green]Top {len(results)} matches retrieved:[/bold green]")
+            console.print(f"\n[bold cyan]Source:[/bold cyan] {source}")
+            console.print(f"[bold cyan]Query:[/bold cyan] {args.query}")
+            console.print(f"[bold green]Top {len(results)} matches:[/bold green]")
             for idx, res in enumerate(results):
                 console.print(
                     Panel(
@@ -323,6 +462,8 @@ def main():
                 )
         else:
             console.print("[bold red]Failed to run retrieval.[/bold red]")
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

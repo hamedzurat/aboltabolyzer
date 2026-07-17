@@ -6,10 +6,15 @@ import torch
 _INTEROP_THREADS_CONFIGURED = False
 
 
+def active_hardware_profile(config):
+    """Return the configured hardware profile name, or None."""
+    return config.get("runtime", {}).get("hardware_profile")
+
+
 def resolve_section(config, section_name):
     """Return a config section with the active hardware profile overlaid."""
     section = deepcopy(config.get(section_name, {}))
-    profile = config.get("runtime", {}).get("hardware_profile")
+    profile = active_hardware_profile(config)
     if not profile:
         return section
 
@@ -51,20 +56,55 @@ def resolve_quantization_mode(gemma_config):
     return "none"
 
 
-def validate_config(config):
-    profile = config.get("runtime", {}).get("hardware_profile")
-    if profile and profile not in config.get("hardware_profiles", {}):
-        raise ValueError(f"Unknown hardware_profile '{profile}'.")
+def describe_active_profile(config):
+    """Snapshot of resolved settings driven by runtime.hardware_profile."""
+    profile = active_hardware_profile(config)
+    gemma = resolve_section(config, "gemma")
+    rag = resolve_section(config, "rag")
+    load_in = None
+    if gemma.get("load_in") is not None or gemma.get("load_in_4bit") or gemma.get("load_in_8bit"):
+        load_in = resolve_quantization_mode(gemma)
+    return {
+        "hardware_profile": profile,
+        "verifier_model": gemma.get("model_name"),
+        "model_loader": gemma.get("model_loader"),
+        "load_in": load_in,
+        "device_map": gemma.get("device_map"),
+        "cuda_max_memory": gemma.get("cuda_max_memory"),
+        "max_input_tokens": gemma.get("max_input_tokens"),
+        "enable_think_pass": gemma.get("enable_think_pass"),
+        "exemplar_top_k": gemma.get("exemplar_top_k"),
+        "rag_batch_size": rag.get("batch_size"),
+        "rag_query_batch_size": rag.get("query_batch_size"),
+        "rag_embedder": rag.get("model_name"),
+    }
 
-    num_folds = int(config.get("num_folds", 0))
-    if num_folds < 2:
-        raise ValueError("num_folds must be at least 2.")
+
+def validate_config(config):
+    profiles = config.get("hardware_profiles", {})
+    profile = active_hardware_profile(config)
+    if profiles:
+        if not profile:
+            raise ValueError(
+                "runtime.hardware_profile is required when hardware_profiles are defined. "
+                "Set it to one of: " + ", ".join(sorted(profiles))
+            )
+        if profile not in profiles:
+            raise ValueError(
+                f"Unknown hardware_profile '{profile}'. "
+                f"Choose one of: {', '.join(sorted(profiles))}"
+            )
 
     query_mode = resolve_section(config, "rag").get("query_mode")
     if query_mode not in ("prompt", "prompt_response"):
         raise ValueError("rag.query_mode must be 'prompt' or 'prompt_response'.")
 
     gemma_config = resolve_section(config, "gemma")
+    if not gemma_config.get("model_name"):
+        raise ValueError(
+            "Resolved gemma.model_name is missing. "
+            f"Set it under [hardware_profiles.{profile}.gemma] (or [gemma])."
+        )
     load_in = resolve_quantization_mode(gemma_config)
     model_loader = gemma_config.get("model_loader", "multimodal_lm")
     if model_loader not in ("multimodal_lm", "causal_lm"):
@@ -85,19 +125,11 @@ def validate_config(config):
             "llm_int8_enable_fp32_cpu_offload=true."
         )
 
-    xlmr_config = resolve_section(config, "xlmr")
-    if int(xlmr_config.get("batch_size", 0)) < 1:
-        raise ValueError("xlmr.batch_size must be at least 1.")
-    if int(xlmr_config.get("max_length", 0)) < 1:
-        raise ValueError("xlmr.max_length must be at least 1.")
-
-
-def fail_on_model_error(config):
-    return bool(resolve_runtime(config).get("fail_on_model_error", True))
-
-
-def use_llm_verifier(config):
-    return bool(resolve_runtime(config).get("use_llm_verifier", True))
+    decision = config.get("decision", {})
+    if "threshold" in decision:
+        threshold = float(decision["threshold"])
+        if not (0.0 <= threshold <= 1.0):
+            raise ValueError("decision.threshold must be between 0 and 1.")
 
 
 def apply_runtime_settings(config):

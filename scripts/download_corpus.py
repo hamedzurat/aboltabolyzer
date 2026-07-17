@@ -1,8 +1,13 @@
 import argparse
 import json
 import os
+import sys
 
 from datasets import load_dataset
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from src.tui import banner, done_panel, info, ok, pipeline_progress
 
 
 def iter_chunks(text, chunk_words, overlap_words):
@@ -22,7 +27,7 @@ def main():
     parser.add_argument("--dataset", default="wikimedia/wikipedia")
     parser.add_argument("--config", default="20231101.bn")
     parser.add_argument("--split", default="train")
-    parser.add_argument("--output", default="corpus/wiki_bn.jsonl")
+    parser.add_argument("--output", default="corpus/wiki/wiki_bn.jsonl")
     parser.add_argument("--chunk-words", type=int, default=220)
     parser.add_argument("--overlap-words", type=int, default=50)
     parser.add_argument(
@@ -33,28 +38,48 @@ def main():
     )
     args = parser.parse_args()
 
+    banner(
+        "Download wiki corpus",
+        f"{args.dataset} / {args.config} → {args.output}",
+    )
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
-    print(f"Loading {args.dataset} / {args.config} / {args.split}")
+    info(f"Loading dataset split '{args.split}'...")
     dataset = load_dataset(args.dataset, args.config, split=args.split)
+    total = len(dataset) if args.max_articles <= 0 else min(len(dataset), args.max_articles)
+    info(f"Will process up to {total} articles")
 
     article_count = 0
     chunk_count = 0
     with open(args.output, "w", encoding="utf-8") as f:
-        for row in dataset:
-            if args.max_articles and article_count >= args.max_articles:
-                break
+        with pipeline_progress() as progress:
+            task = progress.add_task("Chunking wiki", total=total)
+            for row in dataset:
+                if args.max_articles and article_count >= args.max_articles:
+                    break
 
-            text = row.get("text", "")
-            for chunk in iter_chunks(text, args.chunk_words, args.overlap_words):
-                f.write(json.dumps({"text": chunk}, ensure_ascii=False) + "\n")
-                chunk_count += 1
+                text = row.get("text", "")
+                for chunk in iter_chunks(text, args.chunk_words, args.overlap_words):
+                    f.write(json.dumps({"text": chunk}, ensure_ascii=False) + "\n")
+                    chunk_count += 1
 
-            article_count += 1
-            if article_count % 1000 == 0:
-                print(f"Processed {article_count} articles, wrote {chunk_count} chunks")
+                article_count += 1
+                if article_count % 100 == 0 or article_count == total:
+                    progress.update(
+                        task,
+                        description=f"Chunking wiki · {chunk_count} chunks",
+                    )
+                progress.advance(task)
 
-    print(f"Saved {chunk_count} chunks from {article_count} articles to {args.output}")
+    ok(f"Wrote {chunk_count} chunks from {article_count} articles")
+    done_panel(
+        "Corpus ready",
+        [
+            f"Articles: {article_count}",
+            f"Chunks: {chunk_count}",
+            f"Output: {args.output}",
+        ],
+    )
 
 
 if __name__ == "__main__":

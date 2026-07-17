@@ -1,283 +1,100 @@
-# =============================================================================
-# Aboltabolyzer — runtime configuration
-# =============================================================================
-# Edit this file first, then run: just first-run-8gb / just first-run-16gb
-# Profile-specific blocks at the bottom override the base sections.
+# Aboltabolyzer — routed Gemma/Qwen verifier
+#
+# Machine switch (only knob you need for GPU size):
+#   [runtime] hardware_profile = "16gb" | "8gb"
+#
+# Then every `just` recipe uses that profile via resolve_section():
+#   just show-profile   # confirm resolved model / RAG / memory
+#   just setup          # downloads the profile's verifier + builds RAG
+#   just run            # preprocess → predict
+#   just first-run      # setup → preprocess → predict
 
-# Random seed for fold splits and model init reproducibility.
-seed = 42
-
-# Stratified CV folds for XLM-R training and fold-isolated Gemma OOF.
-num_folds = 10
-
-# -----------------------------------------------------------------------------
-# Runtime — which machine profile and verifier mode to use
-# -----------------------------------------------------------------------------
 [runtime]
-# Active hardware profile. Values "8gb" or "16gb" override [runtime], [xlmr],
-# [gemma], and [rag] with matching [hardware_profiles.*] blocks.
-hardware_profile = "16gb"
-
-# If true, training/predict abort when Gemma fails instead of faking scores.
-fail_on_model_error = true
-
-# If true, Gemma is the final verdict source (p_llm). If false, p_llm = p_xlmr
-# and the pipeline skips Gemma — useful for smoke tests without loading the LLM.
-use_llm_verifier = true
-
-# Runtime performance knobs. Leave thread counts at 0 to let PyTorch choose.
-torch_num_threads = 0
-torch_interop_threads = 0
+hardware_profile = "16gb"   # ← set this once per machine ("16gb" | "8gb")
 float32_matmul_precision = "high"
 allow_tf32 = true
-cuda_benchmark = false
 
-# -----------------------------------------------------------------------------
-# Prediction checkpoints — resume `just predict` after OOMs/interruptions
-# -----------------------------------------------------------------------------
 [predict]
-# If true, prediction reuses completed stage CSVs instead of recomputing.
 use_checkpoints = true
-
-# Set true for a one-off clean prediction run without deleting checkpoint files.
 force_recompute = false
-
-# Write a partial submission every N verifier rows so an interrupted run still
-# leaves usable output (submission_partial.csv in the run folder). 0 disables.
 partial_flush_every = 25
+llm_predictions_path = "generated/processed/test_llm_preds.csv"
 
-# Stage-level prediction checkpoints. `test_with_evidence.csv` and the Gemma
-# JSONL debug log are also resumable caches.
-xlmr_predictions_path = "dataset/processed/test_xlmr_preds.csv"
-llm_predictions_path = "dataset/processed/test_llm_preds.csv"
-
-# -----------------------------------------------------------------------------
-# Data paths
-# -----------------------------------------------------------------------------
 [data]
-# Labeled training JSON (299 samples in the sample competition set).
 sample_path = "dataset/sample_dataset.json"
-
-# Test CSV with id, context, prompt_bn, response_bn (no labels).
-test_path = "dataset/.3_testset.csv"
-
-# Generated CSVs land here (train.csv, oof_xlmr.csv, train_with_preds.csv, …).
-processed_dir = "dataset/processed"
-
-# Final competition submission (id, label).
+test_path = "dataset/testset.csv"
+processed_dir = "generated/processed"
 submission_output_path = "submissions/submission.csv"
 
-# -----------------------------------------------------------------------------
-# RAG — dense retrieval for rows where context == "[NULL]"
-# -----------------------------------------------------------------------------
+[router]
+enabled = true
+
+[decision]
+threshold = 0.5
+
+[debug]
+write_debug = true
+
+# ── Shared defaults (profiles override machine-specific keys) ────────────────
+
 [rag]
-# Directory of *.jsonl corpus files ({ "text": "..." } or { "passage": "..." }).
-corpus_dir = "corpus"
-
-# Pickled dense index built by: just build-index
-index_path = "indexes/dense_index.pkl"
-
-# Few-shot exemplar index for Gemma, built during training.
+corpus_root = "corpus"
+index_root = "indexes"
+sources = ["wiki", "famous_bn", "idioms", "literal", "grammar"]
 exemplar_index_path = "indexes/exemplar_index.pkl"
-
-# SentenceTransformer model for query/passage embedding.
 model_name = "BAAI/bge-m3"
-
-# Max passages to retrieve per query before joining and truncating.
+index_dtype = "float16"
 top_k = 5
-
-# After joining top-k passages, truncate evidence to this many whitespace tokens
-# so the cross-encoder / Gemma context window is not blown by long wiki dumps.
 max_evidence_tokens = 512
-
-# Minimum cosine similarity for a passage to be included. Below threshold → [NULL].
 similarity_threshold = 0.5
-
-# Retrieval query text:
-#   "prompt"          — question only (default; safer for hallucination detection)
-#   "prompt_response" — question + answer (experimental; can retrieve false-claim evidence)
-query_mode = "prompt"
-
-# Batch size for SentenceTransformer corpus indexing.
-batch_size = 32
-# Batch size for batched RAG query retrieval during train/predict.
-query_batch_size = 32
-
-# Max sequence length for the embedding model to limit GPU memory usage.
+query_mode = "prompt"          # "prompt" | "prompt_response"
+batch_size = 32                # overridden per profile
+query_batch_size = 32          # overridden per profile
 max_seq_length = 512
 
-# -----------------------------------------------------------------------------
-# XLM-R cross-encoder (defaults; overridden by active hardware_profile)
-# -----------------------------------------------------------------------------
-[xlmr]
-model_name = "FacebookAI/xlm-roberta-large"
-max_length = 512
-batch_size = 16
-num_workers = 2
-pin_memory = true
-prefetch_factor = 2
-persistent_workers = true
-grad_accum_steps = 1
-use_amp = false
-epochs = 20
-lr = 2e-4
-weight_decay = 0.01
-lora_r = 8
-lora_alpha = 16
-lora_dropout = 0.1
-# Focal loss focusing parameter (0 = plain BCE, 2 = standard focal).
-focal_gamma = 2.0
-# Label smoothing: 0 = hard labels, 0.1 = soft (helps stop overconfident collapse).
-label_smoothing = 0.1
-early_stopping_patience = 8
-
-# -----------------------------------------------------------------------------
-# Gemma verifier — final judge with XLM-R encoder prior in the prompt
-# -----------------------------------------------------------------------------
 [gemma]
-model_name = "google/gemma-4-E4B-it"
-model_loader = "multimodal_lm"       # "multimodal_lm" or "causal_lm"
-load_in = "4bit"                     # "4bit", "8bit", or "none"
-
-# Load placement. Base defaults are for all-GPU 16GB-style loading.
-device_map = "cuda:0"
-cuda_max_memory = "14GiB"
-cpu_max_memory = "32GiB"
+# Shared verifier knobs; model / VRAM / think live under [hardware_profiles.*.gemma]
 offload_folder = "models/offload/gemma"
-llm_int8_enable_fp32_cpu_offload = false
-
-# Quant/compute dtype knobs for 4-bit mode.
 torch_dtype = "bfloat16"
 bnb_4bit_compute_dtype = "bfloat16"
 clear_cuda_before_load = true
+think_conf_low = 0.35
+think_conf_high = 0.65
 
-# Truncate Gemma inputs before they get too large. Null means tokenizer default.
-max_input_tokens = 3072
-
-# Use precomputed text embeddings for normal forward passes. This is useful for
-# Gemma 4 CPU-offload profiles where direct embedding weight indexing can hit a
-# meta tensor.
-use_inputs_embeds_for_forward = false
-use_language_model_direct = false
-
-# Extra verifier passes. Disable on constrained/offload profiles for stability.
-classify_cultural_band = true
-enable_think_pass = true
-
-# Dynamic few-shot examples. Lower this to reduce prompt length and avoid loading
-# the exemplar embedding model during prediction.
-exemplar_top_k = 3
-
-# Think trigger: fast F/H logit pass is uncertain when |p_fast - 0.5| < this value.
-confidence_threshold = 0.08
-
-# Think trigger: Gemma fast pass disagrees with XLM-R prior when |p_fast - p_xlmr| > this.
-disagree_threshold = 0.40
-
-# Think trigger: C0 band (math/science/universal) + no retrieved evidence → force CoT.
-force_think_c0_null = true
-
-# Think trigger: C2 band (recent/time-sensitive) → force CoT.
-force_think_c2 = true
-
-# Max tokens for the CoT think pass (parsed verdict: Faithful / Hallucinated).
-# Reasoning + verdict does not fit in 256; below ~512 the CoT is cut off before it
-# reaches the verdict line and the pass silently degrades to the fast-pass score.
-max_think_tokens = 512
-
-# Language the think pass reasons in: "bn" or "en". Evidence/question/answer stay
-# Bengali either way — only the reasoning instruction changes. English reasoning
-# over Bengali source is the cross-lingual CoT setup; A/B it on labeled data
-# before trusting either. Token cost is near-identical (Bengali ≈ 1.08x English).
-think_reasoning_language = "bn"
-
-# -----------------------------------------------------------------------------
-# Threshold decision — single OOF-tuned cutoff on p_llm (no meta-classifier)
-# -----------------------------------------------------------------------------
-[blender]
-# Metric for grid-searching the decision threshold on OOF Gemma scores:
-#   "macro_f1"    — balanced overall F1
-#   "f1_class_0"  — optimize hallucinated-class recall/precision (label 0)
-threshold_metric = "macro_f1"
-
-# Saved to models/blender_config.pkl (legacy filename; stores threshold only).
-
-# -----------------------------------------------------------------------------
-# Hardware profile: RTX 5060 8GB — ungated small text-only verifier
-# -----------------------------------------------------------------------------
-[hardware_profiles.8gb.runtime]
-# Gemma 4 E4B is not viable on 8GB with this Transformers/Accelerate stack.
-# Use an ungated small text-only verifier instead of disabling the LLM entirely.
-use_llm_verifier = true
-fail_on_model_error = true
-
-[hardware_profiles.8gb.xlmr]
-model_name = "FacebookAI/xlm-roberta-base"
-max_length = 384
-batch_size = 2
-num_workers = 2
-pin_memory = true
-prefetch_factor = 2
-persistent_workers = true
-grad_accum_steps = 4
-use_amp = false
-early_stopping_patience = 8
-
-[hardware_profiles.8gb.gemma]
-model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-model_loader = "causal_lm"
-load_in = "4bit"
-llm_int8_enable_fp32_cpu_offload = false
-device_map = "cuda:0"
-cuda_max_memory = "7GiB"
-max_input_tokens = 1536
-use_inputs_embeds_for_forward = false
-use_language_model_direct = false
-classify_cultural_band = false
-enable_think_pass = false
-exemplar_top_k = 0
-max_think_tokens = 128
-
-[hardware_profiles.8gb.rag]
-batch_size = 32
-query_batch_size = 32
-max_seq_length = 512
-
-# -----------------------------------------------------------------------------
-# Hardware profile: RTX 5060 16GB — full pipeline with Gemma
-# -----------------------------------------------------------------------------
-[hardware_profiles.16gb.runtime]
-use_llm_verifier = true
-fail_on_model_error = true
-
-[hardware_profiles.16gb.xlmr]
-model_name = "FacebookAI/xlm-roberta-large"
-max_length = 512
-# batch_size * grad_accum_steps is the effective batch. Keep the product at 16:
-# with ~269 train rows per fold, a larger effective batch leaves too few steps.
-batch_size = 8
-num_workers = 4
-pin_memory = true
-prefetch_factor = 4
-persistent_workers = true
-grad_accum_steps = 2
-use_amp = true
+# ── Profile: 16GB (RTX 5060 Ti / P100 / T4-class) — Gemma 4 ──────────────────
 
 [hardware_profiles.16gb.gemma]
+model_name = "google/gemma-4-E4B-it"
+model_loader = "multimodal_lm"
 load_in = "4bit"
-llm_int8_enable_fp32_cpu_offload = false
 device_map = "cuda:0"
 cuda_max_memory = "14GiB"
+cpu_max_memory = "32GiB"
 max_input_tokens = 3072
-use_inputs_embeds_for_forward = false
-use_language_model_direct = false
-classify_cultural_band = true
 enable_think_pass = true
 exemplar_top_k = 3
 max_think_tokens = 512
-think_reasoning_language = "bn"
 
 [hardware_profiles.16gb.rag]
 batch_size = 128
 query_batch_size = 128
-max_seq_length = 512
+
+# ── Profile: 8GB / small GPUs — ungated Qwen3 thinking model ─────────────────
+
+[hardware_profiles.8gb.gemma]
+model_name = "Qwen/Qwen3-1.7B"
+model_loader = "causal_lm"
+load_in = "4bit"
+device_map = "cuda:0"
+cuda_max_memory = "7GiB"
+cpu_max_memory = "16GiB"
+max_input_tokens = 1536
+enable_think_pass = true
+exemplar_top_k = 0
+max_think_tokens = 512
+chat_template_enable_thinking_fast = false
+chat_template_enable_thinking_think = true
+
+[hardware_profiles.8gb.rag]
+batch_size = 32
+query_batch_size = 32

@@ -1,4 +1,4 @@
-import gc
+import hashlib
 import json
 import logging
 import os
@@ -7,34 +7,46 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import torch
 import transformers
 from huggingface_hub.utils import disable_progress_bars
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
-from src.blender import ThresholdDecision
 from src.config_utils import (
     apply_runtime_settings,
-    fail_on_model_error,
     resolve_quantization_mode,
     resolve_runtime,
     resolve_section,
-    use_llm_verifier,
     validate_config,
 )
-from src.llm_verifier import GemmaVerifier
-from src.rag import BanglaRAG
-from src.xlmr_encoder import predict_test
+from src.evidence_policy import (
+    rag_fallback_source,
+    rag_skip_reason,
+    rag_source_for_task,
+    should_use_rag,
+)
+from src.llm_verifier import (
+    GemmaVerifier,
+    verifier_case_key,
+    verifier_log_matches_metadata,
+)
+from src.rag import BanglaRAG, resolve_rag_sources, source_paths
+from src.router import route_dataframe
+from src.tui import (
+    banner,
+    count_table,
+    done_panel,
+    info,
+    kv_table,
+    ok,
+    pipeline_progress,
+    step,
+    warn,
+)
 
 # Suppress Hugging Face warnings/load reports for a cleaner UI
 transformers.utils.logging.set_verbosity_error()
 transformers.utils.logging.disable_progress_bar()
 disable_progress_bars()
 logging.getLogger("transformers").setLevel(logging.ERROR)
-
-console = Console()
 
 
 def _prediction_checkpoint_path(config, key, default_filename):
@@ -57,43 +69,38 @@ def _load_prediction_checkpoint(
     try:
         checkpoint_df = pd.read_csv(path)
     except Exception as e:
-        console.print(f"[yellow]Could not read prediction checkpoint {path}: {e}[/yellow]")
+        warn(f"Could not read prediction checkpoint {path}: {e}")
         return None
 
     if column not in checkpoint_df.columns:
-        console.print(f"[yellow]Ignoring {path}; missing column '{column}'.[/yellow]")
+        warn(f"Ignoring {path}; missing column '{column}'")
         return None
     if len(checkpoint_df) != expected_len:
-        console.print(
-            f"[yellow]Ignoring {path}; expected {expected_len} rows, found "
-            f"{len(checkpoint_df)}.[/yellow]"
-        )
+        warn(f"Ignoring {path}; expected {expected_len} rows, found {len(checkpoint_df)}")
         return None
     if expected_ids is not None and "id" in checkpoint_df.columns:
         checkpoint_ids = checkpoint_df["id"].astype(str).tolist()
         current_ids = pd.Series(expected_ids).astype(str).tolist()
         if checkpoint_ids != current_ids:
-            console.print(
-                f"[yellow]Ignoring {path}; checkpoint ids do not match test ids.[/yellow]"
-            )
+            warn(f"Ignoring {path}; checkpoint ids do not match test ids")
             return None
     for meta_key, expected_value in (expected_metadata or {}).items():
         if meta_key not in checkpoint_df.columns:
-            console.print(f"[yellow]Ignoring {path}; missing metadata '{meta_key}'.[/yellow]")
+            warn(f"Ignoring {path}; missing metadata '{meta_key}'")
             return None
         actual_values = checkpoint_df[meta_key].astype(str).unique().tolist()
         if actual_values != [str(expected_value)]:
-            console.print(
-                f"[yellow]Ignoring {path}; metadata '{meta_key}' is {actual_values}, "
-                f"expected {expected_value}.[/yellow]"
+            warn(
+                f"Ignoring {path}; metadata '{meta_key}' is {actual_values}, "
+                f"expected {expected_value}"
             )
             return None
 
     values = checkpoint_df[column].to_numpy(dtype=float)
     if not np.isfinite(values).all():
-        console.print(f"[yellow]Ignoring {path}; found non-finite predictions.[/yellow]")
+        warn(f"Ignoring {path}; found non-finite predictions")
         return None
-    console.print(f"[bold green]Loaded checkpointed {column} from {path}.[/bold green]")
+    ok(f"Loaded checkpointed {column} from {path}")
     return values
 
 
@@ -107,7 +114,25 @@ def _save_prediction_checkpoint(path, ids, column, values, metadata=None):
     for meta_key, meta_value in (metadata or {}).items():
         checkpoint_df[meta_key] = meta_value
     checkpoint_df.to_csv(path, index=False)
-    console.print(f"[green]Saved {column} checkpoint to {path}.[/green]")
+    ok(f"Saved {column} checkpoint → {path}")
+
+
+def dataframe_cache_fingerprint(df):
+    """Fingerprint fields that can change verifier outputs."""
+    fields = [
+        "id",
+        "context",
+        "context_original",
+        "prompt_bn",
+        "response_bn",
+        "task_type",
+        "rag_source",
+        "rag_skipped_reason",
+        "evidence_source",
+    ]
+    available = [field for field in fields if field in df.columns]
+    payload = df[available].astype(str).to_json(orient="split", force_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def build_rag_query(row, query_mode):
@@ -116,20 +141,34 @@ def build_rag_query(row, query_mode):
     return str(row["prompt_bn"])
 
 
-def _retrieve_many_fast(rag, queries, progress=None, task=None, chunk_size=256):
-    """Same result as rag.retrieve_many, scored as batched float32 matmuls.
+def apply_threshold(p_llm, threshold=0.5):
+    p_llm = np.asarray(p_llm, dtype=float)
+    labels = (p_llm >= float(threshold)).astype(int)
+    return p_llm, labels
 
-    The index is stored float16 (the encoder is halved on CUDA), and NumPy has no
-    BLAS kernel for float16 — it falls back to an unvectorized loop. Casting the
-    index to float32 once and scoring a whole query chunk in one matmul is ~200x
-    faster than a float16 matvec per query.
-    """
+
+def validate_submission_df(submission_df):
+    cols = list(submission_df.columns)
+    if cols != ["id", "label"]:
+        raise ValueError(f"submission must have columns ['id', 'label'], got {cols}")
+    if submission_df["id"].duplicated().any():
+        raise ValueError("submission ids must be unique")
+    bad = ~submission_df["label"].isin([0, 1])
+    if bad.any():
+        raise ValueError("submission labels must be 0 or 1")
+    return True
+
+
+def _retrieve_many_fast(rag, queries, progress=None, task=None, chunk_size=256):
+    """Batch-encode queries, then retrieve hits for each query scored as batched float32 matmuls."""
     queries = list(queries)
     if not queries:
         return []
 
     rag.load_model()
-    index = np.ascontiguousarray(rag.embeddings, dtype=np.float32)
+    index = rag.prepare_search_embeddings()
+    if index is None:
+        return [[] for _ in queries]
     top_k = rag.top_k
     threshold = rag.similarity_threshold
 
@@ -146,7 +185,7 @@ def _retrieve_many_fast(rag, queries, progress=None, task=None, chunk_size=256):
             dtype=np.float32,
         )
 
-        sims = query_embeddings @ index.T  # (chunk, n_passages)
+        sims = query_embeddings @ index.T
         k = min(top_k, sims.shape[1])
         candidates = np.argpartition(sims, -k, axis=1)[:, -k:]
 
@@ -168,7 +207,7 @@ def _retrieve_many_fast(rag, queries, progress=None, task=None, chunk_size=256):
     return all_results
 
 
-def load_verifier_debug_map(log_path="logs/debug_llm_verifier.jsonl"):
+def load_verifier_debug_map(log_path="logs/debug_llm_verifier.jsonl", expected_metadata=None):
     """Map (prompt, response) -> latest verifier debug fields."""
     cache = {}
     if not os.path.exists(log_path):
@@ -181,257 +220,307 @@ def load_verifier_debug_map(log_path="logs/debug_llm_verifier.jsonl"):
                     continue
                 try:
                     entry = json.loads(line)
-                    key = (str(entry.get("prompt", "")), str(entry.get("response", "")))
+                    if expected_metadata and not verifier_log_matches_metadata(
+                        entry, expected_metadata
+                    ):
+                        continue
+                    key = verifier_case_key(
+                        evidence=entry.get("evidence", ""),
+                        prompt=entry.get("prompt", ""),
+                        response=entry.get("response", ""),
+                        task_type=entry.get("task_type", ""),
+                        context_original=entry.get("context_original", ""),
+                        metadata=expected_metadata,
+                    )
                     reasons = entry.get("think_reasons", [])
                     if isinstance(reasons, list):
                         reasons = "|".join(str(r) for r in reasons)
                     cache[key] = {
                         "p_llm_no_think": entry.get("p_llm_no_think"),
+                        "p_fast": entry.get("p_fast"),
+                        "p_think": entry.get("p_think"),
                         "p_llm_final": entry.get("p_llm_final"),
                         "triggered_think": entry.get("triggered_think"),
                         "verdict_parsed": entry.get("verdict_parsed"),
+                        "confidence_parsed": entry.get("confidence_parsed"),
+                        "think_max_tokens": entry.get("think_max_tokens"),
                         "think_reasons": reasons,
                         "thinking_cot": entry.get("thinking_cot"),
-                        "is_c0": entry.get("is_c0"),
-                        "is_c1": entry.get("is_c1"),
-                        "is_c2": entry.get("is_c2"),
+                        "task_type": entry.get("task_type"),
                     }
                 except Exception:
                     continue
     except Exception as e:
-        console.print(f"[yellow]Could not merge verifier debug log: {e}[/yellow]")
+        warn(f"Could not merge verifier debug log: {e}")
     return cache
 
 
-def build_debug_df(test_df, p_llm, decision, ctx):
-    """Build the full debug frame for `test_df` scored with `p_llm`.
+def apply_router_disabled_policy(test_df):
+    """Baseline evidence policy: no task router and no typed RAG."""
+    test_df = test_df.copy()
+    if "context_original" not in test_df.columns:
+        test_df["context_original"] = test_df["context"]
 
-    Shared by the end-of-run debug CSV and the periodic partial flush, so a
-    partial file has exactly the same schema as the final one. `test_df` may be
-    a head-slice of the full set; every column is derived per-row or from ctx.
-    """
+    test_df["context"] = test_df["context_original"]
+    context_present = ~test_df["context_original"].astype(str).str.strip().isin(
+        ["", "[NULL]", "None", "nan"]
+    )
+    test_df["task_type"] = np.where(context_present, "context_grounded_other", "other_null")
+    test_df["n_retrieved"] = 0
+    test_df["retrieval_sim_max"] = np.nan
+    test_df["retrieval_sim_mean"] = np.nan
+    test_df["rag_used"] = False
+    test_df["rag_source"] = ""
+    test_df["rag_skipped_reason"] = "router_disabled"
+    test_df["evidence_source"] = np.where(context_present, "original_context", "none")
+    test_df["evidence_relevance"] = np.where(context_present, "provided", "no_evidence")
+    count_table(
+        "Router disabled task baseline",
+        test_df["task_type"].value_counts().to_dict(),
+        key_header="task_type",
+    )
+    return test_df
+
+
+def _resolve_available_source(config, task_type):
+    """Pick preferred typed source, then fallback, if its index exists."""
+    sources = resolve_rag_sources(config)
+    candidates = []
+    preferred = rag_source_for_task(task_type)
+    if preferred:
+        candidates.append(preferred)
+    fallback = rag_fallback_source(task_type)
+    if fallback and fallback not in candidates:
+        candidates.append(fallback)
+
+    for name in candidates:
+        if name not in sources:
+            continue
+        index_path = sources[name]["index_path"]
+        if os.path.exists(index_path):
+            return name, index_path
+    if candidates:
+        return candidates[0], sources.get(candidates[0], {}).get("index_path")
+    return None, None
+
+
+def apply_task_evidence_policy(test_df, config):
+    """Route rows and apply typed RAG only where the task policy allows it."""
+    test_df = test_df.copy()
+    if "context_original" not in test_df.columns:
+        test_df["context_original"] = test_df["context"]
+
+    # Always start from original context; old evidence caches may have wrong RAG fills.
+    test_df["context"] = test_df["context_original"]
+    test_df["task_type"] = route_dataframe(test_df)
+    test_df["n_retrieved"] = 0
+    test_df["retrieval_sim_max"] = np.nan
+    test_df["retrieval_sim_mean"] = np.nan
+    test_df["rag_used"] = False
+    test_df["rag_skipped_reason"] = ""
+    test_df["rag_source"] = ""
+    test_df["evidence_source"] = "original_context"
+    test_df["evidence_relevance"] = "n/a"
+
+    for i, row in test_df.iterrows():
+        reason = rag_skip_reason(row["task_type"], row["context_original"])
+        if reason is not None:
+            test_df.at[i, "rag_skipped_reason"] = reason
+            if str(row["context_original"]).strip() in ("[NULL]", "", "None", "nan"):
+                test_df.at[i, "evidence_source"] = "none"
+                test_df.at[i, "evidence_relevance"] = "no_evidence"
+            else:
+                test_df.at[i, "evidence_source"] = "original_context"
+                test_df.at[i, "evidence_relevance"] = "provided"
+        elif not should_use_rag(row["task_type"], row["context_original"], row["prompt_bn"]):
+            test_df.at[i, "rag_skipped_reason"] = "other_null_not_factual"
+            test_df.at[i, "evidence_source"] = "none"
+            test_df.at[i, "evidence_relevance"] = "no_evidence"
+        else:
+            source_name, _ = _resolve_available_source(config, row["task_type"])
+            test_df.at[i, "rag_source"] = source_name or ""
+
+    rag_mask = test_df.apply(
+        lambda r: should_use_rag(r["task_type"], r["context_original"], r["prompt_bn"]),
+        axis=1,
+    )
+    num_rag = int(rag_mask.sum())
+    task_counts = test_df["task_type"].value_counts().to_dict()
+    count_table(
+        "Routed task types",
+        {str(k): int(v) for k, v in task_counts.items()},
+        key_header="task_type",
+    )
+    info(f"RAG candidates this run: {num_rag}/{len(test_df)}")
+
+    if num_rag == 0:
+        warn("No rows need retrieval — all evidence is original context or policy-skipped.")
+        return test_df
+
+    query_mode = config["rag"].get("query_mode", "prompt")
+    rag_rows = test_df.loc[rag_mask]
+    by_source = {}
+    for idx, row in rag_rows.iterrows():
+        source_name, index_path = _resolve_available_source(config, row["task_type"])
+        if not source_name or not index_path or not os.path.exists(index_path):
+            test_df.at[idx, "rag_skipped_reason"] = (
+                f"index_missing:{source_name or rag_source_for_task(row['task_type'])}"
+            )
+            test_df.at[idx, "evidence_source"] = "none"
+            test_df.at[idx, "evidence_relevance"] = "no_evidence"
+            test_df.at[idx, "rag_source"] = source_name or ""
+            continue
+        by_source.setdefault(source_name, []).append(idx)
+
+    if not by_source:
+        warn("No typed RAG indexes available for candidate rows (all index_missing).")
+        skip_counts = (
+            test_df.loc[rag_mask, "rag_skipped_reason"].value_counts().to_dict() if num_rag else {}
+        )
+        if skip_counts:
+            count_table("RAG skip reasons", {str(k): int(v) for k, v in skip_counts.items()})
+        return test_df
+
+    count_table(
+        "Retrieval by source",
+        {name: len(idxs) for name, idxs in by_source.items()},
+        key_header="rag_source",
+    )
+
+    for source_name, idxs in by_source.items():
+        paths = source_paths(config, source_name)
+        info(f"Loading index '{source_name}' ← {paths['index_path']}")
+        rag = BanglaRAG(
+            config=config,
+            source_name=source_name,
+            corpus_dir=paths["corpus_dir"],
+            index_path=paths["index_path"],
+        )
+        if not rag.load_index():
+            for idx in idxs:
+                test_df.at[idx, "rag_skipped_reason"] = f"index_missing:{source_name}"
+                test_df.at[idx, "evidence_source"] = "none"
+                test_df.at[idx, "evidence_relevance"] = "no_evidence"
+            continue
+
+        subset = test_df.loc[idxs]
+        queries = [build_rag_query(row, query_mode) for _, row in subset.iterrows()]
+        with pipeline_progress() as progress:
+            task = progress.add_task(f"Retrieving ({source_name})", total=len(queries))
+            hits_by_query = _retrieve_many_fast(rag, queries, progress, task)
+
+        filled = 0
+        for idx, hits in zip(idxs, hits_by_query, strict=True):
+            evidence, n_hits, max_score, mean_score = rag.format_evidence(hits)
+            test_df.at[idx, "context"] = evidence
+            test_df.at[idx, "n_retrieved"] = n_hits
+            test_df.at[idx, "retrieval_sim_max"] = max_score
+            test_df.at[idx, "retrieval_sim_mean"] = mean_score
+            test_df.at[idx, "rag_used"] = True
+            test_df.at[idx, "rag_skipped_reason"] = ""
+            test_df.at[idx, "rag_source"] = source_name
+            test_df.at[idx, "evidence_source"] = f"rag:{source_name}"
+            if str(evidence).strip() in ("[NULL]", "", "None", "nan"):
+                test_df.at[idx, "evidence_relevance"] = "retrieval_empty"
+            else:
+                test_df.at[idx, "evidence_relevance"] = "retrieved"
+                filled += 1
+        ok(f"{source_name}: retrieved for {len(idxs)} rows · non-empty evidence {filled}")
+
+    ok("Task-aware typed evidence selection complete")
+    return test_df
+
+
+def build_debug_df(test_df, p_llm, threshold, ctx):
+    """Build a compact debug frame for error analysis and threshold tuning."""
     p_llm = np.asarray(p_llm, dtype=float)
-    p_final, preds = decision.predict(p_llm)
-    debug_df = test_df.copy()
-    debug_df["p_llm"] = p_llm
-    debug_df["p_final"] = p_final
-    debug_df["label"] = preds
-    debug_df["threshold"] = decision.threshold
-    debug_df["threshold_metric"] = decision.threshold_metric
-    debug_df["threshold_margin"] = debug_df["p_final"] - float(decision.threshold)
-    debug_df["threshold_abs_margin"] = debug_df["threshold_margin"].abs()
-    debug_df["used_llm_verifier"] = use_llm_verifier(ctx["config"])
-    debug_df["encoder_disagree"] = (debug_df["p_xlmr"] - debug_df["p_llm"]).abs()
-    debug_df["llm_minus_xlmr"] = debug_df["p_llm"] - debug_df["p_xlmr"]
-    debug_df["xlmr_label_at_threshold"] = (debug_df["p_xlmr"] >= decision.threshold).astype(int)
-    debug_df["llm_label_at_threshold"] = (debug_df["p_llm"] >= decision.threshold).astype(int)
-    debug_df["xlmr_llm_label_disagree"] = (
-        debug_df["xlmr_label_at_threshold"] != debug_df["llm_label_at_threshold"]
-    )
-    debug_df["rag_filled"] = (debug_df["context_original"] == "[NULL]") & (
-        debug_df["context"] != "[NULL]"
-    )
-    debug_df["evidence_is_null"] = (
-        debug_df["context"].astype(str).str.strip().isin(("[NULL]", "", "None", "nan"))
-    )
-    debug_df["context_original_is_null"] = (
-        debug_df["context_original"].astype(str).str.strip().isin(("[NULL]", "", "None", "nan"))
-    )
-    debug_df["context_char_len"] = debug_df["context"].astype(str).str.len()
-    debug_df["context_word_len"] = debug_df["context"].astype(str).str.split().str.len()
-    debug_df["prompt_char_len"] = debug_df["prompt_bn"].astype(str).str.len()
-    debug_df["response_char_len"] = debug_df["response_bn"].astype(str).str.len()
-    debug_df["prompt_response_char_len"] = (
-        debug_df["prompt_char_len"] + debug_df["response_char_len"]
+    _, preds = apply_threshold(p_llm, threshold)
+
+    debug_df = pd.DataFrame(
+        {
+            "id": test_df["id"] if "id" in test_df.columns else range(len(test_df)),
+            "label": preds,
+            "p_llm": p_llm,
+            "threshold": float(threshold),
+            "threshold_margin": p_llm - float(threshold),
+            "task_type": test_df["task_type"] if "task_type" in test_df.columns else "",
+            "p_fast": np.nan,
+            "p_think": np.nan,
+            "triggered_think": False,
+            "think_max_tokens": np.nan,
+            "think_reasons": "",
+            "verdict_parsed": pd.Series(None, index=test_df.index, dtype="object"),
+            "confidence_parsed": pd.Series(None, index=test_df.index, dtype="object"),
+            "think_changed_label": False,
+            "thinking_cot": "",
+            "rag_used": test_df["rag_used"] if "rag_used" in test_df.columns else False,
+            "rag_source": test_df["rag_source"] if "rag_source" in test_df.columns else "",
+            "rag_skipped_reason": (
+                test_df["rag_skipped_reason"] if "rag_skipped_reason" in test_df.columns else ""
+            ),
+            "evidence_source": (
+                test_df["evidence_source"] if "evidence_source" in test_df.columns else ""
+            ),
+            "evidence_relevance": (
+                test_df["evidence_relevance"] if "evidence_relevance" in test_df.columns else ""
+            ),
+            "n_retrieved": test_df["n_retrieved"] if "n_retrieved" in test_df.columns else 0,
+            "retrieval_sim_max": (
+                test_df["retrieval_sim_max"] if "retrieval_sim_max" in test_df.columns else np.nan
+            ),
+            "retrieval_sim_mean": (
+                test_df["retrieval_sim_mean"] if "retrieval_sim_mean" in test_df.columns else np.nan
+            ),
+            "context_original": (
+                test_df["context_original"]
+                if "context_original" in test_df.columns
+                else test_df["context"]
+            ),
+            "context": test_df["context"],
+            "prompt_bn": test_df["prompt_bn"],
+            "response_bn": test_df["response_bn"],
+            "run_timestamp": ctx["run_ts"],
+            "hardware_profile": ctx["hardware_profile"],
+            "gemma_model_name": resolve_section(ctx["config"], "gemma").get("model_name"),
+            "gemma_load_in": resolve_quantization_mode(resolve_section(ctx["config"], "gemma")),
+        }
     )
 
-    xlmr_config = resolve_section(ctx["config"], "xlmr")
-    gemma_config = resolve_section(ctx["config"], "gemma")
-    rag_config = resolve_section(ctx["config"], "rag")
-    debug_df["run_timestamp"] = ctx["run_ts"]
-    debug_df["hardware_profile"] = ctx["hardware_profile"]
-    debug_df["num_folds"] = ctx["config"].get("num_folds")
-    debug_df["seed"] = ctx["config"].get("seed")
-    debug_df["use_checkpoints"] = ctx["use_checkpoints"]
-    debug_df["force_recompute"] = ctx["force_recompute"]
-    debug_df["xlmr_from_checkpoint"] = ctx["xlmr_from_checkpoint"]
-    debug_df["llm_from_checkpoint"] = ctx["llm_from_checkpoint"]
-    debug_df["llm_checkpoint_source"] = ctx["llm_checkpoint_source"]
-    debug_df["xlmr_checkpoint_path"] = ctx["xlmr_checkpoint_path"]
-    debug_df["llm_checkpoint_path"] = ctx["llm_checkpoint_path"]
-    debug_df["verifier_debug_log_path"] = ctx["verifier_debug_log_path"]
-    debug_df["threshold_path"] = ctx["threshold_path"]
-    debug_df["submission_path"] = ctx["submission_path"]
-    debug_df["debug_path"] = ctx["debug_path"]
-    debug_df["xlmr_model_name"] = xlmr_config.get("model_name")
-    debug_df["xlmr_max_length"] = xlmr_config.get("max_length")
-    debug_df["xlmr_batch_size"] = xlmr_config.get("batch_size")
-    debug_df["xlmr_use_amp"] = xlmr_config.get("use_amp")
-    debug_df["xlmr_num_workers"] = xlmr_config.get("num_workers")
-    debug_df["xlmr_pin_memory"] = xlmr_config.get("pin_memory")
-    debug_df["gemma_model_name"] = gemma_config.get("model_name")
-    debug_df["gemma_model_loader"] = gemma_config.get("model_loader")
-    debug_df["gemma_device_map"] = gemma_config.get("device_map")
-    debug_df["gemma_cuda_max_memory"] = gemma_config.get("cuda_max_memory")
-    debug_df["gemma_max_input_tokens"] = gemma_config.get("max_input_tokens")
-    debug_df["gemma_max_think_tokens"] = gemma_config.get("max_think_tokens")
-    debug_df["gemma_exemplar_top_k"] = gemma_config.get("exemplar_top_k")
-    debug_df["gemma_load_in"] = resolve_quantization_mode(gemma_config)
-    debug_df["gemma_int8_cpu_offload"] = gemma_config.get("llm_int8_enable_fp32_cpu_offload")
-    debug_df["gemma_use_inputs_embeds_for_forward"] = gemma_config.get(
-        "use_inputs_embeds_for_forward"
+    verifier_map = load_verifier_debug_map(
+        ctx["verifier_debug_log_path"],
+        expected_metadata=ctx.get("verifier_cache_metadata"),
     )
-    debug_df["gemma_use_language_model_direct"] = gemma_config.get("use_language_model_direct")
-    debug_df["gemma_classify_cultural_band"] = gemma_config.get("classify_cultural_band")
-    debug_df["gemma_enable_think_pass"] = gemma_config.get("enable_think_pass")
-    debug_df["gemma_think_reasoning_language"] = gemma_config.get("think_reasoning_language")
-    debug_df["rag_query_mode"] = rag_config.get("query_mode")
-    debug_df["rag_top_k"] = rag_config.get("top_k")
-    debug_df["rag_query_batch_size"] = rag_config.get("query_batch_size")
-    debug_df["rag_similarity_threshold"] = rag_config.get("similarity_threshold")
-    debug_df["rag_max_evidence_tokens"] = rag_config.get("max_evidence_tokens")
-
-    debug_df["p_llm_no_think"] = np.nan
-    debug_df["p_llm_from_log"] = np.nan
-    debug_df["p_llm_log_delta"] = np.nan
-    debug_df["triggered_think"] = False
-    # Object dtype, not float: this holds True/False/None, and pandas 3 refuses to
-    # assign a bool into a float64 column.
-    debug_df["verdict_parsed"] = pd.Series(None, index=debug_df.index, dtype="object")
-    debug_df["think_reasons"] = ""
-    debug_df["thinking_cot"] = ""
-    debug_df["is_c0"] = np.nan
-    debug_df["is_c1"] = np.nan
-    debug_df["is_c2"] = np.nan
-    debug_df["think_changed_probability"] = np.nan
-    debug_df["think_changed_label"] = False
-
-    verifier_map = load_verifier_debug_map(ctx["verifier_debug_log_path"])
     if verifier_map:
-        for i, row in debug_df.iterrows():
-            key = (str(row["prompt_bn"]), str(row["response_bn"]))
-            if key in verifier_map:
-                meta = verifier_map[key]
-                debug_df.at[i, "p_llm_no_think"] = meta.get("p_llm_no_think")
-                debug_df.at[i, "p_llm_from_log"] = meta.get("p_llm_final")
-                debug_df.at[i, "triggered_think"] = bool(meta.get("triggered_think"))
-                debug_df.at[i, "verdict_parsed"] = meta.get("verdict_parsed")
-                debug_df.at[i, "think_reasons"] = meta.get("think_reasons", "")
-                debug_df.at[i, "thinking_cot"] = meta.get("thinking_cot") or ""
-                debug_df.at[i, "is_c0"] = meta.get("is_c0")
-                debug_df.at[i, "is_c1"] = meta.get("is_c1")
-                debug_df.at[i, "is_c2"] = meta.get("is_c2")
-        has_no_think = debug_df["p_llm_no_think"].notna()
-        has_log_prob = debug_df["p_llm_from_log"].notna()
-        debug_df.loc[has_log_prob, "p_llm_log_delta"] = (
-            debug_df.loc[has_log_prob, "p_llm"] - debug_df.loc[has_log_prob, "p_llm_from_log"]
-        )
-        debug_df.loc[has_no_think, "think_changed_probability"] = (
-            debug_df.loc[has_no_think, "p_llm"] - debug_df.loc[has_no_think, "p_llm_no_think"]
-        )
-        debug_df.loc[has_no_think, "think_changed_label"] = (
-            debug_df.loc[has_no_think, "p_llm"] >= decision.threshold
-        ) != (debug_df.loc[has_no_think, "p_llm_no_think"] >= decision.threshold)
+        for row_pos, (i, row) in enumerate(debug_df.iterrows()):
+            key = verifier_case_key(
+                evidence=row["context"],
+                prompt=row["prompt_bn"],
+                response=row["response_bn"],
+                task_type=row["task_type"],
+                context_original=row["context_original"],
+                metadata=ctx.get("verifier_cache_metadata"),
+            )
+            if key not in verifier_map:
+                continue
+            meta = verifier_map[key]
+            p_fast = meta.get("p_fast", meta.get("p_llm_no_think"))
+            debug_df.at[i, "p_fast"] = p_fast
+            debug_df.at[i, "p_think"] = meta.get("p_think")
+            debug_df.at[i, "triggered_think"] = bool(meta.get("triggered_think"))
+            debug_df.at[i, "think_max_tokens"] = meta.get("think_max_tokens")
+            debug_df.at[i, "think_reasons"] = meta.get("think_reasons", "")
+            debug_df.at[i, "verdict_parsed"] = meta.get("verdict_parsed")
+            debug_df.at[i, "confidence_parsed"] = meta.get("confidence_parsed")
+            debug_df.at[i, "thinking_cot"] = meta.get("thinking_cot") or ""
+            if p_fast is not None and np.isfinite(float(p_fast)):
+                debug_df.at[i, "think_changed_label"] = (float(p_llm[row_pos]) >= threshold) != (
+                    float(p_fast) >= threshold
+                )
 
-    preferred_cols = [
-        "id",
-        "label",
-        "p_final",
-        "threshold",
-        "threshold_margin",
-        "threshold_abs_margin",
-        "threshold_metric",
-        "p_llm",
-        "p_llm_no_think",
-        "p_llm_from_log",
-        "p_llm_log_delta",
-        "p_xlmr",
-        "llm_minus_xlmr",
-        "encoder_disagree",
-        "xlmr_label_at_threshold",
-        "llm_label_at_threshold",
-        "xlmr_llm_label_disagree",
-        "triggered_think",
-        "verdict_parsed",
-        "think_reasons",
-        "think_changed_probability",
-        "think_changed_label",
-        "is_c0",
-        "is_c1",
-        "is_c2",
-        "has_context",
-        "evidence_is_null",
-        "context_original_is_null",
-        "rag_filled",
-        "n_retrieved",
-        "retrieval_sim_max",
-        "retrieval_sim_mean",
-        "context_char_len",
-        "context_word_len",
-        "prompt_char_len",
-        "response_char_len",
-        "prompt_response_char_len",
-        "context_original",
-        "context",
-        "prompt_bn",
-        "response_bn",
-        "thinking_cot",
-        "run_timestamp",
-        "hardware_profile",
-        "used_llm_verifier",
-        "llm_checkpoint_source",
-        "xlmr_from_checkpoint",
-        "llm_from_checkpoint",
-        "use_checkpoints",
-        "force_recompute",
-        "num_folds",
-        "seed",
-        "xlmr_model_name",
-        "xlmr_max_length",
-        "xlmr_batch_size",
-        "xlmr_use_amp",
-        "xlmr_num_workers",
-        "xlmr_pin_memory",
-        "gemma_model_name",
-        "gemma_model_loader",
-        "gemma_device_map",
-        "gemma_cuda_max_memory",
-        "gemma_max_input_tokens",
-        "gemma_max_think_tokens",
-        "gemma_exemplar_top_k",
-        "gemma_load_in",
-        "gemma_int8_cpu_offload",
-        "gemma_use_inputs_embeds_for_forward",
-        "gemma_use_language_model_direct",
-        "gemma_classify_cultural_band",
-        "gemma_enable_think_pass",
-        "gemma_think_reasoning_language",
-        "rag_query_mode",
-        "rag_top_k",
-        "rag_query_batch_size",
-        "rag_similarity_threshold",
-        "rag_max_evidence_tokens",
-        "xlmr_checkpoint_path",
-        "llm_checkpoint_path",
-        "verifier_debug_log_path",
-        "threshold_path",
-        "submission_path",
-        "debug_path",
-    ]
-    ordered = [c for c in preferred_cols if c in debug_df.columns]
-    ordered += [c for c in debug_df.columns if c not in ordered]
-    debug_df = debug_df[ordered]
     return debug_df
 
 
 def main():
-    console.print(
-        Panel(
-            "[bold yellow]Test Set Inference & Prediction Pipeline[/bold yellow]",
-            border_style="bold yellow",
-        )
-    )
-
     with open("configs/config.toml", "rb") as f:
         config = tomllib.load(f)
     validate_config(config)
@@ -441,126 +530,52 @@ def main():
     force_recompute = bool(predict_config.get("force_recompute", False))
     runtime_config = resolve_runtime(config)
     hardware_profile = runtime_config.get("hardware_profile", "default")
+    decision_config = config.get("decision", {})
+    threshold = float(decision_config.get("threshold", 0.5))
+    router_enabled = bool(config.get("router", {}).get("enabled", True))
+    gemma_config = resolve_section(config, "gemma")
 
-    # 1. Load preprocessed test dataset
+    banner(
+        "Routed Gemma / Qwen Inference",
+        "router → typed RAG → verifier → submission.csv",
+    )
+    kv_table(
+        "Run config",
+        {
+            "hardware_profile": hardware_profile,
+            "verifier": gemma_config.get("model_name"),
+            "load_in": resolve_quantization_mode(gemma_config),
+            "think_pass": gemma_config.get("enable_think_pass"),
+            "threshold": threshold,
+            "router": router_enabled,
+            "checkpoints": use_checkpoints,
+            "force_recompute": force_recompute,
+        },
+    )
+
     test_processed_path = os.path.join(config["data"]["processed_dir"], "test.csv")
     test_evidence_path = os.path.join(config["data"]["processed_dir"], "test_with_evidence.csv")
 
-    if os.path.exists(test_evidence_path):
-        console.print(
-            f"[bold green]Found existing {test_evidence_path}. Loading cached contexts...[/bold green]"
+    if not os.path.exists(test_processed_path):
+        warn(
+            f"Processed test file not found at {test_processed_path}. Run `just preprocess` first."
         )
-        test_df = pd.read_csv(test_evidence_path)
-        if "context_original" not in test_df.columns:
-            test_df["context_original"] = test_df["context"]
-        for col, default in (
-            ("n_retrieved", 0),
-            ("retrieval_sim_max", np.nan),
-            ("retrieval_sim_mean", np.nan),
-        ):
-            if col not in test_df.columns:
-                test_df[col] = default
-    else:
-        if not os.path.exists(test_processed_path):
-            console.print(
-                f"[bold red]Error: Processed test file not found at {test_processed_path}. Run preprocessing first.[/bold red]"
-            )
-            return
+        return
 
-        test_df = pd.read_csv(test_processed_path)
+    test_df = pd.read_csv(test_processed_path)
+    if "context_original" not in test_df.columns:
         test_df["context_original"] = test_df["context"]
-        test_df["n_retrieved"] = 0
-        test_df["retrieval_sim_max"] = np.nan
-        test_df["retrieval_sim_mean"] = np.nan
+    info(f"Loaded test set: {len(test_df)} rows from {test_processed_path}")
 
-        # 2. Retrieve evidence for test rows if context is NULL
-        console.print("\n[bold cyan]Step 1: Retrieve context facts for NULL test rows[/bold cyan]")
-        null_mask = test_df["context"] == "[NULL]"
-        num_nulls = null_mask.sum()
+    step(1, 3, "Route tasks + select evidence")
+    if not router_enabled:
+        warn("Router disabled in config — using original context only, no typed RAG.")
+        test_df = apply_router_disabled_policy(test_df)
+    else:
+        test_df = apply_task_evidence_policy(test_df, config)
+    test_df.to_csv(test_evidence_path, index=False)
+    ok(f"Cached evidence frame → {test_evidence_path}")
 
-        if num_nulls > 0:
-            index_path = config["rag"]["index_path"]
-            query_mode = config["rag"].get("query_mode", "prompt")
-            if os.path.exists(index_path):
-                console.print(
-                    f"Dense RAG index found. Retrieving evidence for [bold yellow]{num_nulls}[/bold yellow] test rows..."
-                )
-                rag = BanglaRAG()
-                rag.load_index()
-
-                null_rows = test_df[null_mask]
-                queries = [build_rag_query(row, query_mode) for _, row in null_rows.iterrows()]
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    TaskProgressColumn(),
-                    transient=True,
-                ) as progress:
-                    task = progress.add_task(description="Retrieving facts...", total=num_nulls)
-                    hits_by_query = _retrieve_many_fast(rag, queries, progress, task)
-
-                retrieved_contexts = []
-                n_retrieved = []
-                sim_max = []
-                sim_mean = []
-                for hits in hits_by_query:
-                    evidence, n_hits, max_score, mean_score = rag.format_evidence(hits)
-                    retrieved_contexts.append(evidence)
-                    n_retrieved.append(n_hits)
-                    sim_max.append(max_score)
-                    sim_mean.append(mean_score)
-
-                test_df.loc[null_mask, "context"] = retrieved_contexts
-                test_df.loc[null_mask, "n_retrieved"] = n_retrieved
-                test_df.loc[null_mask, "retrieval_sim_max"] = sim_max
-                test_df.loc[null_mask, "retrieval_sim_mean"] = sim_mean
-                console.print("[green]✔ Evidence retrieval complete.[/green]")
-            else:
-                console.print(
-                    f"[bold red]WARNING: Dense RAG index not found at {index_path}.[/bold red]"
-                )
-                console.print("NULL-context test rows will remain ungrounded.")
-
-        test_df.to_csv(test_evidence_path, index=False)
-
-    # 3. Predict with XLM-RoBERTa Cross-Encoder
-    console.print("\n[bold cyan]Step 2: XLM-RoBERTa Ensemble Inference[/bold cyan]")
-    ids = test_df["id"] if "id" in test_df.columns else None
-    xlmr_checkpoint_path = _prediction_checkpoint_path(
-        config, "xlmr_predictions_path", "test_xlmr_preds.csv"
-    )
-    p_xlmr = None
-    xlmr_from_checkpoint = False
-    xlmr_metadata = {"checkpoint_source": "xlmr", "hardware_profile": hardware_profile}
-    if use_checkpoints and not force_recompute:
-        p_xlmr = _load_prediction_checkpoint(
-            xlmr_checkpoint_path,
-            len(test_df),
-            "p_xlmr",
-            expected_ids=ids,
-            expected_metadata=xlmr_metadata,
-        )
-        xlmr_from_checkpoint = p_xlmr is not None
-    if p_xlmr is None:
-        p_xlmr = predict_test(test_df, config)
-        if use_checkpoints:
-            _save_prediction_checkpoint(
-                xlmr_checkpoint_path,
-                ids,
-                "p_xlmr",
-                p_xlmr,
-                metadata=xlmr_metadata,
-            )
-
-    # Clean up GPU memory after Cross-Encoder prediction
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-    # 4. Set up the run folder and threshold before Gemma, so the verifier can
-    # flush partial submissions as it goes instead of only at the end.
     base_submission_path = config["data"]["submission_output_path"]
     submissions_dir = os.path.dirname(base_submission_path)
     basename = os.path.basename(base_submission_path)
@@ -569,127 +584,90 @@ def main():
     run_dir = os.path.join(submissions_dir, run_ts)
     os.makedirs(run_dir, exist_ok=True)
     submission_path = os.path.join(run_dir, basename)
-    partial_path = os.path.join(run_dir, "submission_partial.csv")
-
-    decision = ThresholdDecision()
-    threshold_path = "models/blender_config.pkl"
-    if os.path.exists(threshold_path):
-        decision.load(threshold_path)
-    else:
-        console.print(
-            f"[bold red]Warning: Threshold config not found at {threshold_path}. "
-            f"Using default threshold=0.5.[/bold red]"
-        )
+    partial_debug_path = os.path.join(run_dir, "submission_partial_debug.csv")
+    info(f"Run folder: {run_dir}")
 
     partial_flush_every = int(predict_config.get("partial_flush_every", 0))
-
-    test_df["p_xlmr"] = p_xlmr
+    write_debug = bool(config.get("debug", {}).get("write_debug", True))
+    ids = test_df["id"] if "id" in test_df.columns else None
     verifier = GemmaVerifier()
+    verifier_cache_metadata = verifier.cache_metadata()
 
-    # Shared by the partial flush and the final debug CSV so both have one schema.
-    # Mutated as the run learns its own provenance (llm_checkpoint_source, etc.).
     ctx = {
         "config": config,
         "run_ts": run_ts,
         "hardware_profile": hardware_profile,
         "use_checkpoints": use_checkpoints,
         "force_recompute": force_recompute,
-        "xlmr_from_checkpoint": xlmr_from_checkpoint,
         "llm_from_checkpoint": False,
         "llm_checkpoint_source": "gemma",
-        "xlmr_checkpoint_path": xlmr_checkpoint_path,
         "llm_checkpoint_path": _prediction_checkpoint_path(
             config, "llm_predictions_path", "test_llm_preds.csv"
         ),
         "verifier_debug_log_path": verifier.debug_log_path,
-        "threshold_path": threshold_path,
+        "verifier_cache_metadata": verifier_cache_metadata,
         "submission_path": submission_path,
         "debug_path": submission_path.replace(".csv", "_debug.csv"),
     }
 
     def _write_partial(n_done, preds_so_far):
-        partial_df = build_debug_df(
-            test_df.iloc[:n_done].copy(), preds_so_far, decision, ctx
-        )
-        partial_df.to_csv(partial_path, index=False)
+        if not write_debug:
+            return
+        partial_df = build_debug_df(test_df.iloc[:n_done].copy(), preds_so_far, threshold, ctx)
+        partial_df.to_csv(partial_debug_path, index=False)
 
-    # 5. Predict with Gemma 4 Verifier (encoder prior from XLM-R)
-    console.print("\n[bold cyan]Step 3: Gemma 4 Verifier Inference[/bold cyan]")
-    if use_llm_verifier(config):
-        llm_checkpoint_path = ctx["llm_checkpoint_path"]
-        p_llm = None
-        llm_from_checkpoint = False
-        llm_checkpoint_source = "gemma"
-        checkpoint_gemma_config = resolve_section(config, "gemma")
-        llm_metadata = {
-            "checkpoint_source": "gemma",
-            "hardware_profile": hardware_profile,
-            "gemma_model_name": checkpoint_gemma_config.get("model_name"),
-            "gemma_model_loader": checkpoint_gemma_config.get("model_loader"),
-            "gemma_load_in": resolve_quantization_mode(checkpoint_gemma_config),
-        }
-        if use_checkpoints and not force_recompute:
-            p_llm = _load_prediction_checkpoint(
-                llm_checkpoint_path,
-                len(test_df),
-                "p_llm",
-                expected_ids=ids,
-                expected_metadata=llm_metadata,
-            )
-            llm_from_checkpoint = p_llm is not None
-        if p_llm is not None:
-            console.print(
-                "[bold green]Skipping Gemma; verifier checkpoint is complete.[/bold green]"
-            )
-        else:
-            try:
-                verifier.load_model()
-                if verifier.exemplar_top_k > 0 and not verifier.exemplar_retriever.load_index():
-                    train_evidence_path = os.path.join(
-                        config["data"]["processed_dir"], "train_with_evidence.csv"
-                    )
-                    if os.path.exists(train_evidence_path):
-                        train_df = pd.read_csv(train_evidence_path)
-                        if "label" in train_df.columns:
-                            console.print(
-                                "[yellow]Exemplar index missing; rebuilding from labeled train data.[/yellow]"
-                            )
-                            verifier.exemplar_retriever.build_index(train_df)
-                p_llm = verifier.predict_dataset(
-                    test_df,
-                    p_xlmr=p_xlmr,
-                    use_cache=True,
-                    on_partial=_write_partial,
-                    partial_every=partial_flush_every,
-                )
-                if use_checkpoints:
-                    _save_prediction_checkpoint(
-                        llm_checkpoint_path,
-                        ids,
-                        "p_llm",
-                        p_llm,
-                        metadata=llm_metadata,
-                    )
-            except Exception as e:
-                if fail_on_model_error(config):
-                    raise RuntimeError(
-                        "Gemma verifier failed; refusing to submit fake scores."
-                    ) from e
-                console.print(f"[bold red]Failed to run Gemma verifier on test set: {e}[/bold red]")
-                console.print(
-                    "[yellow]Falling back to XLM-R-only scores because fail_on_model_error=false.[/yellow]"
-                )
-                p_llm = p_xlmr.copy()
-                llm_checkpoint_source = "xlmr_fallback_error"
-    else:
-        console.print(
-            "[yellow]LLM verifier disabled. Using XLM-R scores as Gemma fallback.[/yellow]"
+    step(2, 3, "Verifier inference")
+    llm_checkpoint_path = ctx["llm_checkpoint_path"]
+    p_llm = None
+    llm_from_checkpoint = False
+    llm_checkpoint_source = "gemma"
+    checkpoint_gemma_config = resolve_section(config, "gemma")
+    llm_metadata = {
+        "checkpoint_source": "gemma",
+        "hardware_profile": hardware_profile,
+        "gemma_model_name": checkpoint_gemma_config.get("model_name"),
+        "gemma_model_loader": checkpoint_gemma_config.get("model_loader"),
+        "gemma_load_in": resolve_quantization_mode(checkpoint_gemma_config),
+        "verifier_case_fingerprint": dataframe_cache_fingerprint(test_df),
+        "pipeline": "routed_gemma",
+    }
+    llm_metadata.update({f"verifier_{k}": v for k, v in verifier_cache_metadata.items()})
+    if use_checkpoints and not force_recompute:
+        p_llm = _load_prediction_checkpoint(
+            llm_checkpoint_path,
+            len(test_df),
+            "p_llm",
+            expected_ids=ids,
+            expected_metadata=llm_metadata,
         )
-        p_llm = p_xlmr.copy()
-        llm_from_checkpoint = False
-        llm_checkpoint_source = "xlmr_fallback_disabled"
-        llm_checkpoint_path = _prediction_checkpoint_path(
-            config, "llm_predictions_path", "test_llm_preds.csv"
+        llm_from_checkpoint = p_llm is not None
+    if p_llm is not None:
+        ok("Using complete verifier checkpoint — skipping model load")
+    else:
+        info(f"Loading verifier: {checkpoint_gemma_config.get('model_name')}")
+        verifier.load_model()
+        if verifier.exemplar_top_k > 0 and not verifier.exemplar_retriever.load_index():
+            train_evidence_path = os.path.join(
+                config["data"]["processed_dir"], "train_with_evidence.csv"
+            )
+            train_path = os.path.join(config["data"]["processed_dir"], "train.csv")
+            exemplar_source = None
+            if os.path.exists(train_evidence_path):
+                exemplar_source = train_evidence_path
+            elif os.path.exists(train_path):
+                exemplar_source = train_path
+            if exemplar_source is not None:
+                train_df = pd.read_csv(exemplar_source)
+                if "label" in train_df.columns:
+                    warn(f"Exemplar index missing — rebuilding from {exemplar_source}")
+                    verifier.exemplar_retriever.build_index(train_df)
+        if partial_flush_every:
+            info(f"Partial debug flush every {partial_flush_every} rows")
+        p_llm = verifier.predict_dataset(
+            test_df,
+            use_cache=use_checkpoints and not force_recompute,
+            on_partial=_write_partial,
+            partial_every=partial_flush_every,
         )
         if use_checkpoints:
             _save_prediction_checkpoint(
@@ -697,10 +675,7 @@ def main():
                 ids,
                 "p_llm",
                 p_llm,
-                metadata={
-                    "checkpoint_source": "xlmr_fallback",
-                    "hardware_profile": hardware_profile,
-                },
+                metadata=llm_metadata,
             )
 
     test_df["p_llm"] = p_llm
@@ -708,44 +683,61 @@ def main():
         os.path.join(config["data"]["processed_dir"], "test_with_preds.csv"), index=False
     )
 
-    # 6. Apply tuned threshold to Gemma verdicts (threshold loaded before Gemma)
-    console.print("\n[bold cyan]Step 4: Final Threshold Decision[/bold cyan]")
-    p_final, preds = decision.predict(p_llm)
+    step(3, 3, "Threshold + write submission")
+    info(f"Applying threshold={threshold}")
+    p_final, preds = apply_threshold(p_llm, threshold)
 
-    # 7. Create submission file in the run folder created before Gemma
     submission_df = pd.DataFrame(
         {
             "id": test_df["id"] if "id" in test_df.columns else range(len(preds)),
             "label": preds,
         }
     )
-
+    validate_submission_df(submission_df)
     submission_df.to_csv(submission_path, index=False)
+    ok(f"Wrote submission → {submission_path}")
 
-    # The complete submission supersedes the partial one.
-    if os.path.exists(partial_path):
-        os.remove(partial_path)
+    if os.path.exists(partial_debug_path):
+        os.remove(partial_debug_path)
 
-    debug_path = ctx["debug_path"]
     ctx["llm_from_checkpoint"] = llm_from_checkpoint
     ctx["llm_checkpoint_source"] = llm_checkpoint_source
-    debug_df = build_debug_df(test_df, p_llm, decision, ctx)
-    debug_df.to_csv(debug_path, index=False)
-    console.print(f"Saved detailed debug submission to: [bold white]{debug_path}[/bold white]")
+    if write_debug:
+        debug_df = build_debug_df(test_df, p_llm, threshold, ctx)
+        debug_df.to_csv(ctx["debug_path"], index=False)
+        ok(f"Wrote debug → {ctx['debug_path']}")
 
-    # Create/update 'latest' symlink for convenience  (submissions/latest -> 20250716_123456/)
     latest_link = os.path.join(submissions_dir, "latest")
     if os.path.islink(latest_link) or os.path.exists(latest_link):
         os.remove(latest_link)
     os.symlink(os.path.abspath(run_dir), latest_link)
 
-    console.print(
-        Panel(
-            f"[bold green]✔ Prediction Pipeline Complete![/bold green]\n"
-            f"Saved final submission to: [bold white]{submission_path}[/bold white]\n"
-            f"Label distribution: [bold cyan]0 (Hallucinated): {sum(preds == 0)}[/bold cyan] | [bold green]1 (Faithful): {sum(preds == 1)}[/bold green]",
-            border_style="green",
-        )
+    n0 = int(sum(preds == 0))
+    n1 = int(sum(preds == 1))
+    rag_used_n = int(test_df["rag_used"].sum()) if "rag_used" in test_df.columns else 0
+    think_n = 0
+    if write_debug and os.path.exists(ctx["debug_path"]):
+        try:
+            think_n = int(pd.read_csv(ctx["debug_path"])["triggered_think"].fillna(False).sum())
+        except Exception:
+            think_n = 0
+
+    count_table(
+        "Label distribution",
+        {"0 Hallucinated": n0, "1 Faithful": n1},
+        key_header="label",
+    )
+
+    done_panel(
+        "Prediction complete",
+        [
+            f"Rows: [bold]{len(preds)}[/bold]",
+            f"Labels: [cyan]0={n0}[/cyan] · [green]1={n1}[/green]",
+            f"RAG filled: [bold]{rag_used_n}[/bold]",
+            f"Think triggered: [bold]{think_n}[/bold]",
+            f"Submission: [bold white]{submission_path}[/bold white]",
+            f"Latest link: [bold white]{latest_link}[/bold white]",
+        ],
     )
 
 

@@ -15,11 +15,14 @@ models/
 *.pth
 *.safetensors
 
-# Data and index files
-dataset/
-corpus/
+# Generated data and index files
+generated/
+corpus/**
+!corpus/README.md
+!corpus/**/.gitkeep
 indexes/
 submissions/
+logs/
 
 # IDEs & OS files
 .idea/

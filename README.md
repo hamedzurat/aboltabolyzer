@@ -10,38 +10,47 @@ Bangla hallucination detection for competition submission.
 | **label 0**   | Hallucinated, unsupported, or wrong |
 | **label 1**   | Faithful, supported, correct        |
 
-**Architecture:** XLM-R (LoRA) produces an encoder prior → the LLM verifier gives the final verdict → one OOF-tuned threshold on `p_llm` decides the label. No RandomForest blender.
+**Architecture:** deterministic task router → typed evidence policy (per-corpus RAG) → Gemma/Qwen verifier (fast + optional think) → fixed threshold on `p_llm` (`decision.threshold`, default `0.5`).
 
-**Config:** choose the machine profile in [`configs/config.toml`](configs/config.toml),
-then run the matching `just` workflow.
+No training. Inference only.
 
-## Quick Start
+**Config:** set `hardware_profile` once in [`configs/config.toml`](configs/config.toml). Every `just` recipe (setup, predict, downloads) follows that profile.
 
-1. Put the competition files in `dataset/`:
+---
+
+## Quick start
+
+Requires [uv](https://github.com/astral-sh/uv), [just](https://github.com/casey/just), and a CUDA GPU.
+
+1. Put competition files in `dataset/`:
 
 ```text
-dataset/sample_dataset.json
-dataset/.3_testset.csv
-dataset/sample_submission.csv
+dataset/sample_dataset.json    # labeled train (few-shot exemplars on 16GB)
+dataset/testset.csv            # full test → submission
+dataset/sample_submission.csv  # id,label format example
 ```
 
 2. Pick a profile in `configs/config.toml`:
 
 ```toml
 [runtime]
-hardware_profile = "16gb"  # RTX 5060 Ti 16GB: full Gemma 4 verifier (default)
-# hardware_profile = "8gb" # RTX 5060 mobile 8GB: ungated Qwen verifier
+hardware_profile = "16gb"  # RTX 5060 Ti 16GB → Gemma 4
+# hardware_profile = "8gb" # RTX 5060 mobile 8GB → ungated Qwen
 ```
-
-3. Run one command:
 
 ```bash
-just first-run-8gb   # 8GB, Qwen 1.5B verifier
-# or
-just first-run-16gb  # 16GB, faster full pipeline
+just show-profile   # confirm resolved verifier / VRAM / RAG batch sizes
 ```
 
-4. Upload:
+3. Run on a machine with a real GPU:
+
+```bash
+just first-run   # sync → models for this profile + wiki + indexes → preprocess → predict
+```
+
+For a 200-row dry run, point `[data].test_path` at `dataset/testset_audit_200.csv` (same columns as the full test file), then `just run`.
+
+4. Upload only:
 
 ```text
 submissions/latest/submission.csv
@@ -53,8 +62,7 @@ Inspect:
 submissions/latest/submission_debug.csv
 ```
 
-The 8GB profile uses ungated `Qwen/Qwen2.5-1.5B-Instruct`. The 16GB profile
-uses Gemma 4, which may require Hugging Face access.
+The 8GB profile uses ungated `Qwen/Qwen3-1.7B`. The 16GB profile uses Gemma 4, which may require Hugging Face access.
 
 ---
 
@@ -62,66 +70,87 @@ uses Gemma 4, which may require Hugging Face access.
 
 ```mermaid
 flowchart TD
-    A["Raw data<br/>context, prompt_bn, response_bn, optional label"] --> B["Preprocess<br/>NFC normalize · strip zero-width chars<br/>whitespace cleanup · empty → [NULL]"]
-    B --> C["has_context = context != [NULL]"]
+    A["Raw test CSV<br/>id · context · prompt_bn · response_bn"] --> B["preprocess.py<br/>NFC · strip ZW chars · empty → [NULL]<br/>has_context = context ≠ [NULL]"]
 
-    C --> D{"Provided context?"}
-    D -->|"Yes"| E["Keep original context"]
-    D -->|"No"| F{"RAG index exists?"}
+    TRAIN["sample_dataset.json<br/>→ processed/train.csv"] -.->|16GB: build exemplar index<br/>exemplar_top_k &gt; 0| EX["indexes/exemplar_index.pkl<br/>few-shot F/H neighbors"]
 
-    F -->|"No"| G["context stays [NULL]"]
-    F -->|"Yes"| H["Query = prompt_bn only<br/>(see query_mode in config)"]
+    B --> C["router.py<br/>deterministic task_type"]
 
-    H --> I["Embed query · BGE-M3"]
-    I --> J["Dense cosine search · top_k passages"]
-    J --> K{"score >= similarity_threshold?"}
-    K -->|"Yes"| L["Join passages · truncate max_evidence_tokens<br/>log n_retrieved · sim_max · sim_mean"]
-    K -->|"No"| G
+    C --> D{"Evidence policy<br/>evidence_policy.py"}
 
-    E --> M["Cross-encoder input"]
-    G --> M
+    D -->|"original context present<br/>context_grounded_* / famous_bn_fact_context"| E["Keep original context<br/>rag_used = false<br/>evidence_source = original_context"]
+
+    D -->|"math_* / calendar / translation<br/>RAG_SKIP_TASKS"| F["No RAG<br/>LLM judges via task prompt<br/>context stays [NULL]<br/>evidence_source = none"]
+
+    D -->|"other_null + not factual prompt"| F2["No RAG<br/>rag_skipped_reason = other_null_not_factual"]
+
+    D -->|"NULL + RAG allowed<br/>general_fact_null · factual other_null<br/>famous_bn · idiom · literal · grammar"| G{"Resolve typed source<br/>TASK_RAG_SOURCE<br/>+ famous_bn → wiki fallback<br/>only if indexes/*.pkl exists"}
+
+    G -->|"general_fact_null / factual other_null"| H1["source = wiki"]
+    G -->|"famous_bn_fact_null"| H2["source = famous_bn<br/>else wiki"]
+    G -->|"idiom_meaning_null"| H3["source = idioms"]
+    G -->|"literal_meaning_null"| H4["source = literal"]
+    G -->|"bangla_grammar"| H5["source = grammar"]
+    G -->|"preferred + fallback missing"| K["Skip retrieval<br/>rag_skipped_reason = index_missing:source<br/>context stays [NULL]"]
+
+    H1 --> I["BGE-M3 dense retrieve<br/>query = prompt_bn default<br/>top_k · similarity_threshold<br/>truncate max_evidence_tokens"]
+    H2 --> I
+    H3 --> I
+    H4 --> I
+    H5 --> I
+
+    I --> L["Overwrite context with evidence<br/>n_retrieved · sim_max · sim_mean<br/>rag_used = true<br/>evidence_source = rag:source"]
+
+    E --> M["Task-specific verifier prompt<br/>English scaffolding · TASK_INSTRUCTIONS"]
+    F --> M
+    F2 --> M
+    K --> M
     L --> M
+    EX -.-> M
 
-    M --> N["text = context/evidence<br/>text_pair = prompt_bn + response_bn"]
-    N --> O["XLM-R + LoRA · configured CV folds<br/>8gb: roberta-base · 16gb: roberta-large"]
+    M --> N["Fast pass<br/>next-token logits F / H<br/>p_fast = P Faithful"]
 
-    O --> P["p_xlmr = P(faithful)"]
-    P --> Q["OOF → dataset/processed/oof_xlmr.csv"]
+    N --> O{"Think? OR of triggers<br/>and enable_think_pass<br/>near threshold 0.35–0.65<br/>famous_bn_fact_null<br/>multi-entity context_grounded_fact<br/>math_* / calendar<br/>idiom/literal + irrelevant evidence"}
 
-    M --> R{"use_llm_verifier?"}
-    R -->|"No"| S["p_llm = p_xlmr"]
-    R -->|"Yes"| T["Fold-isolated exemplar index<br/>few-shot from train fold only"]
+    O -->|"No triggers or think disabled<br/>8GB: enable_think_pass = false"| P["p_llm = p_fast"]
+    O -->|"Yes"| Q["Think pass CoT English<br/>reason · verdict · confidence"]
 
-    T --> U["Retrieve similar train exemplars<br/>8gb default: 0 · 16gb default: 3"]
-    U --> V["Cultural band C0/C1/C2<br/>routes think-pass only"]
+    Q --> R{"Parse verdict?"}
+    R -->|"Faithful/Hallucinated<br/>+ strong/likely/uncertain"| S["Map to soft score<br/>0.90 / 0.75 / 0.50 / 0.25 / 0.10"]
+    R -->|"unparsed"| T["Keep p_fast<br/>think_reasons += verdict_unparsed"]
 
-    Q --> X["Gemma prompt<br/>encoder prior + evidence + Q/A + exemplars"]
-    U --> X
-    V --> X
-    X --> Y["Fast pass · F/H next-token logits<br/>p_fast = P(Faithful)"]
+    P --> U["decision.threshold default 0.5<br/>label = 1 if p_llm ≥ threshold else 0"]
+    S --> U
+    T --> U
 
-    Y --> AA{"Think trigger?<br/>uncertain · encoder disagree<br/>C0+NULL · C2"}
-    AA -->|"No"| AB["p_llm = p_fast"]
-    AA -->|"Yes"| AC["CoT think pass<br/>verdict: Faithful / Hallucinated"]
-    AC --> AD["Parse verdict → p_llm ∈ {0.0, 1.0}"]
+    U --> V["submissions/timestamp/submission.csv<br/>id, label only"]
+    U --> W["submission_debug.csv<br/>task_type · rag_source · p_fast · p_think · p_llm<br/>think meta · evidence fields"]
+    V --> X["submissions/latest → timestamp/"]
 
-    AB --> AE["OOF p_llm · train only"]
-    AD --> AE
-    S --> AE
-
-    AE --> AI["Grid-search threshold on OOF p_llm<br/>macro_f1 or f1_class_0"]
-    AI --> AJ["label = 1 if p_llm >= threshold else 0"]
-
-    AJ --> AK["submissions/<timestamp>/submission.csv"]
-    AJ --> AL["submissions/<timestamp>/submission_debug.csv<br/>RAG scores · p_xlmr · p_llm · think meta · label"]
-    AK --> AM["submissions/latest → <timestamp>/ (symlink)"]
+    CHK["Optional resume<br/>test_with_evidence.csv<br/>test_llm_preds.csv<br/>debug_llm_verifier.jsonl"] -.->|use_checkpoints| U
 ```
+
+### Task → corpus source
+
+| `task_type`                | Evidence                    | Corpus source                 |
+| -------------------------- | --------------------------- | ----------------------------- |
+| `context_grounded_*`       | Original context only       | —                             |
+| `famous_bn_fact_context`   | Original context only       | —                             |
+| `general_fact_null`        | Typed RAG                   | `wiki`                        |
+| `other_null` (factual)     | Typed RAG                   | `wiki`                        |
+| `other_null` (not factual) | No RAG                      | —                             |
+| `famous_bn_fact_null`      | Typed RAG                   | `famous_bn` → fallback `wiki` |
+| `idiom_meaning_null`       | Typed RAG when index exists | `idioms`                      |
+| `literal_meaning_null`     | Typed RAG when index exists | `literal`                     |
+| `bangla_grammar`           | Typed RAG when index exists | `grammar`                     |
+| `math_*` / `calendar_*`    | No RAG — LLM calculates     | —                             |
+| `translation_or_bilingual` | No RAG — bilingual judge    | —                             |
+
+Empty corpus folders are fine: `just make-rag` skips them, and predict records `index_missing:<source>`. Wiki is filled by `just download-corpus`; idiom / literal / famous_bn / grammar need curated `*.jsonl`.
 
 ---
 
 ## Installation
-
-Requires [uv](https://github.com/astral-sh/uv) and [just](https://github.com/casey/just).
 
 ```bash
 just sync      # install dependencies
@@ -132,346 +161,305 @@ just           # list all commands
 
 ## Hardware profiles
 
-Pick one profile, edit **`configs/config.toml` `[runtime]`**, then run the command block below.
+Set **`[runtime].hardware_profile`** once. Shared knobs stay in `[gemma]` / `[rag]`; machine-specific model, VRAM, think, and RAG batch sizes live under `[hardware_profiles.<name>.*]`. `resolve_section()` overlays the active profile for every command.
 
-### Profile A — 16GB full pipeline (recommended for submission)
+```bash
+just show-profile   # print resolved verifier + RAG settings
+just first-run      # setup → preprocess → predict for that profile
+```
+
+### Profile A — 16GB full pipeline (recommended)
 
 **Machine:** RTX 5060 16GB, Kaggle P100/T4, or similar.
-
-Use this when Gemma can fit fully on GPU. It is the faster path and keeps
-dynamic Gemma exemplars enabled.
-
-**Set in `configs/config.toml`:**
 
 ```toml
 [runtime]
 hardware_profile = "16gb"
-use_llm_verifier = true
-fail_on_model_error = true
-
-[predict]
-use_checkpoints = true
-force_recompute = false
 
 [hardware_profiles.16gb.gemma]
+model_name = "google/gemma-4-E4B-it"
+model_loader = "multimodal_lm"
 load_in = "4bit"
 device_map = "cuda:0"
+cuda_max_memory = "14GiB"
 exemplar_top_k = 3
 max_input_tokens = 3072
-
-[hardware_profiles.16gb.xlmr]
-use_amp = true
-batch_size = 8
-grad_accum_steps = 2
+enable_think_pass = true
 
 [hardware_profiles.16gb.rag]
 batch_size = 128
 query_batch_size = 128
-max_seq_length = 512
 ```
 
-**Commands (first time):**
-
 ```bash
-just first-run-16gb
+just first-run
 ```
 
 Or step by step:
 
 ```bash
-just sync
-just prepare-full             # models (incl. active verifier) + wiki + RAG index
+just setup             # sync + models for active profile + wiki + make-rag
 just preprocess
-just train
 just predict
 ```
 
-**Commands (after assets exist):**
+After assets exist:
 
 ```bash
-just submit                   # train (fresh) + predict
-just submit-continue          # resume from existing checkpoints + predict
-# or, if raw data changed:
-just run                      # preprocess + fresh train + predict
+just run               # preprocess → predict
+just predict           # prediction only (resumes checkpoints when valid)
 ```
-
-**Notes:** Training runs the LLM verifier once per CV fold for OOF scoring, then
-builds a full exemplar index for inference. Inference is one fast pass per test
-row, plus a think pass on triggered rows when enabled.
 
 ---
 
-### Profile B — 8GB Ungated Qwen Verifier
+### Profile B — 8GB ungated Qwen3 thinking verifier
 
 **Machine:** RTX 5060 mobile 8GB or any GPU too small for Gemma 4 E4B.
-
-Use this when the 16GB Gemma 4 profile does not fit or you do not want to deal
-with gated model access. On this stack, Gemma 4 E4B does not run reliably on 8GB:
-int8 CPU offload loads the model, but scoring moves a huge per-layer embedding
-to CUDA and OOMs. The 8GB profile therefore uses the ungated text-only
-`Qwen/Qwen2.5-1.5B-Instruct` verifier in 4-bit mode.
-
-**Set in `configs/config.toml`:**
 
 ```toml
 [runtime]
 hardware_profile = "8gb"
-use_llm_verifier = true
-
-[predict]
-use_checkpoints = true
-force_recompute = false
 
 [hardware_profiles.8gb.gemma]
-model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+model_name = "Qwen/Qwen3-1.7B"
 model_loader = "causal_lm"
 load_in = "4bit"
 device_map = "cuda:0"
+cuda_max_memory = "7GiB"
 max_input_tokens = 1536
 exemplar_top_k = 0
-classify_cultural_band = false
-enable_think_pass = false
-
-[hardware_profiles.8gb.xlmr]
-model_name = "FacebookAI/xlm-roberta-base"
-batch_size = 2
-use_amp = false
+enable_think_pass = true
+chat_template_enable_thinking_fast = false
+chat_template_enable_thinking_think = true
 
 [hardware_profiles.8gb.rag]
 batch_size = 32
 query_batch_size = 32
-max_seq_length = 512
 ```
-
-**Commands:**
 
 ```bash
-just first-run-8gb
+just first-run
 ```
 
-Or step by step: `just sync` → `just prepare-full` → `just preprocess` → `just train` → `just predict`
-
-This profile still disables dynamic exemplars, cultural-band routing, and the
-generated think pass by default to keep verifier inference small and stable.
-
-For a pure XLM-R debug run without loading Gemma, set:
-
-```toml
-[runtime]
-use_llm_verifier = false
-```
-
-> **Tip:** `just train` always wipes `models/xlmr/` and retrains from scratch.
-> Use `just train-continue` to resume — it skips folds whose checkpoint already exists.
-
-Use this to debug preprocessing, RAG, and cross-encoder training without loading the verifier.
-
----
-
-### Profile C — RAG smoke test
-
-Add to either profile after first setup:
-
-```bash
-just smoke-rag
-```
-
-Or: `just download-corpus-small` → `just build-index` → `just submit`
-
-Compare `submission_debug.csv` columns `n_retrieved`, `retrieval_sim_max`, `rag_filled` with and without the index.
+This profile disables dynamic exemplars, but keeps the explicit think pass on. The fast F/H pass uses non-thinking chat-template mode so Qwen3 does not start with `<think>` when the code needs a single F/H token.
 
 ---
 
 ### OOM / stability
 
-| Symptom          | Fix                                                                                                                 |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------- |
-| XLM-R OOM        | Lower `batch_size` or `max_length` in active hardware profile (`configs/config.toml`)                               |
-| Gemma OOM        | Use the `8gb` profile, lower `cuda_max_memory`, `max_input_tokens`, `max_think_tokens`, or set `exemplar_top_k = 0` |
-| RAG Indexing OOM | Lower `batch_size` or `max_seq_length` in `[rag]` or profile-specific `[hardware_profiles.<profile>.rag]` section   |
-| Stale RAG scores | `just clean-rag-cache` then re-run `just train` / `just predict`                                                    |
+| Symptom          | Fix                                                                                                       |
+| ---------------- | --------------------------------------------------------------------------------------------------------- |
+| Gemma / Qwen OOM | Use `8gb`, lower `cuda_max_memory` / `max_input_tokens` / `max_think_tokens`, or set `exemplar_top_k = 0` |
+| RAG indexing OOM | Lower `batch_size` / `max_seq_length` in `[rag]` or profile RAG overrides                                 |
+| Stale RAG scores | `just clean-rag` then `just predict`                                                                      |
+| Missing indexes  | `rag_skipped_reason=index_missing:<source>` → fill `corpus/<source>/` then `just make-rag`                |
 
 ### Prediction resume
 
-`just predict` writes stage checkpoints:
+| File                                         | Stage                                   |
+| -------------------------------------------- | --------------------------------------- |
+| `generated/processed/test_with_evidence.csv` | Routed + typed-RAG-filled test contexts |
+| `logs/debug_llm_verifier.jsonl`              | Row-level verifier cache                |
+| `generated/processed/test_llm_preds.csv`     | Complete verifier probability vector    |
 
-| File                                       | Stage                             |
-| ------------------------------------------ | --------------------------------- |
-| `dataset/processed/test_with_evidence.csv` | RAG-filled test contexts          |
-| `dataset/processed/test_xlmr_preds.csv`    | XLM-R ensemble probabilities      |
-| `logs/debug_llm_verifier.jsonl`            | Row-level Gemma verifier cache    |
-| `dataset/processed/test_llm_preds.csv`     | Complete Gemma probability vector |
-
-Leave `[predict].use_checkpoints = true` to resume after an OOM or interruption.
-Set `[predict].force_recompute = true` for one clean rerun without deleting files.
+`[predict].use_checkpoints = true` resumes after OOM. `force_recompute = true` ignores checkpoints for one run.
 
 ### Daily workflow
 
-Use these once assets and preprocessing already exist:
-
-| Goal                      | Command                                                     | Notes                                                              |
-| ------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------ |
-| Resume fold training      | `just train-continue`                                       | Keeps `models/xlmr/best_fold_*.pt` and skips completed folds       |
-| Fresh train, then predict | `just submit`                                               | Deletes XLM-R fold checkpoints first because `just train` is fresh |
-| Resume training + predict | `just submit-continue`                                      | Best after an interrupted training run                             |
-| Re-run prediction only    | `just predict`                                              | Reuses RAG, XLM-R, and Gemma prediction checkpoints when valid     |
-| Force clean prediction    | Set `[predict].force_recompute = true`, then `just predict` | Does not delete files; ignores checkpoint reuse for that run       |
-| Rebuild RAG evidence      | `just clean-rag-cache`                                      | Use after changing corpus, RAG index, or RAG knobs                 |
-
-Checkpoint CSVs include metadata for `hardware_profile` and checkpoint source.
-If you switch between `8gb` and `16gb`, incompatible prediction checkpoints are
-ignored instead of silently reused.
+| Goal                   | Command                                           |
+| ---------------------- | ------------------------------------------------- |
+| Predict only           | `just predict`                                    |
+| Force clean prediction | set `force_recompute = true`, then `just predict` |
+| Rebuild RAG indexes    | `just make-rag` / `just make-rag --source wiki`   |
+| Drop RAG caches        | `just clean-rag`                                  |
+| Full refresh           | `just clean-all` → `just setup` → `just run`      |
 
 ### Performance tuning
 
-The defaults are conservative. Tune in `configs/config.toml`:
+| Knob                                 | Where                         | Effect                                  |
+| ------------------------------------ | ----------------------------- | --------------------------------------- |
+| `query_batch_size`                   | `[hardware_profiles.*.rag]`   | Faster RAG queries until embed OOM      |
+| `index_dtype`                        | `[rag]`                       | Compact RAG indexes; default `float16`  |
+| `load_in` / `device_map`             | `[hardware_profiles.*.gemma]` | Quantization and placement              |
+| `max_input_tokens`                   | `[hardware_profiles.*.gemma]` | Memory vs truncation                    |
+| `enable_think_pass`                  | `[hardware_profiles.*.gemma]` | Explicit think pass toggle              |
+| `think_conf_low` / `think_conf_high` | `[gemma]`                     | Near-threshold think band               |
+| `exemplar_top_k`                     | `[hardware_profiles.*.gemma]` | Few-shot; `0` skips exemplar embedder   |
+| `decision.threshold`                 | `[decision]`                  | Label cutoff on `p_llm` (default `0.5`) |
 
-| Knob                                           | Where                         | Effect                                                                     |
-| ---------------------------------------------- | ----------------------------- | -------------------------------------------------------------------------- |
-| `batch_size`                                   | `[hardware_profiles.*.xlmr]`  | Bigger is faster until XLM-R OOMs                                          |
-| `use_amp`                                      | `[hardware_profiles.*.xlmr]`  | Faster/lower VRAM on newer GPUs; enabled for 16GB by default               |
-| `num_workers`, `pin_memory`, `prefetch_factor` | `[hardware_profiles.*.xlmr]`  | Improves DataLoader throughput                                             |
-| `query_batch_size`                             | `[hardware_profiles.*.rag]`   | Batch-encodes RAG queries; bigger is faster until embedding OOM            |
-| `model_loader`                                 | `[hardware_profiles.*.gemma]` | `"causal_lm"` for text-only verifier models, `"multimodal_lm"` for Gemma 4 |
-| `device_map`                                   | `[hardware_profiles.*.gemma]` | `"cuda:0"` is fastest; `"auto"` allows CPU offload                         |
-| `load_in`                                      | `[hardware_profiles.*.gemma]` | `"4bit"` for compact GPU loading; `"8bit"` for int8 loading                |
-| `cuda_max_memory`                              | `[hardware_profiles.*.gemma]` | Lower to avoid OOM on 8GB; raise on larger cards                           |
-| `max_input_tokens`                             | `[hardware_profiles.*.gemma]` | Lower saves memory/time but may truncate evidence                          |
-| `use_language_model_direct`                    | `[hardware_profiles.*.gemma]` | Bypasses Gemma 4 multimodal wrapper for text-only offload runs             |
-| `use_inputs_embeds_for_forward`                | `[hardware_profiles.*.gemma]` | Optional text-embedding workaround for non-direct forwards                 |
-| `classify_cultural_band`, `enable_think_pass`  | `[hardware_profiles.*.gemma]` | Extra Gemma calls; enabled on 16GB, disabled on 8GB by default             |
-| `exemplar_top_k`                               | `[hardware_profiles.*.gemma]` | More examples may help quality but increases prompt cost                   |
+---
 
-For 8GB, use the ungated `Qwen/Qwen2.5-1.5B-Instruct` causal-LM profile. For 16GB,
-keep Gemma 4 on `device_map = "cuda:0"` for best throughput.
-The config is validated before training/prediction, so unsupported combinations
-such as `load_in = "4bit"` with `device_map = "auto"` fail early with a clear
-message.
+## Verifier Prompt
+
+The prompt is intentionally short and blunt. Fast pass asks for one next token only:
+
+```text
+Task: <task_type>
+Rule: <task-specific rule>
+<evidence>
+...
+</evidence>
+Q: <prompt_bn>
+A: <response_bn>
+Return one token only: F = faithful/correct/label 1; H = hallucinated/wrong/label 0.
+V:
+```
+
+The model does not generate a sentence for the fast pass. The code reads next-token logits for F vs H.
+
+Think pass uses verdict-first output so truncation is less likely to lose the parseable answer:
+
+```text
+verdict: Faithful|Hallucinated
+confidence: strong|likely|uncertain
+reason: <one short English sentence>
+```
+
+Token budget is dynamic: hard cases can use the configured cap, while simple lexical or near-threshold cases use smaller caps.
+
+---
+
+## Typed RAG corpora
+
+Five typed sources: `wiki`, `famous_bn`, `idioms`, `literal`, `grammar`. Empty folders are fine (`index_missing:<source>`).
+
+```bash
+just download-corpus                 # → corpus/wiki/wiki_bn.jsonl
+just sort-corpus data.jsonl          # LLM-sort rows into corpus/<source>/data.jsonl
+just sort-corpus data.jsonl -- --dry-run --limit 20
+uv run python scripts/sort_corpus.py --tui
+just make-rag                        # all non-empty sources
+just make-rag --source wiki
+```
+
+`sort-corpus` uses the active verifier model from `configs/config.toml`. It writes useful rows under `corpus/wiki`, `corpus/famous_bn`, `corpus/idioms`, `corpus/literal`, or `corpus/grammar`; skipped/noisy rows go under `generated/corpus_sort_skipped/`.
+
+Layout, JSONL examples, writing guidance, and starter filenames: [`corpus/README.md`](corpus/README.md).
 
 ---
 
 ## Command reference
 
-Run `just` to see recipes grouped by **setup**, **workflows**, **pipeline**, **cache**, **dev**.
+Run `just` to list recipes.
 
-### Workflows (start here)
-
-| Command                | What it does                                                             |
-| ---------------------- | ------------------------------------------------------------------------ |
-| `just first-run-16gb`  | sync → prepare-full → preprocess → **fresh train** → predict             |
-| `just first-run-8gb`   | sync → prepare-full → preprocess → **fresh train** → predict (Qwen 1.5B) |
-| `just run`             | preprocess → fresh train → predict                                       |
-| `just submit`          | **fresh train** → predict (data already preprocessed)                    |
-| `just submit-continue` | resume existing checkpoints → predict                                    |
-| `just smoke-rag`       | small wiki → index → fresh train → predict                               |
-
-### Setup
-
-| Command                      | What it does                                                      |
-| ---------------------------- | ----------------------------------------------------------------- |
-| `just sync`                  | Install Python deps via uv                                        |
-| `just prepare-full`          | Active verifier + both XLM-R profiles + BGE-M3 + wiki + RAG index |
-| `just prepare-assets`        | Both XLM-R profiles + BGE-M3 + wiki + index (no Gemma)            |
-| `just prepare-lite`          | Active-profile XLM-R + BGE-M3 only                                |
-| `just prepare-rag`           | Full wiki download + build index                                  |
-| `just download-models`       | XLM-R for active profile + BGE-M3                                 |
-| `just download-models-all`   | XLM-R for both profiles + BGE-M3                                  |
-| `just download-models-gemma` | Above + active verifier                                           |
-| `just download-corpus`       | Full Bengali Wikipedia → `corpus/`                                |
-| `just download-corpus-small` | 200-article wiki sample                                           |
-| `just build-index`           | Build `indexes/dense_index.pkl`                                   |
-
-### Pipeline
-
-| Command               | What it does                                               |
-| --------------------- | ---------------------------------------------------------- |
-| `just preprocess`     | Clean data → `dataset/processed/train.csv`, `test.csv`     |
-| `just train`          | Wipe `models/xlmr/` + full training pipeline (fresh start) |
-| `just train-continue` | Resume training — keeps existing fold checkpoints          |
-| `just predict`        | Test inference → `submissions/<timestamp>/`                |
-
-### Cache
-
-| Command                | What it does                           |
-| ---------------------- | -------------------------------------- |
-| `just clean-rag-cache` | Drop cached `*_with_evidence.csv` only |
-| `just clean-processed` | Remove all of `dataset/processed/`     |
-| `just clean-logs`      | Remove Gemma JSONL debug logs          |
-| `just clean-all`       | All of the above                       |
-
-### Dev
-
-| Command                     | What it does             |
-| --------------------------- | ------------------------ |
-| `just test`                 | pytest                   |
-| `just lint` / `just format` | Ruff                     |
-| `just check`                | lint + test              |
-| `just export`               | Write `requirements.txt` |
+| Command                        | What it does                                     |
+| ------------------------------ | ------------------------------------------------ |
+| `just sync`                    | Install deps                                     |
+| `just show-profile`            | Print active `hardware_profile` + resolved knobs |
+| `just download-models`         | BGE-M3                                           |
+| `just download-models-gemma`   | BGE-M3 + verifier for active profile             |
+| `just download-corpus`         | Wiki → `corpus/wiki/` (extra args ok)            |
+| `just sort-corpus file.jsonl`  | LLM-sort JSONL rows into typed corpus folders    |
+| `just make-rag`                | Build `indexes/<source>.pkl` from corpus folders |
+| `just setup`                   | sync + models + corpus + make-rag                |
+| `just preprocess`              | Clean → `generated/processed/`                   |
+| `just predict`                 | Routed inference → `submissions/<timestamp>/`    |
+| `just run`                     | preprocess → predict                             |
+| `just first-run`               | setup → preprocess → predict (uses profile)      |
+| `just first-run-16gb` / `8gb`  | Aliases of `first-run` (set profile in config)   |
+| `just clean-rag`               | Drop evidence CSVs + indexes                     |
+| `just clean-processed`         | Drop `generated/processed/`                      |
+| `just clean-logs`              | Drop verifier JSONL logs                         |
+| `just clean-all`               | All cleans                                       |
+| `just test` / `lint` / `check` | Dev helpers                                      |
 
 ---
 
 ## Outputs
 
-### Training (`just train`)
-
-| Path                                        | Contents                                         |
-| ------------------------------------------- | ------------------------------------------------ |
-| `dataset/processed/train_with_evidence.csv` | Train rows after RAG (+ retrieval score columns) |
-| `dataset/processed/oof_xlmr.csv`            | OOF XLM-R probabilities                          |
-| `dataset/processed/train_with_preds.csv`    | OOF `p_xlmr` + OOF `p_llm`                       |
-| `models/xlmr/best_fold_*.pt`                | LoRA checkpoints, one per configured CV fold     |
-| `models/blender_config.pkl`                 | Tuned threshold (legacy filename)                |
-| `indexes/exemplar_index.pkl`                | Full train exemplars for inference               |
-| `logs/debug_llm_verifier_oof_fold_*.jsonl`  | Per-fold Gemma debug during training             |
-
 ### Prediction (`just predict`)
 
-| Path                                           | Contents                                    |
-| ---------------------------------------------- | ------------------------------------------- |
-| `submissions/<timestamp>/submission.csv`       | `id, label` — upload this                   |
-| `submissions/<timestamp>/submission_debug.csv` | Full trace for error analysis               |
-| `submissions/latest`                           | Symlink → most recent timestamped run dir   |
-| `dataset/processed/test_with_evidence.csv`     | Test after RAG                              |
-| `dataset/processed/test_xlmr_preds.csv`        | Resumable XLM-R test probabilities          |
-| `dataset/processed/test_llm_preds.csv`         | Resumable Gemma/fallback test probabilities |
-| `dataset/processed/test_with_preds.csv`        | Test with `p_xlmr`, `p_llm`                 |
-| `logs/debug_llm_verifier.jsonl`                | Per-row Gemma debug at inference            |
+| Path                                           | Contents                                  |
+| ---------------------------------------------- | ----------------------------------------- |
+| `submissions/<timestamp>/submission.csv`       | `id, label` — **upload this only**        |
+| `submissions/<timestamp>/submission_debug.csv` | Full trace for error analysis             |
+| `submissions/latest`                           | Symlink → most recent timestamped run dir |
+| `generated/processed/test_with_evidence.csv`   | Test after routing + typed RAG            |
+| `generated/processed/test_llm_preds.csv`       | Resumable verifier probabilities          |
+| `generated/processed/test_with_preds.csv`      | Test with `p_llm` + `task_type`           |
+| `logs/debug_llm_verifier.jsonl`                | Per-row verifier debug at inference       |
+
+Partial mid-run debug (if enabled) is written as `submission_partial_debug.csv` and removed when the final submission is complete. Never upload a partial/debug file.
 
 ### `submission_debug.csv` columns
 
-The debug CSV is intentionally wide. Key groups:
+Fixed schema for checking mistakes and tuning thresholds:
 
-| Group            | Useful columns                                                                                                                                                                                                                            |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Final decision   | `label`, `p_final`, `threshold`, `threshold_margin`, `threshold_abs_margin`, `threshold_metric`                                                                                                                                           |
-| Model scores     | `p_xlmr`, `p_llm`, `llm_minus_xlmr`, `encoder_disagree`, `xlmr_llm_label_disagree`                                                                                                                                                        |
-| Gemma think pass | `p_llm_no_think`, `p_llm_from_log`, `p_llm_log_delta`, `triggered_think`, `think_reasons`, `thinking_cot`, `think_changed_label`                                                                                                          |
-| Cultural routing | `is_c0`, `is_c1`, `is_c2`                                                                                                                                                                                                                 |
-| RAG/evidence     | `has_context`, `evidence_is_null`, `rag_filled`, `n_retrieved`, `retrieval_sim_max`, `retrieval_sim_mean`, `context_word_len`                                                                                                             |
-| Run provenance   | `run_timestamp`, `hardware_profile`, `used_llm_verifier`, `llm_checkpoint_source`, `xlmr_from_checkpoint`, `llm_from_checkpoint`                                                                                                          |
-| Config snapshot  | `xlmr_model_name`, `xlmr_batch_size`, `xlmr_use_amp`, `gemma_model_name`, `gemma_model_loader`, `gemma_load_in`, `gemma_device_map`, `gemma_cuda_max_memory`, `gemma_max_input_tokens`, `gemma_enable_think_pass`, `rag_query_batch_size` |
-| Artifact paths   | `submission_path`, `debug_path`, `xlmr_checkpoint_path`, `llm_checkpoint_path`, `verifier_debug_log_path`                                                                                                                                 |
+| Group      | Columns                                                                                                                                                   |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Decision   | `id`, `label`, `p_llm`, `threshold`, `threshold_margin`                                                                                                   |
+| Routing    | `task_type`                                                                                                                                               |
+| Verifier   | `p_fast`, `p_think`, `triggered_think`, `think_max_tokens`, `think_reasons`, `verdict_parsed`, `confidence_parsed`, `think_changed_label`, `thinking_cot` |
+| Evidence   | `rag_used`, `rag_source`, `rag_skipped_reason`, `evidence_source`, `evidence_relevance`, `n_retrieved`, `retrieval_sim_max`, `retrieval_sim_mean`         |
+| Text       | `context_original`, `context`, `prompt_bn`, `response_bn`                                                                                                 |
+| Provenance | `run_timestamp`, `hardware_profile`, `gemma_model_name`, `gemma_load_in`                                                                                  |
 
-Start with `threshold_abs_margin` to find borderline decisions, then inspect
-`encoder_disagree`, `triggered_think`, and `rag_filled` for likely error modes.
+Sort by `abs(threshold_margin)` for borderline rows; filter by `task_type` / `rag_source` / `think_changed_label` to find weak categories.
 
 ---
 
 ## Data files
 
-Place competition files here:
-
 ```text
-dataset/sample_dataset.json    # labeled train (299 rows)
-dataset/.3_testset.csv         # test (2516 rows)
-dataset/sample_submission.csv  # format example
+dataset/sample_dataset.json              # labeled train (exemplars for 16GB few-shot)
+dataset/testset.csv                      # competition-like test (2516 rows) → submission
+dataset/sample_submission.csv            # id,label format example
+dataset/testset_audit_200.csv            # runnable 200-row dry run
+dataset/analysis/testset_audit_200.csv   # same 200 rows + gold_label columns to fill
 ```
 
-Corpus for RAG (optional, built via `just download-corpus`):
+### Full test set (`dataset/testset.csv`)
 
-```text
-corpus/*.jsonl                 # { "text": "..." } or { "passage": "..." }
-```
+2516 rows · 1155 `[NULL]` context · 1361 with context.
+
+| `task_type`                | Count |
+| -------------------------- | ----: |
+| `context_grounded_fact`    |   885 |
+| `general_fact_null`        |   575 |
+| `context_grounded_other`   |   342 |
+| `other_null`               |   254 |
+| `bangla_grammar`           |   106 |
+| `idiom_meaning_null`       |    75 |
+| `literal_meaning_null`     |    75 |
+| `famous_bn_fact_null`      |    59 |
+| `translation_or_bilingual` |    59 |
+| `math_speed_distance`      |    23 |
+| `famous_bn_fact_context`   |    17 |
+| `calendar_arithmetic`      |    13 |
+| `math_profit_loss`         |    12 |
+| `math_average`             |    11 |
+| `math_work_rate`           |    10 |
+
+This is a mixed benchmark: context entailment, null facts, idioms/literal meanings, grammar, arithmetic, famous BN facts, and translation. One blunt “RAG must support the answer” rule fails on idioms/lexicon rows.
+
+### 200-row audit set
+
+Stratified slice for labeling and threshold tuning:
+
+| `task_type`                | Count |
+| -------------------------- | ----: |
+| `context_grounded_fact`    |    40 |
+| `general_fact_null`        |    30 |
+| `bangla_grammar`           |    18 |
+| `context_grounded_other`   |    18 |
+| `idiom_meaning_null`       |    15 |
+| `literal_meaning_null`     |    15 |
+| `famous_bn_fact_null`      |    14 |
+| `other_null`               |    12 |
+| `translation_or_bilingual` |     8 |
+| `math_*` / `calendar_*`    |    25 |
+| `famous_bn_fact_context`   |     5 |
+
+Runnable inference file: `dataset/testset_audit_200.csv`  
+Label file: `dataset/analysis/testset_audit_200.csv` — fill `gold_label` (`1` faithful / `0` hallucinated), `auditor_confidence`, `needs_human_review`, `audit_reason`.
+
+**Labeling rules:**
+
+1. Judge `response_bn` for `prompt_bn`; use original context when present.
+2. Idiom (`ভাবার্থ`) / literal (`শাব্দিক অর্থ`): use language knowledge — do not mark wrong only because RAG is empty.
+3. Math/calendar: calculate the answer.
+4. Watch common swaps: Mujib ↔ Nazrul ↔ Tagore; Independence Day ↔ Victory Day; Searchlight ↔ Mujibnagar; total vs Bangladesh-only numbers; birth year vs later event year.
+5. After labeling, score **by `task_type`**, not only global accuracy.
 
 ---
 
@@ -479,78 +467,60 @@ corpus/*.jsonl                 # { "text": "..." } or { "passage": "..." }
 
 ### Root
 
-| File                         | Role                                                     |
-| ---------------------------- | -------------------------------------------------------- |
-| `README.md`                  | This document — architecture, hardware recipes, commands |
-| `configs/config.toml`        | **All configuration knobs with inline docs**             |
-| `justfile`                   | Command runner                                           |
-| `pyproject.toml` / `uv.lock` | Dependencies (uv)                                        |
-| `requirements.txt`           | Exported deps for non-uv environments                    |
-| `main.py`                    | Placeholder; use `just train` / `just predict`           |
+| File                         | Role                                         |
+| ---------------------------- | -------------------------------------------- |
+| `README.md`                  | Architecture, hardware recipes, commands     |
+| `configs/config.toml`        | **All configuration knobs with inline docs** |
+| `justfile`                   | Command runner                               |
+| `pyproject.toml` / `uv.lock` | Dependencies (uv)                            |
+| `requirements.txt`           | Exported deps for non-uv environments        |
 
 ### `src/`
 
-| File              | Role                                                                   |
-| ----------------- | ---------------------------------------------------------------------- |
-| `preprocess.py`   | Bengali text cleanup, `[NULL]` handling, `has_context`                 |
-| `rag.py`          | BGE-M3 dense index, scored retrieval, `max_evidence_tokens` truncation |
-| `xlmr_encoder.py` | LoRA fine-tune, configured-fold OOF, test ensemble                     |
-| `llm_verifier.py` | Gemma verifier — encoder prior, fast/think passes, C0/C1/C2 routing    |
-| `blender.py`      | `ThresholdDecision` — OOF threshold on `p_llm` only                    |
-| `train.py`        | Orchestrates preprocess → RAG → XLM-R → OOF Gemma → threshold          |
-| `predict.py`      | Orchestrates RAG → XLM-R → Gemma → threshold → submission + debug CSV  |
-| `evaluate.py`     | Macro F1, per-class F1, confusion matrix                               |
-| `config_utils.py` | Hardware profile resolution, model path cache, runtime torch settings  |
+| File                 | Role                                                                  |
+| -------------------- | --------------------------------------------------------------------- |
+| `preprocess.py`      | Bengali text cleanup, `[NULL]` handling, `has_context`                |
+| `router.py`          | Deterministic `task_type` classification                              |
+| `evidence_policy.py` | Task→corpus map, prompts, think triggers, think score map             |
+| `rag.py`             | Typed corpora, per-source BGE-M3 indexes, scored retrieval            |
+| `llm_verifier.py`    | Gemma/Qwen verifier — task prompts, fast/think passes                 |
+| `predict.py`         | Route → typed evidence → verifier → threshold → submission + debug    |
+| `tui.py`             | Shared Rich banners / progress / tables                               |
+| `config_utils.py`    | Hardware profile resolution, model path cache, runtime torch settings |
 
 ### `scripts/`
 
-| File                 | Role                                              |
-| -------------------- | ------------------------------------------------- |
-| `download_models.py` | Hugging Face snapshots → `models/hf/`             |
-| `download_corpus.py` | Bengali Wikipedia chunks → `corpus/wiki_bn.jsonl` |
+| File                 | Role                                                   |
+| -------------------- | ------------------------------------------------------ |
+| `download_models.py` | Hugging Face snapshots → `models/hf/`                  |
+| `download_corpus.py` | Bengali Wikipedia chunks → `corpus/wiki/wiki_bn.jsonl` |
 
 ### Generated (gitignored)
 
-| Path                 | Role                                     |
-| -------------------- | ---------------------------------------- |
-| `dataset/processed/` | Intermediate CSVs                        |
-| `corpus/`            | RAG source documents                     |
-| `indexes/`           | `dense_index.pkl`, `exemplar_index.pkl`  |
-| `models/`            | Fold weights, threshold pickle, HF cache |
-| `submissions/`       | Final + debug CSVs                       |
-| `logs/`              | Gemma JSONL debug logs                   |
+| Path                   | Role                                            |
+| ---------------------- | ----------------------------------------------- |
+| `generated/processed/` | Intermediate CSVs                               |
+| `corpus/<source>/`     | Typed RAG documents (`*.jsonl`)                 |
+| `indexes/<source>.pkl` | Per-source dense indexes (+ optional exemplars) |
+| `models/`              | HF cache / offload                              |
+| `submissions/`         | Final + debug CSVs                              |
+| `logs/`                | Verifier JSONL debug logs                       |
 
 ---
 
 ## Known weaknesses
 
-1. **Small labeled set (299)** — threshold and LoRA both fit on little data; treat train metrics as noisy.
-2. **C0/C1/C2 bands** — LLM-guessed, only used to trigger think; can misfire on edge cases.
-3. **Wiki-only RAG** — weak on math, spelling MCQs, recent news; think-pass is the fallback.
-4. **Expensive OOF Gemma training** — one verifier pass per configured CV fold; plan GPU time accordingly.
-5. **8GB uses a smaller verifier** — Gemma 4 E4B offload loads but OOMs during scoring on this stack, so 8GB uses `Qwen/Qwen2.5-1.5B-Instruct`.
-6. **Cached evidence CSVs** — if you change corpus/index/config RAG knobs, delete `*_with_evidence.csv` before re-running.
-7. **Kaggle packaging not automated** — fold checkpoints, index, and exemplars must be bundled manually as a Dataset for offline submit.
+1. **No labeled gold for the 200-row audit set yet** — fill `dataset/analysis/testset_audit_200.csv` before tuning thresholds.
+2. **Typed lexical corpora are empty by default** — idiom / literal / grammar / famous_bn folders need curated `*.jsonl` before those indexes help.
+3. **Math/calendar rows are LLM-only** — no separate symbolic solver; Gemma/Qwen judges via task prompts (RAG skipped).
+4. **8GB uses a smaller verifier** — `Qwen/Qwen3-1.7B` instead of Gemma 4; fast F/H uses non-thinking chat mode and the explicit think pass uses thinking mode.
+5. **Evidence cache stickiness** — after corpus/index/config RAG changes, run `just clean-rag` before `just predict`.
+6. **Kaggle packaging not automated**.
 
 ---
 
 ## Roadmap
 
-**Done**
-
-- [x] Gemma-led verifier with XLM-R encoder prior
-- [x] Fold-isolated OOF Gemma + OOF threshold (no RandomForest)
-- [x] Think triggers: uncertainty, encoder disagreement, C0+NULL, C2
-- [x] `max_evidence_tokens` + retrieval scores in debug CSV
-- [x] 8GB / 16GB hardware profiles
-- [x] Resumable prediction checkpoints with profile/source metadata
-- [x] Wide debug submission CSV with score, RAG, checkpoint, and config provenance
-- [x] Batched RAG query retrieval and faster XLM-R inference settings
-- [x] `just` recipes for assets, train, predict
-
-**Next**
-
-- [ ] Compare `macro_f1` vs `f1_class_0` threshold on real OOF runs
-- [ ] Kaggle Dataset bundle: index + fold checkpoints + exemplars + threshold
-- [ ] Optional curated corpus packs (BD history, grammar) beyond wiki
-- [ ] Submission notebook template (internet-off inference)
+- [ ] Label the 200-row audit set and tune per-task thresholds if needed
+- [ ] Fill idiom / literal / famous-fact / grammar corpus tables
+- [ ] Kaggle Dataset bundle + offline submit notebook

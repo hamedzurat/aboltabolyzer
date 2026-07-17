@@ -10,9 +10,6 @@ import pandas as pd
 import torch
 import transformers
 from huggingface_hub.utils import disable_progress_bars
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForMultimodalLM,
@@ -22,6 +19,9 @@ from transformers import (
 )
 
 from src.config_utils import resolve_quantization_mode, resolve_section
+from src.evidence_policy import map_think_verdict, should_trigger_think, task_instruction
+from src.router import route_row
+from src.tui import banner, console, info, ok, pipeline_progress, warn
 
 # Suppress Hugging Face warnings/load reports for a cleaner UI
 transformers.utils.logging.set_verbosity_error()
@@ -29,7 +29,51 @@ transformers.utils.logging.disable_progress_bar()
 disable_progress_bars()
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-console = Console()
+CACHE_VERSION = "verifier-cache-v2"
+CACHE_METADATA_FIELDS = (
+    "model_name",
+    "model_loader",
+    "load_in",
+    "max_input_tokens",
+    "enable_think_pass",
+    "exemplar_top_k",
+    "think_conf_low",
+    "think_conf_high",
+    "chat_template_enable_thinking_fast",
+    "chat_template_enable_thinking_think",
+)
+
+
+def verifier_case_key(
+    *,
+    evidence,
+    prompt,
+    response,
+    task_type,
+    context_original,
+    metadata=None,
+):
+    """Stable identity for one verifier inference case."""
+    key = (
+        CACHE_VERSION,
+        str(task_type),
+        str(context_original),
+        str(evidence),
+        str(prompt),
+        str(response),
+    )
+    if metadata:
+        key += tuple((field, str(metadata.get(field, ""))) for field in CACHE_METADATA_FIELDS)
+    return key
+
+
+def verifier_log_matches_metadata(entry, expected_metadata):
+    if entry.get("cache_version") != CACHE_VERSION:
+        return False
+    for field in CACHE_METADATA_FIELDS:
+        if str(entry.get(field, "")) != str(expected_metadata.get(field, "")):
+            return False
+    return True
 
 
 def _resolve_torch_dtype(dtype_name, default):
@@ -167,23 +211,20 @@ class GemmaVerifier:
         self.clear_cuda_before_load = gemma_config.get("clear_cuda_before_load", True)
         self.max_input_tokens = gemma_config.get("max_input_tokens")
         self.exemplar_top_k = int(gemma_config.get("exemplar_top_k", 3))
-        self.classify_cultural_band_enabled = gemma_config.get("classify_cultural_band", True)
         self.enable_think_pass = gemma_config.get("enable_think_pass", True)
         self.use_inputs_embeds_for_forward = gemma_config.get(
             "use_inputs_embeds_for_forward", False
         )
         self.use_language_model_direct = gemma_config.get("use_language_model_direct", False)
-        self.conf_threshold = gemma_config["confidence_threshold"]
-        self.disagree_threshold = gemma_config.get("disagree_threshold", 0.25)
-        self.force_think_c0_null = gemma_config.get("force_think_c0_null", True)
-        self.force_think_c2 = gemma_config.get("force_think_c2", True)
+        self.conf_low = float(gemma_config.get("think_conf_low", 0.35))
+        self.conf_high = float(gemma_config.get("think_conf_high", 0.65))
         self.max_think_tokens = gemma_config["max_think_tokens"]
-        self.think_reasoning_language = gemma_config.get("think_reasoning_language", "bn")
-        if self.think_reasoning_language not in ("bn", "en"):
-            raise ValueError(
-                "gemma.think_reasoning_language must be 'bn' or 'en', got "
-                f"{self.think_reasoning_language!r}."
-            )
+        self.chat_template_enable_thinking_fast = gemma_config.get(
+            "chat_template_enable_thinking_fast"
+        )
+        self.chat_template_enable_thinking_think = gemma_config.get(
+            "chat_template_enable_thinking_think"
+        )
         self.debug_log_path = "logs/debug_llm_verifier.jsonl"
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -197,16 +238,31 @@ class GemmaVerifier:
 
         self.exemplar_retriever = ExemplarRetriever(self.config)
 
+    def cache_metadata(self):
+        return {
+            "model_name": self.model_name,
+            "model_loader": self.model_loader,
+            "load_in": self.load_in,
+            "max_input_tokens": self.max_input_tokens,
+            "enable_think_pass": self.enable_think_pass,
+            "exemplar_top_k": self.exemplar_top_k,
+            "think_conf_low": self.conf_low,
+            "think_conf_high": self.conf_high,
+            "chat_template_enable_thinking_fast": self.chat_template_enable_thinking_fast,
+            "chat_template_enable_thinking_think": self.chat_template_enable_thinking_think,
+        }
+
     def load_model(self):
         from src.config_utils import resolve_model_path
 
         resolved_name = resolve_model_path(self.model_name)
-        console.print(f"[bold cyan]Loading LLM verifier model:[/bold cyan] {self.model_name}")
+        info(f"Loading verifier model: {self.model_name}")
+        info(f"Device={self.device} · load_in={self.load_in} · loader={self.model_loader}")
         if self.clear_cuda_before_load and torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
 
-        with Console().status("Initializing processor...", spinner="aesthetic"):
+        with console.status("Initializing processor...", spinner="aesthetic"):
             if self.model_loader == "causal_lm":
                 self.tokenizer = AutoTokenizer.from_pretrained(resolved_name)
                 self.processor = self.tokenizer
@@ -270,7 +326,7 @@ class GemmaVerifier:
         else:
             load_kwargs["device_map"] = None
 
-        with Console().status(
+        with console.status(
             "Loading weights (this may take a few minutes)...", spinner="bouncingBar"
         ):
             model_class = (
@@ -291,7 +347,7 @@ class GemmaVerifier:
                     "model with model.language_model and lm_head."
                 )
 
-        console.print("[green]✔ LLM verifier model loaded successfully![/green]")
+        ok(f"Verifier loaded · input_device={self.input_device}")
 
     def _infer_input_device(self):
         if torch.cuda.is_available():
@@ -350,156 +406,83 @@ class GemmaVerifier:
             logits = logits * final_logit_softcapping
         return logits
 
-    def predict_cultural_band(self, prompt_bn):
-        """Classifies the prompt into C0, C1, or C2 based on next-token logits."""
-        if self.model is None:
-            self.load_model()
-
-        # Prompt asking the model to classify the cultural band of the query
-        user_content = (
-            f"নিচের প্রশ্নটি মনোযোগ দিয়ে পড়ো এবং এটি কোন ক্যাটাগরির তা নির্ধারণ করো:\n"
-            f"প্রশ্ন: {prompt_bn}\n\n"
-            f"ক্যাটাগরি সমূহ:\n"
-            f"C0 - বিশ্বজনীন বা বৈজ্ঞানিক তথ্য (যেমন: গণিত, সাধারণ বিজ্ঞান, বিশ্ব ভূগোল)\n"
-            f"C1 - বাংলাদেশ বা বাঙালি সংস্কৃতি-সংক্রান্ত তথ্য (যেমন: বাংলাদেশ ইতিহাস, বাংলা সাহিত্য, স্থানীয় সংস্কৃতি)\n"
-            f"C2 - সাম্প্রতিক, পরিবর্তনশীল বা বিতর্কিত তথ্য (যেমন: সাম্প্রতিক খবর, সময়-সংবেদনশীল তথ্য)\n\n"
-            f"ক্যাটাগরি (C0/C1/C2):"
+    def _think_instruction(self, task_type: str):
+        """English reasoning instruction for the think pass."""
+        return (
+            "Write exactly this format, with the verdict first:\n"
+            "verdict: Faithful|Hallucinated\n"
+            "confidence: strong|likely|uncertain\n"
+            "reason: <one short English sentence>"
         )
 
-        messages = [{"role": "user", "content": user_content}]
-        prompt = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        prompt += "C"  # Pre-fill assistant response with "C" so the next token is exactly "0", "1", or "2"!
+    def _think_token_budget(self, task_type: str, think_reasons: list[str]):
+        """Use the configured cap only for cases that usually need room."""
+        cap = int(self.max_think_tokens)
+        reason_set = set(think_reasons or [])
 
-        inputs = self._prepare_inputs(prompt)
+        if task_type in {
+            "math_work_rate",
+            "math_speed_distance",
+            "math_profit_loss",
+            "math_average",
+            "calendar_arithmetic",
+            "famous_bn_fact_null",
+        }:
+            return cap
 
-        with torch.inference_mode():
-            logits = self._forward_logits(inputs)
+        if "multi_entity_context" in reason_set:
+            return cap
 
-        next_token_logits = logits[0, -1, :]
-        probs = torch.softmax(next_token_logits, dim=-1)
+        if task_type in {
+            "idiom_meaning_null",
+            "literal_meaning_null",
+            "bangla_grammar",
+            "translation_or_bilingual",
+        }:
+            return min(cap, 256)
 
-        # Retrieve probabilities for the digit tokens "0", "1", "2"
-        token_0_ids = [
-            self.tokenizer.encode("0", add_special_tokens=False)[-1],
-            self.tokenizer.encode(" 0", add_special_tokens=False)[-1],
-        ]
-        token_1_ids = [
-            self.tokenizer.encode("1", add_special_tokens=False)[-1],
-            self.tokenizer.encode(" 1", add_special_tokens=False)[-1],
-        ]
-        token_2_ids = [
-            self.tokenizer.encode("2", add_special_tokens=False)[-1],
-            self.tokenizer.encode(" 2", add_special_tokens=False)[-1],
-        ]
+        if reason_set == {"near_threshold"}:
+            return min(cap, 256)
 
-        prob_c0 = sum(probs[tid].item() for tid in token_0_ids if tid is not None)
-        prob_c1 = sum(probs[tid].item() for tid in token_1_ids if tid is not None)
-        prob_c2 = sum(probs[tid].item() for tid in token_2_ids if tid is not None)
+        return min(cap, 384)
 
-        sum_prob = prob_c0 + prob_c1 + prob_c2
-        if sum_prob > 0:
-            p_c0 = prob_c0 / sum_prob
-            p_c1 = prob_c1 / sum_prob
-            p_c2 = prob_c2 / sum_prob
-        else:
-            p_c0, p_c1, p_c2 = 0.33, 0.33, 0.34
-
-        # Return the one-hot band features
-        probs_list = [p_c0, p_c1, p_c2]
-        pred_idx = np.argmax(probs_list)
-
-        is_c0 = 1.0 if pred_idx == 0 else 0.0
-        is_c1 = 1.0 if pred_idx == 1 else 0.0
-        is_c2 = 1.0 if pred_idx == 2 else 0.0
-
-        return is_c0, is_c1, is_c2
+    def _apply_chat_template(self, messages, *, enable_thinking=None):
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = bool(enable_thinking)
+        try:
+            return self.processor.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            kwargs.pop("enable_thinking", None)
+            return self.processor.apply_chat_template(messages, **kwargs)
 
     @staticmethod
-    def _format_encoder_prior(p_xlmr, has_context, evidence):
-        """Build a natural-language XLM-R prior block for Gemma prompts."""
-        if p_xlmr is None:
-            return ""
-
-        p_xlmr = float(p_xlmr)
-        if p_xlmr >= 0.65:
-            verdict_hint = "সম্ভবত Faithful"
-        elif p_xlmr <= 0.35:
-            verdict_hint = "সম্ভবত Hallucinated"
-        else:
-            verdict_hint = "অনিশ্চিত"
-
-        context_note = "প্রদত্ত প্রসঙ্গ আছে" if has_context else "প্রদত্ত প্রসঙ্গ নেই ([NULL])"
-        evidence_note = (
-            "প্রমাণ/তথ্যসূত্র উপলব্ধ"
-            if str(evidence).strip() not in ("[NULL]", "", "None", "nan")
-            else "কোনো প্রমাণ/তথ্যসূত্র নেই"
+    def _parse_think_output(generated_text: str):
+        verdict_match = re.search(
+            r"verdict\s*:\s*(Faithful|Hallucinated)",
+            generated_text,
+            re.IGNORECASE,
         )
-
-        return (
-            f"ক্রস-এনকোডার (XLM-R) ইঙ্গিত:\n"
-            f"- P(Faithful) = {p_xlmr:.2f} → {verdict_hint}\n"
-            f"- {context_note}; {evidence_note}\n"
-            f"এই ইঙ্গিতটি সহায়ক; চূড়ান্ত বিচার তোমার।\n\n"
+        confidence_match = re.search(
+            r"confidence\s*:\s*(strong|likely|uncertain)",
+            generated_text,
+            re.IGNORECASE,
         )
-
-    def _think_instruction(self):
-        """Reasoning instruction for the think pass, in the configured language.
-
-        Only the instruction switches; the evidence/question/answer above it stay
-        Bengali so the model compares the source text directly instead of an
-        internal translation of it. The verdict line is English in both cases
-        because the parser looks for the literal 'verdict: Faithful/Hallucinated'.
-        """
-        if self.think_reasoning_language == "en":
-            return (
-                "Reason in English in at most three short sentences, comparing the "
-                "Bengali answer against the Bengali evidence. Quote the Bengali text "
-                "directly where it matters; do not translate it. Then, on the final "
-                "line, you must write 'verdict: Faithful' or 'verdict: Hallucinated'."
-            )
-        return (
-            "সর্বোচ্চ তিনটি ছোট বাক্যে নিজের যুক্তি লেখো, তারপর শেষ লাইনে "
-            "অবশ্যই 'verdict: Faithful' অথবা 'verdict: Hallucinated' লিখবে।"
-        )
-
-    def _should_trigger_think(
-        self,
-        p_fast,
-        p_xlmr,
-        is_c0,
-        is_c2,
-        evidence,
-        think_reasons,
-    ):
-        """Return True if any think trigger fires."""
-        uncertainty = abs(p_fast - 0.5)
-        if uncertainty < self.conf_threshold:
-            think_reasons.append("uncertain_fast_pass")
-            return True
-
-        if p_xlmr is not None and abs(p_fast - float(p_xlmr)) > self.disagree_threshold:
-            think_reasons.append("encoder_disagreement")
-            return True
-
-        evidence_is_null = str(evidence).strip() in ("[NULL]", "", "None", "nan")
-        if self.force_think_c0_null and is_c0 >= 0.5 and evidence_is_null:
-            think_reasons.append("c0_null_evidence")
-            return True
-
-        if self.force_think_c2 and is_c2 >= 0.5:
-            think_reasons.append("c2_time_sensitive")
-            return True
-
-        return False
+        verdict = verdict_match.group(1) if verdict_match else None
+        confidence = confidence_match.group(1) if confidence_match else None
+        score = map_think_verdict(verdict, confidence) if verdict else None
+        return verdict, confidence, score
 
     def predict_single(
         self,
         evidence,
         prompt_bn,
         response_bn,
-        p_xlmr=None,
+        task_type=None,
+        context_original=None,
         has_context=None,
         silent=True,
         write_log=True,
@@ -507,14 +490,18 @@ class GemmaVerifier:
         if self.model is None:
             self.load_model()
 
-        # 1. Classify the cultural band. On low-VRAM offload profiles this extra
-        # forward pass is disabled because it is only used to route the think pass.
-        if self.classify_cultural_band_enabled:
-            is_c0, is_c1, is_c2 = self.predict_cultural_band(prompt_bn)
-        else:
-            is_c0, is_c1, is_c2 = 0.0, 1.0, 0.0
+        if task_type is None:
+            ctx_for_route = (
+                context_original
+                if context_original is not None
+                else (evidence if has_context else "[NULL]")
+            )
+            task_type = route_row(ctx_for_route or "[NULL]", prompt_bn, response_bn)
+        if context_original is None:
+            context_original = evidence if has_context else "[NULL]"
 
-        # 2. Retrieve training exemplars for dynamic few-shot prompting
+        instruction = task_instruction(task_type)
+
         if self.exemplar_top_k > 0:
             exemplars = self.exemplar_retriever.retrieve_exemplars(
                 query=f"{prompt_bn} {response_bn}",
@@ -525,35 +512,34 @@ class GemmaVerifier:
         else:
             exemplars = []
 
-        # 3. Format prompt with exemplars and encoder prior
-        encoder_prior = self._format_encoder_prior(p_xlmr, has_context, evidence)
-
         prompt_exemplars = ""
         for idx, ex in enumerate(exemplars):
             ex_label_str = "F" if ex["label"] == 1 else "H"
             prompt_exemplars += (
-                f"উদাহরণ {idx + 1}:\n"
-                f"<evidence>\n{ex['context']}\n</evidence>\n"
-                f"প্রশ্ন: {ex['prompt_bn']}\n"
-                f"উত্তর: {ex['response_bn']}\n"
-                f"বিচার (F/H):{ex_label_str}\n\n"
+                f"Ex {idx + 1}\n"
+                f"E: {ex['context']}\n"
+                f"Q: {ex['prompt_bn']}\n"
+                f"A: {ex['response_bn']}\n"
+                f"V: {ex_label_str}\n\n"
             )
 
         user_content = (
             f"{prompt_exemplars}"
-            f"চলতি বিচার্য বিষয়:\n"
-            f"{encoder_prior}"
+            f"Task: {task_type}\n"
+            f"Rule: {instruction}\n"
             f"<evidence>\n{evidence}\n</evidence>\n"
-            f"প্রশ্ন: {prompt_bn}\n"
-            f"উত্তর: {response_bn}"
+            f"Q: {prompt_bn}\n"
+            f"A: {response_bn}\n"
+            "Return one token only: F = faithful/correct/label 1; "
+            "H = hallucinated/wrong/label 0.\n"
         )
 
         messages = [{"role": "user", "content": user_content}]
-        prompt = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        prompt = self._apply_chat_template(
+            messages,
+            enable_thinking=self.chat_template_enable_thinking_fast,
         )
-        # Append target prefix completion so the model continues directly after the prompt
-        prompt += "বিচার (F/H):"
+        prompt += "V:"
 
         inputs = self._prepare_inputs(prompt)
 
@@ -567,25 +553,26 @@ class GemmaVerifier:
         prob_h = sum(probs[tid].item() for tid in self.token_h_ids if tid is not None)
 
         sum_prob = prob_f + prob_h
-        if sum_prob > 0:
-            p_f = prob_f / sum_prob
-        else:
-            p_f = 0.5
-
+        p_f = (prob_f / sum_prob) if sum_prob > 0 else 0.5
         p_llm = p_f
+        p_fast = p_f
 
-        # Check think triggers (uncertainty, encoder disagreement, hard cases)
         think_reasons = []
-        triggered_think = self._should_trigger_think(
+        triggered_think = should_trigger_think(
             p_fast=p_llm,
-            p_xlmr=p_xlmr,
-            is_c0=is_c0,
-            is_c2=is_c2,
+            task_type=task_type,
             evidence=evidence,
+            context_original=context_original,
+            prompt_bn=prompt_bn,
+            conf_low=self.conf_low,
+            conf_high=self.conf_high,
             think_reasons=think_reasons,
         )
         p_llm_no_think = p_llm
         generated_text = ""
+        verdict_parsed = None
+        confidence_parsed = None
+        think_max_tokens = None
 
         if triggered_think and not self.enable_think_pass:
             think_reasons.append("think_pass_disabled")
@@ -594,32 +581,31 @@ class GemmaVerifier:
         if triggered_think:
             if not silent:
                 reason_str = ", ".join(think_reasons) if think_reasons else "unknown"
-                console.print(
-                    f"[yellow]Think pass triggered ({reason_str}, p_fast={p_llm:.4f}).[/yellow]"
-                )
+                warn(f"Think pass triggered ({reason_str}, p_fast={p_llm:.4f})")
 
             think_user_content = (
                 f"{prompt_exemplars}"
-                f"চলতি বিচার্য বিষয়:\n"
-                f"{encoder_prior}"
+                f"Task: {task_type}\n"
+                f"Rule: {instruction}\n"
                 f"<evidence>\n{evidence}\n</evidence>\n"
-                f"প্রশ্ন: {prompt_bn}\n"
-                f"উত্তর: {response_bn}\n"
-                f"ক্রস-এনকোডার ইঙ্গিত উপরে দেওয়া আছে; প্রয়োজন হলে তা বাতিল করো।\n"
-                f"{self._think_instruction()}"
+                f"Q: {prompt_bn}\n"
+                f"A: {response_bn}\n"
+                f"{self._think_instruction(task_type)}"
             )
 
             think_messages = [{"role": "user", "content": think_user_content}]
-            think_prompt = self.processor.apply_chat_template(
-                think_messages, tokenize=False, add_generation_prompt=True
+            think_prompt = self._apply_chat_template(
+                think_messages,
+                enable_thinking=self.chat_template_enable_thinking_think,
             )
 
             think_inputs = self._prepare_inputs(think_prompt, use_inputs_embeds=False)
+            think_max_tokens = self._think_token_budget(task_type, think_reasons)
 
             with torch.inference_mode():
                 gen_outputs = self.model.generate(
                     **think_inputs,
-                    max_new_tokens=self.max_think_tokens,
+                    max_new_tokens=think_max_tokens,
                     do_sample=False,
                     temperature=None,
                     top_p=None,
@@ -629,54 +615,41 @@ class GemmaVerifier:
             generated_tokens = gen_outputs[0][input_len:]
             generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
-            # Parse the full-word verdict from the CoT output.
-            # We instruct the model to write "verdict: Faithful" or "verdict: Hallucinated",
-            # which are far less likely to appear accidentally inside Bengali prose than
-            # single characters F / H.
-            verdict_match = re.search(
-                r"verdict\s*:\s*(Faithful|Hallucinated)",
-                generated_text,
-                re.IGNORECASE,
-            )
-            if verdict_match:
-                p_llm = 1.0 if verdict_match.group(1).lower() == "faithful" else 0.0
-                verdict_parsed = True
+            verdict, confidence, think_score = self._parse_think_output(generated_text)
+            verdict_parsed = verdict
+            confidence_parsed = confidence
+            if think_score is not None:
+                p_llm = think_score
             else:
-                # No verdict line: the CoT ran out of budget before writing one, so
-                # p_llm stays at the fast-pass score. Record it — otherwise the row
-                # is indistinguishable from a think pass that agreed with the prior.
-                verdict_parsed = False
                 think_reasons.append("verdict_unparsed")
                 if not silent:
-                    console.print(
-                        f"[red]Think pass produced no verdict in {self.max_think_tokens} "
-                        f"tokens; keeping p_fast={p_llm:.4f}.[/red]"
+                    warn(
+                        f"Think pass produced no verdict in {think_max_tokens} "
+                        f"tokens; keeping p_fast={p_llm:.4f}"
                     )
 
-        # Log debug data
-        if triggered_think:
-            generated_text_log = generated_text
-        else:
-            generated_text_log = None
-            verdict_parsed = None
+        generated_text_log = generated_text if triggered_think else None
 
         log_entry = {
+            "cache_version": CACHE_VERSION,
             "evidence": evidence,
+            "context_original": context_original,
             "prompt": prompt_bn,
             "response": response_bn,
-            "p_xlmr": None if p_xlmr is None else float(p_xlmr),
+            "task_type": task_type,
             "has_context": None if has_context is None else bool(has_context),
+            "p_fast": float(p_fast),
+            "p_think": None if not triggered_think else float(p_llm),
             "p_llm_no_think": float(p_llm_no_think),
             "triggered_think": bool(triggered_think),
             "think_reasons": think_reasons,
+            "think_max_tokens": think_max_tokens,
             "thinking_cot": generated_text_log,
             "verdict_parsed": verdict_parsed,
-            "think_reasoning_language": self.think_reasoning_language,
+            "confidence_parsed": confidence_parsed,
             "p_llm_final": float(p_llm),
-            "is_c0": float(is_c0),
-            "is_c1": float(is_c1),
-            "is_c2": float(is_c2),
         }
+        log_entry.update(self.cache_metadata())
         if write_log:
             os.makedirs(os.path.dirname(self.debug_log_path), exist_ok=True)
             with open(self.debug_log_path, "a", encoding="utf-8") as lf:
@@ -689,12 +662,11 @@ class GemmaVerifier:
         try:
             on_partial(n_done, list(preds))
         except Exception as e:
-            console.print(f"[yellow]Partial submission write failed ({e}); continuing.[/yellow]")
+            warn(f"Partial submission write failed ({e}); continuing")
 
     def predict_dataset(
         self,
         df,
-        p_xlmr=None,
         use_cache=True,
         debug_log_path=None,
         on_partial=None,
@@ -711,6 +683,7 @@ class GemmaVerifier:
         self.debug_log_path = active_log_path
 
         cache = {}
+        cache_metadata = self.cache_metadata()
         if use_cache and os.path.exists(active_log_path):
             try:
                 with open(active_log_path, "r", encoding="utf-8") as lf:
@@ -720,7 +693,16 @@ class GemmaVerifier:
                             continue
                         try:
                             entry = json.loads(line)
-                            key = (entry["prompt"], entry["response"])
+                            if not verifier_log_matches_metadata(entry, cache_metadata):
+                                continue
+                            key = verifier_case_key(
+                                evidence=entry.get("evidence", ""),
+                                prompt=entry.get("prompt", ""),
+                                response=entry.get("response", ""),
+                                task_type=entry.get("task_type", ""),
+                                context_original=entry.get("context_original", ""),
+                                metadata=cache_metadata,
+                            )
                             cache[key] = (
                                 entry["p_llm_final"],
                                 entry["triggered_think"],
@@ -728,49 +710,62 @@ class GemmaVerifier:
                         except Exception:
                             continue
                 if cache:
-                    console.print(
-                        f"[bold green]Loaded {len(cache)} existing predictions from debug log "
-                        f"({active_log_path}).[/bold green]"
-                    )
+                    ok(f"Loaded {len(cache)} cached predictions from debug log ({active_log_path})")
             except Exception as e:
-                console.print(
-                    f"[yellow]Could not read existing debug log: {e}. Starting fresh.[/yellow]"
-                )
+                warn(f"Could not read existing debug log: {e}. Starting fresh.")
 
-        if p_xlmr is None:
-            if "p_xlmr" in df.columns:
-                p_xlmr = df["p_xlmr"].values
-            else:
-                p_xlmr = [None] * len(df)
+        if "task_type" in df.columns:
+            task_types = df["task_type"].astype(str).tolist()
+        else:
+            task_types = [
+                route_row(
+                    row.get("context_original", row["context"]),
+                    row["prompt_bn"],
+                    row.get("response_bn", ""),
+                )
+                for _, row in df.iterrows()
+            ]
+
+        if "context_original" in df.columns:
+            context_originals = df["context_original"].astype(str).tolist()
+        else:
+            context_originals = df["context"].astype(str).tolist()
 
         if "has_context" in df.columns:
             has_context_values = df["has_context"].values
         else:
-            has_context_values = (df["context"] != "[NULL]").values
+            has_context_values = [
+                str(c).strip() not in ("[NULL]", "", "None", "nan") for c in context_originals
+            ]
 
         preds = []
         total_rows = len(df)
         think_count = 0
+        cache_hits = 0
 
         try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-            ) as progress:
-                task = progress.add_task(description="Running Gemma Verifier...", total=total_rows)
+            with pipeline_progress() as progress:
+                task = progress.add_task("Verifier", total=total_rows)
 
                 for row_num, (idx, row) in enumerate(df.iterrows(), start=1):
                     evidence = str(row["context"])
                     prompt = str(row["prompt_bn"])
                     response = str(row["response_bn"])
-                    row_p_xlmr = p_xlmr[row_num - 1] if p_xlmr is not None else None
+                    row_task_type = task_types[row_num - 1]
+                    row_context_original = context_originals[row_num - 1]
                     row_has_context = bool(has_context_values[row_num - 1])
-                    key = (prompt, response)
+                    key = verifier_case_key(
+                        evidence=evidence,
+                        prompt=prompt,
+                        response=response,
+                        task_type=row_task_type,
+                        context_original=row_context_original,
+                        metadata=cache_metadata,
+                    )
 
                     if use_cache and key in cache:
                         prob, triggered_think = cache[key]
+                        cache_hits += 1
                     else:
                         if self.model is None:
                             self.load_model()
@@ -778,7 +773,8 @@ class GemmaVerifier:
                             evidence,
                             prompt,
                             response,
-                            p_xlmr=row_p_xlmr,
+                            task_type=row_task_type,
+                            context_original=row_context_original,
                             has_context=row_has_context,
                             silent=True,
                             write_log=use_cache,
@@ -791,21 +787,25 @@ class GemmaVerifier:
 
                     progress.update(
                         task,
-                        description=f"Processed {row_num}/{total_rows} (Think triggers: {think_count})",
+                        description=(
+                            f"Verifier · {row_task_type} · think {think_count} · cache {cache_hits}"
+                        ),
                     )
                     progress.advance(task)
 
                     if on_partial and partial_every and row_num % partial_every == 0:
                         self._emit_partial(on_partial, row_num, preds)
+                        info(f"Partial debug flushed at row {row_num}/{total_rows}")
         finally:
             self.debug_log_path = original_log_path
 
         if on_partial and partial_every:
             self._emit_partial(on_partial, len(preds), preds)
 
-        console.print(
-            f"[green]✔ Gemma predictions complete. Think triggered on "
-            f"{think_count}/{total_rows} rows ({think_count / total_rows * 100:.1f}%).[/green]"
+        ok(
+            f"Verifier done · think {think_count}/{total_rows} "
+            f"({100.0 * think_count / max(total_rows, 1):.1f}%) · "
+            f"cache hits {cache_hits}"
         )
         return np.array(preds)
 
@@ -816,20 +816,16 @@ def main():
 
     train_path = os.path.join(config["data"]["processed_dir"], "train.csv")
     if not os.path.exists(train_path):
-        console.print(
-            "[bold red]Preprocessed train data not found. Please run preprocess.py first.[/bold red]"
-        )
+        warn("Preprocessed train data not found. Run `just preprocess` first.")
         return
 
     df = pd.read_csv(train_path)
     df_sample = df.head(3)
 
+    banner("Gemma verifier smoke", "3-row sample from processed train.csv")
     verifier = GemmaVerifier()
-    console.print(
-        Panel("[bold yellow]🤖 Gemma Verifier Test Phase[/bold yellow]", border_style="yellow")
-    )
     preds = verifier.predict_dataset(df_sample)
-    console.print(f"Sample predictions: {preds}")
+    info(f"Sample predictions: {preds}")
 
 
 if __name__ == "__main__":
