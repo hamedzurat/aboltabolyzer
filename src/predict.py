@@ -116,6 +116,58 @@ def build_rag_query(row, query_mode):
     return str(row["prompt_bn"])
 
 
+def _retrieve_many_fast(rag, queries, progress=None, task=None, chunk_size=256):
+    """Same result as rag.retrieve_many, scored as batched float32 matmuls.
+
+    The index is stored float16 (the encoder is halved on CUDA), and NumPy has no
+    BLAS kernel for float16 — it falls back to an unvectorized loop. Casting the
+    index to float32 once and scoring a whole query chunk in one matmul is ~200x
+    faster than a float16 matvec per query.
+    """
+    queries = list(queries)
+    if not queries:
+        return []
+
+    rag.load_model()
+    index = np.ascontiguousarray(rag.embeddings, dtype=np.float32)
+    top_k = rag.top_k
+    threshold = rag.similarity_threshold
+
+    all_results = []
+    for start in range(0, len(queries), chunk_size):
+        chunk = queries[start : start + chunk_size]
+        query_embeddings = np.asarray(
+            rag.model.encode(
+                chunk,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+                batch_size=rag.query_batch_size,
+            ),
+            dtype=np.float32,
+        )
+
+        sims = query_embeddings @ index.T  # (chunk, n_passages)
+        k = min(top_k, sims.shape[1])
+        candidates = np.argpartition(sims, -k, axis=1)[:, -k:]
+
+        for row_idx in range(sims.shape[0]):
+            row_sims = sims[row_idx]
+            idx = candidates[row_idx]
+            idx = idx[np.argsort(row_sims[idx])[::-1]]
+            all_results.append(
+                [
+                    {"text": rag.passages[i], "score": float(row_sims[i])}
+                    for i in idx
+                    if row_sims[i] >= threshold
+                ]
+            )
+
+        if progress is not None and task is not None:
+            progress.advance(task, len(chunk))
+
+    return all_results
+
+
 def load_verifier_debug_map(log_path="logs/debug_llm_verifier.jsonl"):
     """Map (prompt, response) -> latest verifier debug fields."""
     cache = {}
@@ -137,6 +189,7 @@ def load_verifier_debug_map(log_path="logs/debug_llm_verifier.jsonl"):
                         "p_llm_no_think": entry.get("p_llm_no_think"),
                         "p_llm_final": entry.get("p_llm_final"),
                         "triggered_think": entry.get("triggered_think"),
+                        "verdict_parsed": entry.get("verdict_parsed"),
                         "think_reasons": reasons,
                         "thinking_cot": entry.get("thinking_cot"),
                         "is_c0": entry.get("is_c0"),
@@ -148,6 +201,227 @@ def load_verifier_debug_map(log_path="logs/debug_llm_verifier.jsonl"):
     except Exception as e:
         console.print(f"[yellow]Could not merge verifier debug log: {e}[/yellow]")
     return cache
+
+
+def build_debug_df(test_df, p_llm, decision, ctx):
+    """Build the full debug frame for `test_df` scored with `p_llm`.
+
+    Shared by the end-of-run debug CSV and the periodic partial flush, so a
+    partial file has exactly the same schema as the final one. `test_df` may be
+    a head-slice of the full set; every column is derived per-row or from ctx.
+    """
+    p_llm = np.asarray(p_llm, dtype=float)
+    p_final, preds = decision.predict(p_llm)
+    debug_df = test_df.copy()
+    debug_df["p_llm"] = p_llm
+    debug_df["p_final"] = p_final
+    debug_df["label"] = preds
+    debug_df["threshold"] = decision.threshold
+    debug_df["threshold_metric"] = decision.threshold_metric
+    debug_df["threshold_margin"] = debug_df["p_final"] - float(decision.threshold)
+    debug_df["threshold_abs_margin"] = debug_df["threshold_margin"].abs()
+    debug_df["used_llm_verifier"] = use_llm_verifier(ctx["config"])
+    debug_df["encoder_disagree"] = (debug_df["p_xlmr"] - debug_df["p_llm"]).abs()
+    debug_df["llm_minus_xlmr"] = debug_df["p_llm"] - debug_df["p_xlmr"]
+    debug_df["xlmr_label_at_threshold"] = (debug_df["p_xlmr"] >= decision.threshold).astype(int)
+    debug_df["llm_label_at_threshold"] = (debug_df["p_llm"] >= decision.threshold).astype(int)
+    debug_df["xlmr_llm_label_disagree"] = (
+        debug_df["xlmr_label_at_threshold"] != debug_df["llm_label_at_threshold"]
+    )
+    debug_df["rag_filled"] = (debug_df["context_original"] == "[NULL]") & (
+        debug_df["context"] != "[NULL]"
+    )
+    debug_df["evidence_is_null"] = (
+        debug_df["context"].astype(str).str.strip().isin(("[NULL]", "", "None", "nan"))
+    )
+    debug_df["context_original_is_null"] = (
+        debug_df["context_original"].astype(str).str.strip().isin(("[NULL]", "", "None", "nan"))
+    )
+    debug_df["context_char_len"] = debug_df["context"].astype(str).str.len()
+    debug_df["context_word_len"] = debug_df["context"].astype(str).str.split().str.len()
+    debug_df["prompt_char_len"] = debug_df["prompt_bn"].astype(str).str.len()
+    debug_df["response_char_len"] = debug_df["response_bn"].astype(str).str.len()
+    debug_df["prompt_response_char_len"] = (
+        debug_df["prompt_char_len"] + debug_df["response_char_len"]
+    )
+
+    xlmr_config = resolve_section(ctx["config"], "xlmr")
+    gemma_config = resolve_section(ctx["config"], "gemma")
+    rag_config = resolve_section(ctx["config"], "rag")
+    debug_df["run_timestamp"] = ctx["run_ts"]
+    debug_df["hardware_profile"] = ctx["hardware_profile"]
+    debug_df["num_folds"] = ctx["config"].get("num_folds")
+    debug_df["seed"] = ctx["config"].get("seed")
+    debug_df["use_checkpoints"] = ctx["use_checkpoints"]
+    debug_df["force_recompute"] = ctx["force_recompute"]
+    debug_df["xlmr_from_checkpoint"] = ctx["xlmr_from_checkpoint"]
+    debug_df["llm_from_checkpoint"] = ctx["llm_from_checkpoint"]
+    debug_df["llm_checkpoint_source"] = ctx["llm_checkpoint_source"]
+    debug_df["xlmr_checkpoint_path"] = ctx["xlmr_checkpoint_path"]
+    debug_df["llm_checkpoint_path"] = ctx["llm_checkpoint_path"]
+    debug_df["verifier_debug_log_path"] = ctx["verifier_debug_log_path"]
+    debug_df["threshold_path"] = ctx["threshold_path"]
+    debug_df["submission_path"] = ctx["submission_path"]
+    debug_df["debug_path"] = ctx["debug_path"]
+    debug_df["xlmr_model_name"] = xlmr_config.get("model_name")
+    debug_df["xlmr_max_length"] = xlmr_config.get("max_length")
+    debug_df["xlmr_batch_size"] = xlmr_config.get("batch_size")
+    debug_df["xlmr_use_amp"] = xlmr_config.get("use_amp")
+    debug_df["xlmr_num_workers"] = xlmr_config.get("num_workers")
+    debug_df["xlmr_pin_memory"] = xlmr_config.get("pin_memory")
+    debug_df["gemma_model_name"] = gemma_config.get("model_name")
+    debug_df["gemma_model_loader"] = gemma_config.get("model_loader")
+    debug_df["gemma_device_map"] = gemma_config.get("device_map")
+    debug_df["gemma_cuda_max_memory"] = gemma_config.get("cuda_max_memory")
+    debug_df["gemma_max_input_tokens"] = gemma_config.get("max_input_tokens")
+    debug_df["gemma_max_think_tokens"] = gemma_config.get("max_think_tokens")
+    debug_df["gemma_exemplar_top_k"] = gemma_config.get("exemplar_top_k")
+    debug_df["gemma_load_in"] = resolve_quantization_mode(gemma_config)
+    debug_df["gemma_int8_cpu_offload"] = gemma_config.get("llm_int8_enable_fp32_cpu_offload")
+    debug_df["gemma_use_inputs_embeds_for_forward"] = gemma_config.get(
+        "use_inputs_embeds_for_forward"
+    )
+    debug_df["gemma_use_language_model_direct"] = gemma_config.get("use_language_model_direct")
+    debug_df["gemma_classify_cultural_band"] = gemma_config.get("classify_cultural_band")
+    debug_df["gemma_enable_think_pass"] = gemma_config.get("enable_think_pass")
+    debug_df["gemma_think_reasoning_language"] = gemma_config.get("think_reasoning_language")
+    debug_df["rag_query_mode"] = rag_config.get("query_mode")
+    debug_df["rag_top_k"] = rag_config.get("top_k")
+    debug_df["rag_query_batch_size"] = rag_config.get("query_batch_size")
+    debug_df["rag_similarity_threshold"] = rag_config.get("similarity_threshold")
+    debug_df["rag_max_evidence_tokens"] = rag_config.get("max_evidence_tokens")
+
+    debug_df["p_llm_no_think"] = np.nan
+    debug_df["p_llm_from_log"] = np.nan
+    debug_df["p_llm_log_delta"] = np.nan
+    debug_df["triggered_think"] = False
+    # Object dtype, not float: this holds True/False/None, and pandas 3 refuses to
+    # assign a bool into a float64 column.
+    debug_df["verdict_parsed"] = pd.Series(None, index=debug_df.index, dtype="object")
+    debug_df["think_reasons"] = ""
+    debug_df["thinking_cot"] = ""
+    debug_df["is_c0"] = np.nan
+    debug_df["is_c1"] = np.nan
+    debug_df["is_c2"] = np.nan
+    debug_df["think_changed_probability"] = np.nan
+    debug_df["think_changed_label"] = False
+
+    verifier_map = load_verifier_debug_map(ctx["verifier_debug_log_path"])
+    if verifier_map:
+        for i, row in debug_df.iterrows():
+            key = (str(row["prompt_bn"]), str(row["response_bn"]))
+            if key in verifier_map:
+                meta = verifier_map[key]
+                debug_df.at[i, "p_llm_no_think"] = meta.get("p_llm_no_think")
+                debug_df.at[i, "p_llm_from_log"] = meta.get("p_llm_final")
+                debug_df.at[i, "triggered_think"] = bool(meta.get("triggered_think"))
+                debug_df.at[i, "verdict_parsed"] = meta.get("verdict_parsed")
+                debug_df.at[i, "think_reasons"] = meta.get("think_reasons", "")
+                debug_df.at[i, "thinking_cot"] = meta.get("thinking_cot") or ""
+                debug_df.at[i, "is_c0"] = meta.get("is_c0")
+                debug_df.at[i, "is_c1"] = meta.get("is_c1")
+                debug_df.at[i, "is_c2"] = meta.get("is_c2")
+        has_no_think = debug_df["p_llm_no_think"].notna()
+        has_log_prob = debug_df["p_llm_from_log"].notna()
+        debug_df.loc[has_log_prob, "p_llm_log_delta"] = (
+            debug_df.loc[has_log_prob, "p_llm"] - debug_df.loc[has_log_prob, "p_llm_from_log"]
+        )
+        debug_df.loc[has_no_think, "think_changed_probability"] = (
+            debug_df.loc[has_no_think, "p_llm"] - debug_df.loc[has_no_think, "p_llm_no_think"]
+        )
+        debug_df.loc[has_no_think, "think_changed_label"] = (
+            debug_df.loc[has_no_think, "p_llm"] >= decision.threshold
+        ) != (debug_df.loc[has_no_think, "p_llm_no_think"] >= decision.threshold)
+
+    preferred_cols = [
+        "id",
+        "label",
+        "p_final",
+        "threshold",
+        "threshold_margin",
+        "threshold_abs_margin",
+        "threshold_metric",
+        "p_llm",
+        "p_llm_no_think",
+        "p_llm_from_log",
+        "p_llm_log_delta",
+        "p_xlmr",
+        "llm_minus_xlmr",
+        "encoder_disagree",
+        "xlmr_label_at_threshold",
+        "llm_label_at_threshold",
+        "xlmr_llm_label_disagree",
+        "triggered_think",
+        "verdict_parsed",
+        "think_reasons",
+        "think_changed_probability",
+        "think_changed_label",
+        "is_c0",
+        "is_c1",
+        "is_c2",
+        "has_context",
+        "evidence_is_null",
+        "context_original_is_null",
+        "rag_filled",
+        "n_retrieved",
+        "retrieval_sim_max",
+        "retrieval_sim_mean",
+        "context_char_len",
+        "context_word_len",
+        "prompt_char_len",
+        "response_char_len",
+        "prompt_response_char_len",
+        "context_original",
+        "context",
+        "prompt_bn",
+        "response_bn",
+        "thinking_cot",
+        "run_timestamp",
+        "hardware_profile",
+        "used_llm_verifier",
+        "llm_checkpoint_source",
+        "xlmr_from_checkpoint",
+        "llm_from_checkpoint",
+        "use_checkpoints",
+        "force_recompute",
+        "num_folds",
+        "seed",
+        "xlmr_model_name",
+        "xlmr_max_length",
+        "xlmr_batch_size",
+        "xlmr_use_amp",
+        "xlmr_num_workers",
+        "xlmr_pin_memory",
+        "gemma_model_name",
+        "gemma_model_loader",
+        "gemma_device_map",
+        "gemma_cuda_max_memory",
+        "gemma_max_input_tokens",
+        "gemma_max_think_tokens",
+        "gemma_exemplar_top_k",
+        "gemma_load_in",
+        "gemma_int8_cpu_offload",
+        "gemma_use_inputs_embeds_for_forward",
+        "gemma_use_language_model_direct",
+        "gemma_classify_cultural_band",
+        "gemma_enable_think_pass",
+        "gemma_think_reasoning_language",
+        "rag_query_mode",
+        "rag_top_k",
+        "rag_query_batch_size",
+        "rag_similarity_threshold",
+        "rag_max_evidence_tokens",
+        "xlmr_checkpoint_path",
+        "llm_checkpoint_path",
+        "verifier_debug_log_path",
+        "threshold_path",
+        "submission_path",
+        "debug_path",
+    ]
+    ordered = [c for c in preferred_cols if c in debug_df.columns]
+    ordered += [c for c in debug_df.columns if c not in ordered]
+    debug_df = debug_df[ordered]
+    return debug_df
 
 
 def main():
@@ -224,8 +498,7 @@ def main():
                     transient=True,
                 ) as progress:
                     task = progress.add_task(description="Retrieving facts...", total=num_nulls)
-                    hits_by_query = rag.retrieve_many(queries)
-                    progress.advance(task, num_nulls)
+                    hits_by_query = _retrieve_many_fast(rag, queries, progress, task)
 
                 retrieved_contexts = []
                 n_retrieved = []
@@ -286,14 +559,64 @@ def main():
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    # 4. Predict with Gemma 4 Verifier (encoder prior from XLM-R)
-    console.print("\n[bold cyan]Step 3: Gemma 4 Verifier Inference[/bold cyan]")
+    # 4. Set up the run folder and threshold before Gemma, so the verifier can
+    # flush partial submissions as it goes instead of only at the end.
+    base_submission_path = config["data"]["submission_output_path"]
+    submissions_dir = os.path.dirname(base_submission_path)
+    basename = os.path.basename(base_submission_path)
+
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(submissions_dir, run_ts)
+    os.makedirs(run_dir, exist_ok=True)
+    submission_path = os.path.join(run_dir, basename)
+    partial_path = os.path.join(run_dir, "submission_partial.csv")
+
+    decision = ThresholdDecision()
+    threshold_path = "models/blender_config.pkl"
+    if os.path.exists(threshold_path):
+        decision.load(threshold_path)
+    else:
+        console.print(
+            f"[bold red]Warning: Threshold config not found at {threshold_path}. "
+            f"Using default threshold=0.5.[/bold red]"
+        )
+
+    partial_flush_every = int(predict_config.get("partial_flush_every", 0))
+
     test_df["p_xlmr"] = p_xlmr
     verifier = GemmaVerifier()
-    if use_llm_verifier(config):
-        llm_checkpoint_path = _prediction_checkpoint_path(
+
+    # Shared by the partial flush and the final debug CSV so both have one schema.
+    # Mutated as the run learns its own provenance (llm_checkpoint_source, etc.).
+    ctx = {
+        "config": config,
+        "run_ts": run_ts,
+        "hardware_profile": hardware_profile,
+        "use_checkpoints": use_checkpoints,
+        "force_recompute": force_recompute,
+        "xlmr_from_checkpoint": xlmr_from_checkpoint,
+        "llm_from_checkpoint": False,
+        "llm_checkpoint_source": "gemma",
+        "xlmr_checkpoint_path": xlmr_checkpoint_path,
+        "llm_checkpoint_path": _prediction_checkpoint_path(
             config, "llm_predictions_path", "test_llm_preds.csv"
+        ),
+        "verifier_debug_log_path": verifier.debug_log_path,
+        "threshold_path": threshold_path,
+        "submission_path": submission_path,
+        "debug_path": submission_path.replace(".csv", "_debug.csv"),
+    }
+
+    def _write_partial(n_done, preds_so_far):
+        partial_df = build_debug_df(
+            test_df.iloc[:n_done].copy(), preds_so_far, decision, ctx
         )
+        partial_df.to_csv(partial_path, index=False)
+
+    # 5. Predict with Gemma 4 Verifier (encoder prior from XLM-R)
+    console.print("\n[bold cyan]Step 3: Gemma 4 Verifier Inference[/bold cyan]")
+    if use_llm_verifier(config):
+        llm_checkpoint_path = ctx["llm_checkpoint_path"]
         p_llm = None
         llm_from_checkpoint = False
         llm_checkpoint_source = "gemma"
@@ -336,6 +659,8 @@ def main():
                     test_df,
                     p_xlmr=p_xlmr,
                     use_cache=True,
+                    on_partial=_write_partial,
+                    partial_every=partial_flush_every,
                 )
                 if use_checkpoints:
                     _save_prediction_checkpoint(
@@ -383,34 +708,11 @@ def main():
         os.path.join(config["data"]["processed_dir"], "test_with_preds.csv"), index=False
     )
 
-    # 5. Load threshold decision config
-    decision = ThresholdDecision()
-    threshold_path = "models/blender_config.pkl"
-    if os.path.exists(threshold_path):
-        decision.load(threshold_path)
-    else:
-        console.print(
-            f"[bold red]Warning: Threshold config not found at {threshold_path}. "
-            f"Using default threshold=0.5.[/bold red]"
-        )
-
-    # 6. Apply tuned threshold to Gemma verdicts
+    # 6. Apply tuned threshold to Gemma verdicts (threshold loaded before Gemma)
     console.print("\n[bold cyan]Step 4: Final Threshold Decision[/bold cyan]")
     p_final, preds = decision.predict(p_llm)
 
-    # 7. Create submission file — timestamped run folder
-    base_submission_path = config["data"][
-        "submission_output_path"
-    ]  # e.g. submissions/submission.csv
-    submissions_dir = os.path.dirname(base_submission_path)  # e.g. submissions/
-    basename = os.path.basename(base_submission_path)  # e.g. submission.csv
-
-    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(submissions_dir, run_ts)
-    os.makedirs(run_dir, exist_ok=True)
-
-    submission_path = os.path.join(run_dir, basename)
-
+    # 7. Create submission file in the run folder created before Gemma
     submission_df = pd.DataFrame(
         {
             "id": test_df["id"] if "id" in test_df.columns else range(len(preds)),
@@ -420,209 +722,14 @@ def main():
 
     submission_df.to_csv(submission_path, index=False)
 
-    # 8. Rich debug CSV for error analysis
-    debug_path = submission_path.replace(".csv", "_debug.csv")
-    debug_df = test_df.copy()
-    debug_df["p_final"] = p_final
-    debug_df["label"] = preds
-    debug_df["threshold"] = decision.threshold
-    debug_df["threshold_metric"] = decision.threshold_metric
-    debug_df["threshold_margin"] = debug_df["p_final"] - float(decision.threshold)
-    debug_df["threshold_abs_margin"] = debug_df["threshold_margin"].abs()
-    debug_df["used_llm_verifier"] = use_llm_verifier(config)
-    debug_df["encoder_disagree"] = (debug_df["p_xlmr"] - debug_df["p_llm"]).abs()
-    debug_df["llm_minus_xlmr"] = debug_df["p_llm"] - debug_df["p_xlmr"]
-    debug_df["xlmr_label_at_threshold"] = (debug_df["p_xlmr"] >= decision.threshold).astype(int)
-    debug_df["llm_label_at_threshold"] = (debug_df["p_llm"] >= decision.threshold).astype(int)
-    debug_df["xlmr_llm_label_disagree"] = (
-        debug_df["xlmr_label_at_threshold"] != debug_df["llm_label_at_threshold"]
-    )
-    debug_df["rag_filled"] = (debug_df["context_original"] == "[NULL]") & (
-        debug_df["context"] != "[NULL]"
-    )
-    debug_df["evidence_is_null"] = (
-        debug_df["context"].astype(str).str.strip().isin(("[NULL]", "", "None", "nan"))
-    )
-    debug_df["context_original_is_null"] = (
-        debug_df["context_original"].astype(str).str.strip().isin(("[NULL]", "", "None", "nan"))
-    )
-    debug_df["context_char_len"] = debug_df["context"].astype(str).str.len()
-    debug_df["context_word_len"] = debug_df["context"].astype(str).str.split().str.len()
-    debug_df["prompt_char_len"] = debug_df["prompt_bn"].astype(str).str.len()
-    debug_df["response_char_len"] = debug_df["response_bn"].astype(str).str.len()
-    debug_df["prompt_response_char_len"] = (
-        debug_df["prompt_char_len"] + debug_df["response_char_len"]
-    )
+    # The complete submission supersedes the partial one.
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
 
-    xlmr_config = resolve_section(config, "xlmr")
-    gemma_config = resolve_section(config, "gemma")
-    rag_config = resolve_section(config, "rag")
-    debug_df["run_timestamp"] = run_ts
-    debug_df["hardware_profile"] = hardware_profile
-    debug_df["num_folds"] = config.get("num_folds")
-    debug_df["seed"] = config.get("seed")
-    debug_df["use_checkpoints"] = use_checkpoints
-    debug_df["force_recompute"] = force_recompute
-    debug_df["xlmr_from_checkpoint"] = xlmr_from_checkpoint
-    debug_df["llm_from_checkpoint"] = llm_from_checkpoint
-    debug_df["llm_checkpoint_source"] = llm_checkpoint_source
-    debug_df["xlmr_checkpoint_path"] = xlmr_checkpoint_path
-    debug_df["llm_checkpoint_path"] = llm_checkpoint_path
-    debug_df["verifier_debug_log_path"] = verifier.debug_log_path
-    debug_df["threshold_path"] = threshold_path
-    debug_df["submission_path"] = submission_path
-    debug_df["debug_path"] = debug_path
-    debug_df["xlmr_model_name"] = xlmr_config.get("model_name")
-    debug_df["xlmr_max_length"] = xlmr_config.get("max_length")
-    debug_df["xlmr_batch_size"] = xlmr_config.get("batch_size")
-    debug_df["xlmr_use_amp"] = xlmr_config.get("use_amp")
-    debug_df["xlmr_num_workers"] = xlmr_config.get("num_workers")
-    debug_df["xlmr_pin_memory"] = xlmr_config.get("pin_memory")
-    debug_df["gemma_model_name"] = gemma_config.get("model_name")
-    debug_df["gemma_model_loader"] = gemma_config.get("model_loader")
-    debug_df["gemma_device_map"] = gemma_config.get("device_map")
-    debug_df["gemma_cuda_max_memory"] = gemma_config.get("cuda_max_memory")
-    debug_df["gemma_max_input_tokens"] = gemma_config.get("max_input_tokens")
-    debug_df["gemma_max_think_tokens"] = gemma_config.get("max_think_tokens")
-    debug_df["gemma_exemplar_top_k"] = gemma_config.get("exemplar_top_k")
-    debug_df["gemma_load_in"] = resolve_quantization_mode(gemma_config)
-    debug_df["gemma_int8_cpu_offload"] = gemma_config.get("llm_int8_enable_fp32_cpu_offload")
-    debug_df["gemma_use_inputs_embeds_for_forward"] = gemma_config.get(
-        "use_inputs_embeds_for_forward"
-    )
-    debug_df["gemma_use_language_model_direct"] = gemma_config.get("use_language_model_direct")
-    debug_df["gemma_classify_cultural_band"] = gemma_config.get("classify_cultural_band")
-    debug_df["gemma_enable_think_pass"] = gemma_config.get("enable_think_pass")
-    debug_df["rag_query_mode"] = rag_config.get("query_mode")
-    debug_df["rag_top_k"] = rag_config.get("top_k")
-    debug_df["rag_query_batch_size"] = rag_config.get("query_batch_size")
-    debug_df["rag_similarity_threshold"] = rag_config.get("similarity_threshold")
-    debug_df["rag_max_evidence_tokens"] = rag_config.get("max_evidence_tokens")
-
-    debug_df["p_llm_no_think"] = np.nan
-    debug_df["p_llm_from_log"] = np.nan
-    debug_df["p_llm_log_delta"] = np.nan
-    debug_df["triggered_think"] = False
-    debug_df["think_reasons"] = ""
-    debug_df["thinking_cot"] = ""
-    debug_df["is_c0"] = np.nan
-    debug_df["is_c1"] = np.nan
-    debug_df["is_c2"] = np.nan
-    debug_df["think_changed_probability"] = np.nan
-    debug_df["think_changed_label"] = False
-
-    verifier_map = load_verifier_debug_map()
-    if verifier_map:
-        for i, row in debug_df.iterrows():
-            key = (str(row["prompt_bn"]), str(row["response_bn"]))
-            if key in verifier_map:
-                meta = verifier_map[key]
-                debug_df.at[i, "p_llm_no_think"] = meta.get("p_llm_no_think")
-                debug_df.at[i, "p_llm_from_log"] = meta.get("p_llm_final")
-                debug_df.at[i, "triggered_think"] = bool(meta.get("triggered_think"))
-                debug_df.at[i, "think_reasons"] = meta.get("think_reasons", "")
-                debug_df.at[i, "thinking_cot"] = meta.get("thinking_cot") or ""
-                debug_df.at[i, "is_c0"] = meta.get("is_c0")
-                debug_df.at[i, "is_c1"] = meta.get("is_c1")
-                debug_df.at[i, "is_c2"] = meta.get("is_c2")
-        has_no_think = debug_df["p_llm_no_think"].notna()
-        has_log_prob = debug_df["p_llm_from_log"].notna()
-        debug_df.loc[has_log_prob, "p_llm_log_delta"] = (
-            debug_df.loc[has_log_prob, "p_llm"] - debug_df.loc[has_log_prob, "p_llm_from_log"]
-        )
-        debug_df.loc[has_no_think, "think_changed_probability"] = (
-            debug_df.loc[has_no_think, "p_llm"] - debug_df.loc[has_no_think, "p_llm_no_think"]
-        )
-        debug_df.loc[has_no_think, "think_changed_label"] = (
-            debug_df.loc[has_no_think, "p_llm"] >= decision.threshold
-        ) != (debug_df.loc[has_no_think, "p_llm_no_think"] >= decision.threshold)
-
-    preferred_cols = [
-        "id",
-        "label",
-        "p_final",
-        "threshold",
-        "threshold_margin",
-        "threshold_abs_margin",
-        "threshold_metric",
-        "p_llm",
-        "p_llm_no_think",
-        "p_llm_from_log",
-        "p_llm_log_delta",
-        "p_xlmr",
-        "llm_minus_xlmr",
-        "encoder_disagree",
-        "xlmr_label_at_threshold",
-        "llm_label_at_threshold",
-        "xlmr_llm_label_disagree",
-        "triggered_think",
-        "think_reasons",
-        "think_changed_probability",
-        "think_changed_label",
-        "is_c0",
-        "is_c1",
-        "is_c2",
-        "has_context",
-        "evidence_is_null",
-        "context_original_is_null",
-        "rag_filled",
-        "n_retrieved",
-        "retrieval_sim_max",
-        "retrieval_sim_mean",
-        "context_char_len",
-        "context_word_len",
-        "prompt_char_len",
-        "response_char_len",
-        "prompt_response_char_len",
-        "context_original",
-        "context",
-        "prompt_bn",
-        "response_bn",
-        "thinking_cot",
-        "run_timestamp",
-        "hardware_profile",
-        "used_llm_verifier",
-        "llm_checkpoint_source",
-        "xlmr_from_checkpoint",
-        "llm_from_checkpoint",
-        "use_checkpoints",
-        "force_recompute",
-        "num_folds",
-        "seed",
-        "xlmr_model_name",
-        "xlmr_max_length",
-        "xlmr_batch_size",
-        "xlmr_use_amp",
-        "xlmr_num_workers",
-        "xlmr_pin_memory",
-        "gemma_model_name",
-        "gemma_model_loader",
-        "gemma_device_map",
-        "gemma_cuda_max_memory",
-        "gemma_max_input_tokens",
-        "gemma_max_think_tokens",
-        "gemma_exemplar_top_k",
-        "gemma_load_in",
-        "gemma_int8_cpu_offload",
-        "gemma_use_inputs_embeds_for_forward",
-        "gemma_use_language_model_direct",
-        "gemma_classify_cultural_band",
-        "gemma_enable_think_pass",
-        "rag_query_mode",
-        "rag_top_k",
-        "rag_query_batch_size",
-        "rag_similarity_threshold",
-        "rag_max_evidence_tokens",
-        "xlmr_checkpoint_path",
-        "llm_checkpoint_path",
-        "verifier_debug_log_path",
-        "threshold_path",
-        "submission_path",
-        "debug_path",
-    ]
-    ordered = [c for c in preferred_cols if c in debug_df.columns]
-    ordered += [c for c in debug_df.columns if c not in ordered]
-    debug_df = debug_df[ordered]
+    debug_path = ctx["debug_path"]
+    ctx["llm_from_checkpoint"] = llm_from_checkpoint
+    ctx["llm_checkpoint_source"] = llm_checkpoint_source
+    debug_df = build_debug_df(test_df, p_llm, decision, ctx)
     debug_df.to_csv(debug_path, index=False)
     console.print(f"Saved detailed debug submission to: [bold white]{debug_path}[/bold white]")
 

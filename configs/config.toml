@@ -42,6 +42,10 @@ use_checkpoints = true
 # Set true for a one-off clean prediction run without deleting checkpoint files.
 force_recompute = false
 
+# Write a partial submission every N verifier rows so an interrupted run still
+# leaves usable output (submission_partial.csv in the run folder). 0 disables.
+partial_flush_every = 25
+
 # Stage-level prediction checkpoints. `test_with_evidence.csv` and the Gemma
 # JSONL debug log are also resumable caches.
 xlmr_predictions_path = "dataset/processed/test_xlmr_preds.csv"
@@ -165,10 +169,10 @@ enable_think_pass = true
 exemplar_top_k = 3
 
 # Think trigger: fast F/H logit pass is uncertain when |p_fast - 0.5| < this value.
-confidence_threshold = 0.15
+confidence_threshold = 0.08
 
 # Think trigger: Gemma fast pass disagrees with XLM-R prior when |p_fast - p_xlmr| > this.
-disagree_threshold = 0.25
+disagree_threshold = 0.40
 
 # Think trigger: C0 band (math/science/universal) + no retrieved evidence → force CoT.
 force_think_c0_null = true
@@ -177,7 +181,15 @@ force_think_c0_null = true
 force_think_c2 = true
 
 # Max tokens for the CoT think pass (parsed verdict: Faithful / Hallucinated).
-max_think_tokens = 256
+# Reasoning + verdict does not fit in 256; below ~512 the CoT is cut off before it
+# reaches the verdict line and the pass silently degrades to the fast-pass score.
+max_think_tokens = 512
+
+# Language the think pass reasons in: "bn" or "en". Evidence/question/answer stay
+# Bengali either way — only the reasoning instruction changes. English reasoning
+# over Bengali source is the cross-lingual CoT setup; A/B it on labeled data
+# before trusting either. Token cost is near-identical (Bengali ≈ 1.08x English).
+think_reasoning_language = "bn"
 
 # -----------------------------------------------------------------------------
 # Threshold decision — single OOF-tuned cutoff on p_llm (no meta-classifier)
@@ -262,7 +274,8 @@ use_language_model_direct = false
 classify_cultural_band = true
 enable_think_pass = true
 exemplar_top_k = 3
-max_think_tokens = 256
+max_think_tokens = 512
+think_reasoning_language = "bn"
 
 [hardware_profiles.16gb.rag]
 batch_size = 128

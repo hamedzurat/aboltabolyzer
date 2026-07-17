@@ -31,13 +31,15 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 console = Console()
 
 
-def _dataloader_kwargs(config, device):
+def _dataloader_kwargs(config, device, tokenizer=None):
     num_workers = int(config.get("num_workers", 0) or 0)
     pin_memory = bool(config.get("pin_memory", False)) and device.type == "cuda"
     kwargs = {
         "num_workers": num_workers,
         "pin_memory": pin_memory,
     }
+    if tokenizer is not None:
+        kwargs["collate_fn"] = PadCollator(tokenizer)
     if num_workers > 0:
         kwargs["persistent_workers"] = bool(config.get("persistent_workers", True))
         kwargs["prefetch_factor"] = int(config.get("prefetch_factor", 2) or 2)
@@ -113,20 +115,35 @@ class BanglaDataset(Dataset):
             text_pair,
             add_special_tokens=True,
             max_length=self.max_length,
-            padding="max_length",
             truncation=True,
-            return_tensors="pt",
         )
 
         item = {
-            "input_ids": encoding["input_ids"].flatten(),
-            "attention_mask": encoding["attention_mask"].flatten(),
+            "input_ids": encoding["input_ids"],
+            "attention_mask": encoding["attention_mask"],
         }
 
         if self.has_labels:
-            item["labels"] = torch.tensor(self.labels[idx], dtype=torch.float)
+            item["labels"] = float(self.labels[idx])
 
         return item
+
+
+class PadCollator:
+    """Pad each batch to its own longest sequence rather than a fixed max_length."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, features):
+        has_labels = "labels" in features[0]
+        labels = [f.pop("labels") for f in features] if has_labels else None
+
+        batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
+
+        if has_labels:
+            batch["labels"] = torch.tensor(labels, dtype=torch.float)
+        return batch
 
 
 def get_model(model_name, lora_r, lora_alpha, lora_dropout, device):
@@ -134,6 +151,13 @@ def get_model(model_name, lora_r, lora_alpha, lora_dropout, device):
 
     resolved_name = resolve_model_path(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(resolved_name, num_labels=1)
+
+    # Recompute activations in the backward pass instead of holding all 24 layers'
+    # worth: measured 8.1 -> 3.0 GiB peak for ~50% slower epochs. Only takes effect
+    # in train() mode. use_reentrant=False is required here: the base weights are
+    # frozen by LoRA, so under the reentrant implementation no input requires grad
+    # and the checkpointed blocks get none.
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     peft_config = LoraConfig(
         task_type=TaskType.SEQ_CLS,
@@ -265,7 +289,7 @@ def train_cross_validation(train_df, config):
         train_dataset = BanglaDataset(fold_train_df, tokenizer, xlmr_config["max_length"])
         val_dataset = BanglaDataset(fold_val_df, tokenizer, xlmr_config["max_length"])
 
-        loader_kwargs = _dataloader_kwargs(xlmr_config, device)
+        loader_kwargs = _dataloader_kwargs(xlmr_config, device, tokenizer)
         train_loader = DataLoader(
             train_dataset,
             batch_size=xlmr_config["batch_size"],
@@ -278,6 +302,11 @@ def train_cross_validation(train_df, config):
             shuffle=False,
             **loader_kwargs,
         )
+
+        # Bound up front so the fold teardown below is valid on the resume path,
+        # which never builds them.
+        optimizer = None
+        scheduler = None
 
         state_dict_path = f"models/xlmr/best_fold_{fold}.pt"
         if os.path.exists(state_dict_path):
@@ -408,10 +437,14 @@ def train_cross_validation(train_df, config):
 
         oof_preds[val_idx] = best_fold_preds
 
-        # Cleanup memory
-        del model
-        torch.cuda.empty_cache()
+        # Cleanup memory. The optimizer holds references to the model's params and
+        # its AdamW state, so dropping the model alone does not free it.
+        del model, optimizer, scheduler
+        del train_loader, val_loader, train_dataset, val_dataset
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
     train_df["p_xlmr"] = oof_preds
     train_df.to_csv(os.path.join(config["data"]["processed_dir"], "oof_xlmr.csv"), index=False)
@@ -440,7 +473,7 @@ def predict_test(test_df, config):
         test_dataset,
         batch_size=xlmr_config["batch_size"],
         shuffle=False,
-        **_dataloader_kwargs(xlmr_config, device),
+        **_dataloader_kwargs(xlmr_config, device, tokenizer),
     )
 
     all_fold_preds = []

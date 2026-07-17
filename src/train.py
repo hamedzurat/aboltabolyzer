@@ -127,6 +127,13 @@ def main():
                 train_df.loc[null_mask, "retrieval_sim_max"] = sim_max
                 train_df.loc[null_mask, "retrieval_sim_mean"] = sim_mean
                 console.print("[green]✔ Context evidence retrieval complete.[/green]")
+
+                # Drop the embedder and the index before training: otherwise BGE-M3
+                # stays on the GPU for every fold, and the index in RAM.
+                del rag
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             else:
                 console.print(
                     f"[bold red]WARNING: Dense RAG index not found at {index_path}.[/bold red]"

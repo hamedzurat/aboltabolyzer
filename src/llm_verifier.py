@@ -178,6 +178,12 @@ class GemmaVerifier:
         self.force_think_c0_null = gemma_config.get("force_think_c0_null", True)
         self.force_think_c2 = gemma_config.get("force_think_c2", True)
         self.max_think_tokens = gemma_config["max_think_tokens"]
+        self.think_reasoning_language = gemma_config.get("think_reasoning_language", "bn")
+        if self.think_reasoning_language not in ("bn", "en"):
+            raise ValueError(
+                "gemma.think_reasoning_language must be 'bn' or 'en', got "
+                f"{self.think_reasoning_language!r}."
+            )
         self.debug_log_path = "logs/debug_llm_verifier.jsonl"
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -438,6 +444,26 @@ class GemmaVerifier:
             f"এই ইঙ্গিতটি সহায়ক; চূড়ান্ত বিচার তোমার।\n\n"
         )
 
+    def _think_instruction(self):
+        """Reasoning instruction for the think pass, in the configured language.
+
+        Only the instruction switches; the evidence/question/answer above it stay
+        Bengali so the model compares the source text directly instead of an
+        internal translation of it. The verdict line is English in both cases
+        because the parser looks for the literal 'verdict: Faithful/Hallucinated'.
+        """
+        if self.think_reasoning_language == "en":
+            return (
+                "Reason in English in at most three short sentences, comparing the "
+                "Bengali answer against the Bengali evidence. Quote the Bengali text "
+                "directly where it matters; do not translate it. Then, on the final "
+                "line, you must write 'verdict: Faithful' or 'verdict: Hallucinated'."
+            )
+        return (
+            "সর্বোচ্চ তিনটি ছোট বাক্যে নিজের যুক্তি লেখো, তারপর শেষ লাইনে "
+            "অবশ্যই 'verdict: Faithful' অথবা 'verdict: Hallucinated' লিখবে।"
+        )
+
     def _should_trigger_think(
         self,
         p_fast,
@@ -580,8 +606,7 @@ class GemmaVerifier:
                 f"প্রশ্ন: {prompt_bn}\n"
                 f"উত্তর: {response_bn}\n"
                 f"ক্রস-এনকোডার ইঙ্গিত উপরে দেওয়া আছে; প্রয়োজন হলে তা বাতিল করো।\n"
-                f"বিচার করো এবং নিজের ভাষায় ব্যাখ্যা কর। "
-                f"শেষে অবশ্যই 'verdict: Faithful' অথবা 'verdict: Hallucinated' লিখবে।"
+                f"{self._think_instruction()}"
             )
 
             think_messages = [{"role": "user", "content": think_user_content}]
@@ -615,12 +640,25 @@ class GemmaVerifier:
             )
             if verdict_match:
                 p_llm = 1.0 if verdict_match.group(1).lower() == "faithful" else 0.0
+                verdict_parsed = True
+            else:
+                # No verdict line: the CoT ran out of budget before writing one, so
+                # p_llm stays at the fast-pass score. Record it — otherwise the row
+                # is indistinguishable from a think pass that agreed with the prior.
+                verdict_parsed = False
+                think_reasons.append("verdict_unparsed")
+                if not silent:
+                    console.print(
+                        f"[red]Think pass produced no verdict in {self.max_think_tokens} "
+                        f"tokens; keeping p_fast={p_llm:.4f}.[/red]"
+                    )
 
         # Log debug data
         if triggered_think:
             generated_text_log = generated_text
         else:
             generated_text_log = None
+            verdict_parsed = None
 
         log_entry = {
             "evidence": evidence,
@@ -632,6 +670,8 @@ class GemmaVerifier:
             "triggered_think": bool(triggered_think),
             "think_reasons": think_reasons,
             "thinking_cot": generated_text_log,
+            "verdict_parsed": verdict_parsed,
+            "think_reasoning_language": self.think_reasoning_language,
             "p_llm_final": float(p_llm),
             "is_c0": float(is_c0),
             "is_c1": float(is_c1),
@@ -644,7 +684,28 @@ class GemmaVerifier:
 
         return p_llm, triggered_think
 
-    def predict_dataset(self, df, p_xlmr=None, use_cache=True, debug_log_path=None):
+    @staticmethod
+    def _emit_partial(on_partial, n_done, preds):
+        try:
+            on_partial(n_done, list(preds))
+        except Exception as e:
+            console.print(f"[yellow]Partial submission write failed ({e}); continuing.[/yellow]")
+
+    def predict_dataset(
+        self,
+        df,
+        p_xlmr=None,
+        use_cache=True,
+        debug_log_path=None,
+        on_partial=None,
+        partial_every=0,
+    ):
+        """Score every row with the verifier.
+
+        on_partial(n_done, preds_so_far) is invoked every `partial_every` rows (and
+        once at the end) so callers can persist partial output; a failure inside it
+        must not kill an in-flight run, so it is called defensively.
+        """
         active_log_path = debug_log_path or self.debug_log_path
         original_log_path = self.debug_log_path
         self.debug_log_path = active_log_path
@@ -733,8 +794,14 @@ class GemmaVerifier:
                         description=f"Processed {row_num}/{total_rows} (Think triggers: {think_count})",
                     )
                     progress.advance(task)
+
+                    if on_partial and partial_every and row_num % partial_every == 0:
+                        self._emit_partial(on_partial, row_num, preds)
         finally:
             self.debug_log_path = original_log_path
+
+        if on_partial and partial_every:
+            self._emit_partial(on_partial, len(preds), preds)
 
         console.print(
             f"[green]✔ Gemma predictions complete. Think triggered on "
