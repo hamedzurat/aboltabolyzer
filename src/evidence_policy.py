@@ -9,7 +9,7 @@ import re
 TASK_RAG_SOURCE = {
     "general_fact_null": "wiki",
     "other_null": "wiki",
-    "famous_bn_fact_null": "famous_bn",
+    "famous_bn_fact_null": "wiki",
     "idiom_meaning_null": "idioms",
     "literal_meaning_null": "literal",
     "bangla_grammar": "grammar",
@@ -25,9 +25,7 @@ TASK_RAG_SOURCE = {
 }
 
 # If the preferred source index is missing, try this fallback (still typed).
-TASK_RAG_FALLBACK = {
-    "famous_bn_fact_null": "wiki",
-}
+TASK_RAG_FALLBACK = {}
 
 # Never retrieve for these even if a source mapping exists.
 RAG_SKIP_TASKS = frozenset(

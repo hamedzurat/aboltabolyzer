@@ -10,7 +10,7 @@
 #   just first-run      # setup → preprocess → predict
 
 [runtime]
-hardware_profile = "16gb"   # ← set this once per machine ("16gb" | "8gb")
+hardware_profile = "8gb"          # ← set this once per machine ("16gb" | "8gb")
 float32_matmul_precision = "high"
 allow_tf32 = true
 
@@ -40,16 +40,16 @@ write_debug = true
 [rag]
 corpus_root = "corpus"
 index_root = "indexes"
-sources = ["wiki", "famous_bn", "idioms", "literal", "grammar"]
+sources = ["wiki", "idioms", "literal", "grammar"]
 exemplar_index_path = "indexes/exemplar_index.pkl"
 model_name = "BAAI/bge-m3"
 index_dtype = "float16"
 top_k = 5
 max_evidence_tokens = 512
 similarity_threshold = 0.5
-query_mode = "prompt"          # "prompt" | "prompt_response"
-batch_size = 32                # overridden per profile
-query_batch_size = 32          # overridden per profile
+query_mode = "prompt"                                           # "prompt" | "prompt_response"
+batch_size = 32                                                 # overridden per profile
+query_batch_size = 32                                           # overridden per profile
 max_seq_length = 512
 
 [gemma]
@@ -82,7 +82,8 @@ query_batch_size = 128
 # ── Profile: 8GB / small GPUs — ungated Qwen3 thinking model ─────────────────
 
 [hardware_profiles.8gb.gemma]
-model_name = "Qwen/Qwen3-1.7B"
+# model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+model_name = "Qwen/Qwen2.5-7B-Instruct"
 model_loader = "causal_lm"
 load_in = "4bit"
 device_map = "cuda:0"

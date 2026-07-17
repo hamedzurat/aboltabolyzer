@@ -71,20 +71,20 @@ If `context` is `[NULL]`:
 
 RAG is skipped when original context exists. RAG is also skipped for math, calendar, and translation tasks.
 
-| `task_type`                      | RAG? | Source                               |
-| -------------------------------- | ---- | ------------------------------------ |
-| `context_grounded_fact`          | no   | original context                     |
-| `context_grounded_other`         | no   | original context                     |
-| `famous_bn_fact_context`         | no   | original context                     |
-| `general_fact_null`              | yes  | `corpus/wiki/`                       |
-| factual `other_null`             | yes  | `corpus/wiki/`                       |
-| non-factual `other_null`         | no   | none                                 |
-| `famous_bn_fact_null`            | yes  | `corpus/famous_bn/`, fallback `wiki` |
-| `idiom_meaning_null`             | yes  | `corpus/idioms/`                     |
-| `literal_meaning_null`           | yes  | `corpus/literal/`                    |
-| `bangla_grammar`                 | yes  | `corpus/grammar/`                    |
-| `math_*` / `calendar_arithmetic` | no   | none                                 |
-| `translation_or_bilingual`       | no   | none                                 |
+| `task_type`                      | RAG? | Source            |
+| -------------------------------- | ---- | ----------------- |
+| `context_grounded_fact`          | no   | original context  |
+| `context_grounded_other`         | no   | original context  |
+| `famous_bn_fact_context`         | no   | original context  |
+| `general_fact_null`              | yes  | `corpus/wiki/`    |
+| factual `other_null`             | yes  | `corpus/wiki/`    |
+| non-factual `other_null`         | no   | none              |
+| `famous_bn_fact_null`            | yes  | `corpus/wiki/`    |
+| `idiom_meaning_null`             | yes  | `corpus/idioms/`  |
+| `literal_meaning_null`           | yes  | `corpus/literal/` |
+| `bangla_grammar`                 | yes  | `corpus/grammar/` |
+| `math_*` / `calendar_arithmetic` | no   | none              |
+| `translation_or_bilingual`       | no   | none              |
 
 If an index is missing, the row keeps `[NULL]` evidence and records:
 
@@ -325,8 +325,7 @@ task_type = famous_bn_fact_null
 Evidence:
 
 ```text
-preferred source = famous_bn
-fallback source = wiki
+preferred source = wiki
 query = "রবীন্দ্রনাথ কত সালে জন্মগ্রহণ করেন?"
 ```
 

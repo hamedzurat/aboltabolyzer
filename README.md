@@ -84,17 +84,15 @@ flowchart TD
 
     D -->|"other_null + not factual prompt"| F2["No RAG<br/>rag_skipped_reason = other_null_not_factual"]
 
-    D -->|"NULL + RAG allowed<br/>general_fact_null · factual other_null<br/>famous_bn · idiom · literal · grammar"| G{"Resolve typed source<br/>TASK_RAG_SOURCE<br/>+ famous_bn → wiki fallback<br/>only if indexes/*.pkl exists"}
+    D -->|"NULL + RAG allowed<br/>general_fact_null · factual other_null · famous_bn_fact_null<br/>idiom · literal · grammar"| G{"Resolve typed source<br/>TASK_RAG_SOURCE<br/>only if indexes/*.pkl exists"}
 
-    G -->|"general_fact_null / factual other_null"| H1["source = wiki"]
-    G -->|"famous_bn_fact_null"| H2["source = famous_bn<br/>else wiki"]
+    G -->|"general_fact_null / factual other_null / famous_bn_fact_null"| H1["source = wiki"]
     G -->|"idiom_meaning_null"| H3["source = idioms"]
     G -->|"literal_meaning_null"| H4["source = literal"]
     G -->|"bangla_grammar"| H5["source = grammar"]
-    G -->|"preferred + fallback missing"| K["Skip retrieval<br/>rag_skipped_reason = index_missing:source<br/>context stays [NULL]"]
+    G -->|"index missing"| K["Skip retrieval<br/>rag_skipped_reason = index_missing:source<br/>context stays [NULL]"]
 
     H1 --> I["BGE-M3 dense retrieve<br/>query = prompt_bn default<br/>top_k · similarity_threshold<br/>truncate max_evidence_tokens"]
-    H2 --> I
     H3 --> I
     H4 --> I
     H5 --> I
@@ -132,21 +130,21 @@ flowchart TD
 
 ### Task → corpus source
 
-| `task_type`                | Evidence                    | Corpus source                 |
-| -------------------------- | --------------------------- | ----------------------------- |
-| `context_grounded_*`       | Original context only       | —                             |
-| `famous_bn_fact_context`   | Original context only       | —                             |
-| `general_fact_null`        | Typed RAG                   | `wiki`                        |
-| `other_null` (factual)     | Typed RAG                   | `wiki`                        |
-| `other_null` (not factual) | No RAG                      | —                             |
-| `famous_bn_fact_null`      | Typed RAG                   | `famous_bn` → fallback `wiki` |
-| `idiom_meaning_null`       | Typed RAG when index exists | `idioms`                      |
-| `literal_meaning_null`     | Typed RAG when index exists | `literal`                     |
-| `bangla_grammar`           | Typed RAG when index exists | `grammar`                     |
-| `math_*` / `calendar_*`    | No RAG — LLM calculates     | —                             |
-| `translation_or_bilingual` | No RAG — bilingual judge    | —                             |
+| `task_type`                | Evidence                    | Corpus source |
+| -------------------------- | --------------------------- | ------------- |
+| `context_grounded_*`       | Original context only       | —             |
+| `famous_bn_fact_context`   | Original context only       | —             |
+| `general_fact_null`        | Typed RAG                   | `wiki`        |
+| `other_null` (factual)     | Typed RAG                   | `wiki`        |
+| `other_null` (not factual) | No RAG                      | —             |
+| `famous_bn_fact_null`      | Typed RAG                   | `wiki`        |
+| `idiom_meaning_null`       | Typed RAG when index exists | `idioms`      |
+| `literal_meaning_null`     | Typed RAG when index exists | `literal`     |
+| `bangla_grammar`           | Typed RAG when index exists | `grammar`     |
+| `math_*` / `calendar_*`    | No RAG — LLM calculates     | —             |
+| `translation_or_bilingual` | No RAG — bilingual judge    | —             |
 
-Empty corpus folders are fine: `just make-rag` skips them, and predict records `index_missing:<source>`. Wiki is filled by `just download-corpus`; idiom / literal / famous_bn / grammar need curated `*.jsonl`.
+Empty corpus folders are fine: `just make-rag` skips them, and predict records `index_missing:<source>`. Wiki is filled by `just download-corpus`; idiom / literal / grammar need curated `*.jsonl`.
 
 ---
 
@@ -321,7 +319,7 @@ Token budget is dynamic: hard cases can use the configured cap, while simple lex
 
 ## Typed RAG corpora
 
-Five typed sources: `wiki`, `famous_bn`, `idioms`, `literal`, `grammar`. Empty folders are fine (`index_missing:<source>`).
+Four typed sources: `wiki`, `idioms`, `literal`, `grammar`. Empty folders are fine (`index_missing:<source>`).
 
 ```bash
 just download-corpus                 # → corpus/wiki/wiki_bn.jsonl
@@ -332,7 +330,7 @@ just make-rag                        # all non-empty sources
 just make-rag --source wiki
 ```
 
-`sort-corpus` uses the active verifier model from `configs/config.toml`. It writes useful rows under `corpus/wiki`, `corpus/famous_bn`, `corpus/idioms`, `corpus/literal`, or `corpus/grammar`; skipped/noisy rows go under `generated/corpus_sort_skipped/`.
+`sort-corpus` uses the active verifier model from `configs/config.toml`. It writes useful rows under `corpus/wiki`, `corpus/idioms`, `corpus/literal`, or `corpus/grammar`; skipped/noisy rows go under `generated/corpus_sort_skipped/`.
 
 Layout, JSONL examples, writing guidance, and starter filenames: [`corpus/README.md`](corpus/README.md).
 
@@ -511,7 +509,7 @@ Label file: `dataset/analysis/testset_audit_200.csv` — fill `gold_label` (`1` 
 ## Known weaknesses
 
 1. **No labeled gold for the 200-row audit set yet** — fill `dataset/analysis/testset_audit_200.csv` before tuning thresholds.
-2. **Typed lexical corpora are empty by default** — idiom / literal / grammar / famous_bn folders need curated `*.jsonl` before those indexes help.
+2. **Typed lexical corpora are empty by default** — idiom / literal / grammar folders need curated `*.jsonl` before those indexes help.
 3. **Math/calendar rows are LLM-only** — no separate symbolic solver; Gemma/Qwen judges via task prompts (RAG skipped).
 4. **8GB uses a smaller verifier** — `Qwen/Qwen3-1.7B` instead of Gemma 4; fast F/H uses non-thinking chat mode and the explicit think pass uses thinking mode.
 5. **Evidence cache stickiness** — after corpus/index/config RAG changes, run `just clean-rag` before `just predict`.
@@ -522,5 +520,5 @@ Label file: `dataset/analysis/testset_audit_200.csv` — fill `gold_label` (`1` 
 ## Roadmap
 
 - [ ] Label the 200-row audit set and tune per-task thresholds if needed
-- [ ] Fill idiom / literal / famous-fact / grammar corpus tables
+- [ ] Fill idiom / literal / grammar corpus tables
 - [ ] Kaggle Dataset bundle + offline submit notebook

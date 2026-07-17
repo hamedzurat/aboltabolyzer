@@ -14,7 +14,6 @@ from src.tui import banner, console, done_panel, info, kv_table, ok, pipeline_pr
 
 DEFAULT_RAG_SOURCES = {
     "wiki": {"corpus_dir": "corpus/wiki", "index_path": "indexes/wiki.pkl"},
-    "famous_bn": {"corpus_dir": "corpus/famous_bn", "index_path": "indexes/famous_bn.pkl"},
     "idioms": {"corpus_dir": "corpus/idioms", "index_path": "indexes/idioms.pkl"},
     "literal": {"corpus_dir": "corpus/literal", "index_path": "indexes/literal.pkl"},
     "grammar": {"corpus_dir": "corpus/grammar", "index_path": "indexes/grammar.pkl"},

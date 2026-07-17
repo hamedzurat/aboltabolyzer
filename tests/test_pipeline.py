@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.sort_corpus import heuristic_bucket, parse_bucket
+from scripts.sort_corpus import parse_bucket
 from src.config_utils import resolve_quantization_mode, resolve_section, validate_config
 from src.evidence_policy import (
     map_think_verdict,
@@ -42,15 +42,10 @@ def test_clean_text():
     assert clean_text("[NULL]") == "[NULL]"
 
 
-def test_sort_corpus_bucket_parser_and_heuristics():
-    assert parse_bucket("bucket: famous_bn") == "famous_bn"
+def test_sort_corpus_bucket_parser():
+    assert parse_bucket("bucket: famous_bn") == "wiki"
     assert parse_bucket("IDIOM") == "idioms"
     assert parse_bucket("discard this") == "skip"
-
-    assert heuristic_bucket("সমাস: দুই বা ততোধিক পদের মিলনে একটি পদ গঠিত হলে") == "grammar"
-    assert heuristic_bucket("জো-হুকুমের দল: আজ্ঞাবহ লোকজন বোঝায়") == "idioms"
-    assert heuristic_bucket("শাব্দিক অর্থ: নববর্ষ মানে নতুন বছর") == "literal"
-    assert heuristic_bucket("রবীন্দ্রনাথ ঠাকুর ১৮৬১ সালে জন্মগ্রহণ করেন") == "famous_bn"
 
 
 def test_router_classifies_core_task_types():
@@ -82,7 +77,7 @@ def test_rag_skip_policy_by_task_type():
 def test_rag_source_mapping_by_task_type():
     assert rag_source_for_task("general_fact_null") == "wiki"
     assert rag_source_for_task("other_null") == "wiki"
-    assert rag_source_for_task("famous_bn_fact_null") == "famous_bn"
+    assert rag_source_for_task("famous_bn_fact_null") == "wiki"
     assert rag_source_for_task("idiom_meaning_null") == "idioms"
     assert rag_source_for_task("literal_meaning_null") == "literal"
     assert rag_source_for_task("bangla_grammar") == "grammar"
@@ -474,14 +469,20 @@ def test_repo_config_profiles_resolve_complete_settings():
         config = tomllib.load(f)
 
     validate_config(config)
-    assert describe_active_profile(config)["verifier_model"] == "google/gemma-4-E4B-it"
+    active_profile = config["runtime"]["hardware_profile"]
+    snap = describe_active_profile(config)
+    expected_8gb_model = config["hardware_profiles"]["8gb"]["gemma"]["model_name"]
+    if active_profile == "16gb":
+        assert snap["verifier_model"] == "google/gemma-4-E4B-it"
+    elif active_profile == "8gb":
+        assert snap["verifier_model"] == expected_8gb_model
     assert config["data"]["processed_dir"] == "generated/processed"
     assert config["predict"]["llm_predictions_path"].startswith("generated/processed/")
 
     config["runtime"]["hardware_profile"] = "8gb"
     validate_config(config)
     snap = describe_active_profile(config)
-    assert snap["verifier_model"] == "Qwen/Qwen3-1.7B"
+    assert snap["verifier_model"] == expected_8gb_model
     assert snap["enable_think_pass"] is True
     assert snap["rag_batch_size"] == 32
 

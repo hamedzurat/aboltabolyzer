@@ -9,11 +9,10 @@ Each subdirectory is one retrieval source. Put `*.jsonl` files with one JSON obj
 
 ## Sources
 
-The five sources separate cases where retrieval means different things. Do not split further until the labeled audit set shows a repeated failure mode. If you do not have curated material yet, leave a source empty rather than filling it with noisy mixed documents — `just make-rag` skips empty folders and prediction records `index_missing:<source>`.
+The four sources separate cases where retrieval means different things. Do not split further until the labeled audit set shows a repeated failure mode. If you do not have curated material yet, leave a source empty rather than filling it with noisy mixed documents — `just make-rag` skips empty folders and prediction records `index_missing:<source>`.
 
 ```text
-corpus/wiki/        # general facts (Bengali Wikipedia)
-corpus/famous_bn/   # Bangladesh history / literature / geography
+corpus/wiki/        # general facts (Bengali Wikipedia + Bangladesh history / literature / geography)
 corpus/idioms/      # ভাবার্থ
 corpus/literal/     # শাব্দিক অর্থ
 corpus/grammar/     # Bangla grammar
@@ -23,19 +22,18 @@ corpus/grammar/     # Bangla grammar
 indexes/<source>.pkl
 ```
 
-| Source | Role |
-| --- | --- |
-| `wiki` | Broad factual lookup |
-| `famous_bn` | High-value Bangladesh/literature facts that often get swapped |
-| `idioms` | Figurative phrase meanings (ভাবার্থ) |
-| `literal` | Literal/compositional meanings (শাব্দিক অর্থ) |
-| `grammar` | Short Bangla grammar rules and examples |
+| Source    | Role                                                                                          |
+| --------- | --------------------------------------------------------------------------------------------- |
+| `wiki`    | Broad factual lookup (including general science/global facts and Bangladesh/literature facts) |
+| `idioms`  | Figurative phrase meanings (ভাবার্থ)                                                          |
+| `literal` | Literal/compositional meanings (শাব্দিক অর্থ)                                                 |
+| `grammar` | Short Bangla grammar rules and examples                                                       |
 
 Task → source mapping lives in `src/evidence_policy.py`. Config lists sources as:
 
 ```toml
 [rag]
-sources = ["wiki", "famous_bn", "idioms", "literal", "grammar"]
+sources = ["wiki", "idioms", "literal", "grammar"]
 ```
 
 ## Build
@@ -59,11 +57,6 @@ Use compact, retrieval-friendly notes: one fact, one meaning, or one small rule/
 {"text": "পদ্মা নদী বাংলাদেশের অন্যতম প্রধান নদী। গঙ্গা নদী বাংলাদেশে প্রবেশ করার পর পদ্মা নামে পরিচিত।"}
 {"text": "সুন্দরবন বাংলাদেশ ও ভারতের পশ্চিমবঙ্গে অবস্থিত একটি বৃহৎ ম্যানগ্রোভ বন। রয়েল বেঙ্গল টাইগারের জন্য সুন্দরবন বিখ্যাত।"}
 {"text": "জাতিসংঘ ১৯৪৫ সালে প্রতিষ্ঠিত হয়। এর সদর দপ্তর যুক্তরাষ্ট্রের নিউ ইয়র্ক শহরে অবস্থিত।"}
-```
-
-### `corpus/famous_bn/bangladesh_facts.jsonl`
-
-```jsonl
 {"text": "বঙ্গবন্ধু শেখ মুজিবুর রহমান বাংলাদেশের স্বাধীনতা আন্দোলনের প্রধান নেতা। তিনি ১৯২০ সালের ১৭ মার্চ টুঙ্গিপাড়ায় জন্মগ্রহণ করেন।"}
 {"text": "বাংলাদেশের স্বাধীনতা দিবস ২৬ মার্চ। বিজয় দিবস ১৬ ডিসেম্বর। এই দুই জাতীয় দিবসের তারিখ আলাদা।"}
 {"text": "অপারেশন সার্চলাইট ১৯৭১ সালের ২৫ মার্চ রাতে পাকিস্তানি সেনাবাহিনীর সামরিক অভিযান। মুজিবনগর সরকার গঠিত হয় ১৯৭১ সালের ১০ এপ্রিল।"}
@@ -82,9 +75,9 @@ Use compact, retrieval-friendly notes: one fact, one meaning, or one small rule/
 ### `corpus/literal/literal_meanings.jsonl`
 
 ```jsonl
-{"text": "ফ্ল্যাট শব্দের শাব্দিক অর্থ চ্যাপ্টা, সমতল বা সমান পৃষ্ঠবিশিষ্ট। বাসার অর্থে ফ্ল্যাট আলাদা ব্যবহার।"}
+{"text": "ফ্ল্যাট শব্দের শাব্দিক অর্থ চ্যাপ্টা, সমতল বা সমান পৃষ্ঠা। বাসার অর্থে ফ্ল্যাট আলাদা ব্যবহার।"}
 {"text": "জলহস্তী শব্দের শাব্দিক অর্থ জল বা পানির সঙ্গে সম্পর্কিত হস্তী; প্রচলিত অর্থে এটি হিপোপটেমাস প্রাণীকে বোঝায়।"}
-{"text": "দূরবীন শব্দের শাব্দিক অর্থ দূরের বস্তু দেখার যন্ত্র। দূর + বীন বা দর্শন অর্থের সমন্বয়ে শব্দটি গঠিত।"}
+{"text": "দূরবীন শব্দের শাব্দিক অর্থ দূরের বস্তু দেখার যন্ত্র। দূর + বীন বা दर्शन অর্থের সমন্বয়ে শব্দটি গঠিত।"}
 {"text": "নববর্ষ শব্দের শাব্দিক অর্থ নতুন বছর। নব অর্থ নতুন এবং বর্ষ অর্থ বছর।"}
 ```
 
@@ -119,21 +112,10 @@ Example `corpus/grammar/karok.jsonl`:
 
 ```text
 corpus/wiki/wiki_bn.jsonl
-corpus/famous_bn/bangladesh_history.jsonl
-corpus/famous_bn/bangla_literature.jsonl
 corpus/idioms/bangla_idioms.jsonl
 corpus/literal/literal_meanings.jsonl
 corpus/grammar/somash.jsonl       # সমাস, ব্যাসবাক্য, examples
 corpus/grammar/sandhi.jsonl       # স্বরসন্ধি / ব্যঞ্জনসন্ধি rules
 corpus/grammar/karok.jsonl        # কারক, বিভক্তি
 corpus/grammar/parts_of_speech.jsonl
-```
-
-## Legacy files
-
-Migrate flat legacy files if needed:
-
-```bash
-mv corpus/facts.jsonl corpus/wiki/
-mv corpus/bcs_facts.jsonl corpus/famous_bn/
 ```

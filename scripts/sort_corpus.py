@@ -1,11 +1,17 @@
+# ruff: noqa: E402
 import argparse
 import json
 import os
 import re
 import sys
+import time
 import tomllib
+import warnings
 from collections import Counter
 from pathlib import Path
+
+# Suppress PyTorch/bitsandbytes FutureWarnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import torch
 
@@ -15,12 +21,12 @@ from src.config_utils import describe_active_profile, validate_config
 from src.llm_verifier import GemmaVerifier
 from src.tui import banner, count_table, done_panel, info, pipeline_progress, warn
 
-BUCKETS = ("wiki", "famous_bn", "idioms", "literal", "grammar", "skip")
+BUCKETS = ("wiki", "idioms", "literal", "grammar", "skip")
 
 BUCKET_ALIASES = {
-    "famous": "famous_bn",
-    "famous-bn": "famous_bn",
-    "famous_bn": "famous_bn",
+    "famous": "wiki",
+    "famous-bn": "wiki",
+    "famous_bn": "wiki",
     "idiom": "idioms",
     "idioms": "idioms",
     "literal": "literal",
@@ -31,35 +37,6 @@ BUCKET_ALIASES = {
     "discard": "skip",
     "none": "skip",
 }
-
-GRAMMAR_PATTERNS = (
-    "সমাস",
-    "সন্ধি",
-    "কারক",
-    "বিভক্তি",
-    "ব্যাসবাক্য",
-    "ধাতু",
-    "ক্রিয়া",
-    "ক্রিয়া",
-    "বিশেষ্য",
-    "বিশেষণ",
-)
-IDIOM_PATTERNS = ("ভাবার্থ", "বাগধারা", "প্রবাদ", "লোকোক্তি")
-LITERAL_PATTERNS = ("শাব্দিক অর্থ", "আক্ষরিক অর্থ", "literal meaning")
-FAMOUS_BN_PATTERNS = (
-    "রবীন্দ্রনাথ",
-    "নজরুল",
-    "শেখ মুজিব",
-    "মুজিবনগর",
-    "স্বাধীনতা দিবস",
-    "বিজয় দিবস",
-    "বিজয় দিবস",
-    "অপারেশন সার্চলাইট",
-    "বাংলাদেশ",
-    "ঢাকা বিশ্ববিদ্যালয়",
-    "ঢাকা বিশ্ববিদ্যালয়",
-    "সুন্দরবন",
-)
 
 
 def text_from_obj(obj, text_keys):
@@ -81,40 +58,29 @@ def parse_bucket(output):
     return None
 
 
-def heuristic_bucket(text):
-    text = str(text)
-    lower = text.lower()
-    if any(pattern in text for pattern in GRAMMAR_PATTERNS):
-        return "grammar"
-    if any(pattern in text for pattern in LITERAL_PATTERNS) or "শাব্দিক" in text:
-        return "literal"
-    if any(pattern in text for pattern in IDIOM_PATTERNS) or re.search(
-        r"[^।:]{2,30}:\s*[^।]+", text
-    ):
-        if any(word in text for word in ("অর্থ", "বোঝায়", "বুঝায়", "মানে")):
-            return "idioms"
-    if any(pattern in text for pattern in FAMOUS_BN_PATTERNS):
-        return "famous_bn"
-    if len(text.split()) >= 5:
-        return "wiki"
-    if "literal" in lower:
-        return "literal"
-    return "skip"
-
-
 def corpus_sort_prompt(text):
+    # Truncate text to avoid token limits on very long Wikipedia pages
+    truncated_text = str(text)[:1500]
     return (
-        "Sort this Bangla corpus line into one bucket for a hallucination detector.\n"
-        "Buckets:\n"
-        "wiki = broad factual encyclopedia facts, not specifically the special buckets\n"
-        "famous_bn = Bangladesh history, Bangla literature, famous Bangladeshi/Bengali facts\n"
-        "idioms = Bengali idiom/proverb/ভাবার্থ/figurative phrase meanings\n"
-        "literal = শাব্দিক or আক্ষরিক word meanings\n"
-        "grammar = Bangla grammar rules/examples: সমাস, সন্ধি, কারক, বিভক্তি, ব্যাসবাক্য, ধাতু\n"
-        "skip = noisy, malformed, too vague, duplicate header, not useful as evidence\n"
-        "Return only one bucket name.\n"
-        f"Text:\n{text}\n"
-        "bucket:"
+        "You are an expert data cleaner and annotator. Your goal is to convert the input text into a list of clean, sorted, atomic, and self-contained factual statements in Bengali, and classify them into their correct category.\n\n"
+        "Instructions for Rewording:\n"
+        "1. Resolve Pronouns & Context: Replace vague words (e.g., 'তিনি', 'ওনার', 'এটি', 'সেখানে') with the actual names, entities, or concepts they refer to. Every generated fact must be fully understandable on its own without needing external context.\n"
+        "2. Prepend Story/Book Context: If the text is from a story, book, or poem (like 'তোতা-কাহিনি' or 'রবীন্দ্রনাথ ঠাকুরের কবিতা'), explicitly add this context to the fact (e.g., 'রবীন্দ্রনাথ ঠাকুরের তোতা-কাহিনি গল্পে রাজা পাখিটিকে শিক্ষা দেওয়ার নির্দেশ দেন।').\n"
+        "3. Convert Questions/Blanks: Turn questions (e.g., 'পদ্মা নদীর শাখা নদী কোনটি?') and fill-in-the-blanks (e.g., 'বাংলাদেশ ______ সালে অলিম্পিকে অংশ নেয়') into direct, declarative facts (e.g., 'পদ্মা নদীর শাখা নদী হলো গড়াই ও ধলেশ্বরী।' or 'বাংলাদেশ ১৯৮৪ সালে অলিম্পিকে অংশগ্রহণ করে।').\n"
+        "4. Handle Long/Messy Paragraphs: If the input is a long article or contains multiple paragraphs, extract all key factual statements (up to 5-10 facts). Split them so each fact is a single, short, atomic sentence.\n"
+        "5. Output Format: Return a list of reworded facts, with one fact per line prefixed by a dash (-). If it is a clean single fact, output just that one fact.\n\n"
+        "Categories:\n"
+        "- wiki: General facts (science, global history/geography, global events), Bangladesh history, Bangla literature, Bangladeshi geography, famous Bengali personalities/events, and Bengali literary stories (e.g. তোতা-কাহিনি)\n"
+        "- idioms: Bengali idioms, proverbs, or figurative meanings (ভাবার্থ, বাগধারা)\n"
+        "- literal: Word translation or literal meanings (শাব্দিক অর্থ, আক্ষরিক অর্থ)\n"
+        "- grammar: Bangla grammar rules, definitions, and grammatical examples (সমাস, সন্ধি, কারক)\n"
+        "- skip: Math/equations/numbers, English language, questions, code, noisy or low-quality text\n\n"
+        "Output Format:\n"
+        "bucket: <category>\n"
+        "reworded:\n"
+        "- <Factual Sentence 1>\n"
+        "- <Factual Sentence 2> (if multiple)\n\n"
+        f"Input Text: {truncated_text}\n"
     )
 
 
@@ -140,7 +106,7 @@ class CorpusSorter:
         with torch.inference_mode():
             outputs = self.verifier.model.generate(
                 **inputs,
-                max_new_tokens=8,
+                max_new_tokens=1024,
                 do_sample=False,
                 temperature=None,
                 top_p=None,
@@ -150,7 +116,36 @@ class CorpusSorter:
             outputs[0][input_len:],
             skip_special_tokens=True,
         )
-        return parse_bucket(generated), generated.strip()
+
+        # Strip think block if present (DeepSeek-R1 models write reasoning inside <think>...</think>)
+        cleaned_generated = re.sub(
+            r"<think>.*?(?:</think>|$)", "", generated, flags=re.DOTALL
+        ).strip()
+        # Strip markdown code blocks/fences (e.g. ```yaml or ```)
+        cleaned_generated = re.sub(r"```[A-Za-z0-9_-]*", "", cleaned_generated).strip()
+
+        bucket = None
+        reworded = text
+
+        bucket_match = re.search(r"bucket\s*[:=]\s*(\w+)", cleaned_generated, re.IGNORECASE)
+        if bucket_match:
+            bucket = parse_bucket(bucket_match.group(1))
+        else:
+            bucket = parse_bucket(cleaned_generated)
+
+        text_match = re.search(
+            r"reworded\s*[:=]\s*(.+)", cleaned_generated, re.IGNORECASE | re.DOTALL
+        )
+        if not text_match:
+            text_match = re.search(
+                r"text\s*[:=]\s*(.+)", cleaned_generated, re.IGNORECASE | re.DOTALL
+            )
+        if text_match:
+            reworded = text_match.group(1).strip()
+            # Remove any trailing incomplete UTF-8 characters decoded as \ufffd
+            reworded = reworded.replace("\ufffd", "").strip()
+
+        return bucket, reworded, generated.strip()
 
 
 def iter_jsonl(path, text_keys):
@@ -190,6 +185,7 @@ class JsonlWriters:
         self.annotate = annotate
         self.skipped_path = Path(skipped_path)
         self.handles = {}
+        self.last_flush_time = time.time()
 
     def path_for_bucket(self, bucket):
         if bucket == "skip":
@@ -206,6 +202,12 @@ class JsonlWriters:
         if self.annotate:
             output.update(meta)
         self.handles[bucket].write(json.dumps(output, ensure_ascii=False) + "\n")
+
+        current_time = time.time()
+        if current_time - self.last_flush_time >= 60.0:
+            for handle in self.handles.values():
+                handle.flush()
+            self.last_flush_time = current_time
 
     def close(self):
         for handle in self.handles.values():
@@ -239,6 +241,13 @@ def run_sort(args):
             skipped_path=skipped_path,
         )
 
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / "sort_corpus_debug.jsonl"
+    log_mode = "a" if args.append else "w"
+    log_file = open(log_path, log_mode, encoding="utf-8")
+    last_log_flush = time.time()
+
     total_rows = count_jsonl_rows(input_path, args.limit)
     counts = Counter()
     invalid_outputs = 0
@@ -251,18 +260,50 @@ def run_sort(args):
             ):
                 if args.limit and row_idx > args.limit:
                     break
+
+                fact_lines = []
                 if row_error:
                     bucket = "skip"
+                    reworded = text
                     raw_output = row_error
                 else:
-                    bucket, raw_output = sorter.classify(text)
+                    bucket, reworded, raw_output = sorter.classify(text)
                     if bucket is None:
                         invalid_outputs += 1
-                        bucket = heuristic_bucket(text) if args.fallback == "heuristic" else "skip"
+                        bucket = "skip"
 
                 if bucket not in BUCKETS:
                     bucket = "skip"
                 counts[bucket] += 1
+
+                # Extract fact lines if valid
+                if not row_error and bucket != "skip" and reworded:
+                    fact_lines = [
+                        f.strip()
+                        for f in reworded.split("\n")
+                        if f.strip()
+                        and not f.strip().lower().startswith("reworded")
+                        and not f.strip().lower().startswith("bucket")
+                        and not f.strip().lower().startswith("category")
+                    ]
+                    # Clean bullet points/numbered prefixes
+                    fact_lines = [re.sub(r"^[-*•\d.]+\s*", "", f).strip() for f in fact_lines]
+                    fact_lines = [f for f in fact_lines if f]
+
+                # Write detailed logs
+                log_entry = {
+                    "line_no": line_no,
+                    "input_text": text,
+                    "parsed_bucket": bucket,
+                    "reworded_facts": fact_lines if fact_lines else [reworded],
+                    "raw_model_output": raw_output,
+                    "error": row_error or None,
+                }
+                log_file.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+                current_time = time.time()
+                if current_time - last_log_flush >= 60.0:
+                    log_file.flush()
+                    last_log_flush = current_time
 
                 if writers is not None:
                     meta = {
@@ -270,17 +311,40 @@ def run_sort(args):
                         "_sort_line": line_no,
                         "_sort_model_output": raw_output,
                     }
-                    writers.write(bucket, obj, meta)
+                    if bucket != "skip" and fact_lines:
+                        for fact in fact_lines:
+                            obj_to_write = dict(obj)
+                            for key in text_keys:
+                                if key in obj_to_write:
+                                    obj_to_write[key] = fact
+                                    break
+                            writers.write(bucket, obj_to_write, meta)
+                    else:
+                        writers.write(bucket, obj, meta)
 
-                progress.update(task, description=f"Classifying · {bucket}")
+                gpu_status = ""
+                if torch.cuda.is_available():
+                    allocated_gb = torch.cuda.memory_allocated() / (1024**3)
+                    reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+                    gpu_status = f" | GPU VRAM: {allocated_gb:.1f}/{reserved_gb:.1f}GB"
+
+                stats_str = " | ".join(f"{b}: {counts[b]}" for b in BUCKETS if counts[b] > 0)
+                desc = (
+                    f"Classifying | {stats_str}{gpu_status}"
+                    if stats_str
+                    else f"Classifying{gpu_status}"
+                )
+
+                progress.update(task, description=desc)
                 progress.advance(task)
     finally:
+        log_file.close()
         if writers is not None:
             writers.close()
 
     count_table("Sorted corpus lines", {k: int(v) for k, v in counts.items()})
     if invalid_outputs:
-        warn(f"LLM returned {invalid_outputs} unparseable bucket(s); fallback={args.fallback}")
+        warn(f"LLM returned {invalid_outputs} unparseable bucket(s)")
 
     lines = [f"{bucket}: {counts[bucket]}" for bucket in BUCKETS if counts[bucket]]
     if not args.dry_run:
@@ -293,6 +357,13 @@ def tui_args(parser):
     import questionary
 
     input_path = questionary.path("Input .jsonl file:").ask()
+    if input_path and os.path.exists(input_path):
+        try:
+            total_rows = count_jsonl_rows(input_path)
+            info(f"Selected file: {Path(input_path).name} ({total_rows} rows found)")
+        except Exception as e:
+            warn(f"Could not read file stats: {e}")
+
     output_root = questionary.text("Corpus root:", default="corpus").ask()
     output_name = questionary.text(
         "Output filename:",
@@ -328,12 +399,20 @@ def build_parser():
     parser.add_argument("--append", action="store_true")
     parser.add_argument("--annotate", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--fallback", choices=["heuristic", "skip"], default="heuristic")
+    parser.add_argument(
+        "--fallback",
+        choices=["skip"],
+        default="skip",
+        help="Fallback option when LLM classification fails (default: skip)",
+    )
     parser.add_argument("--tui", action="store_true", help="Prompt for options interactively")
     return parser
 
 
 def main():
+    import warnings
+
+    warnings.filterwarnings("ignore", category=FutureWarning)
     parser = build_parser()
     args = parser.parse_args()
     if args.tui or not args.input:

@@ -85,7 +85,7 @@ def main():
     for i, model_name in enumerate(names, start=1):
         local_dir = os.path.join(args.models_dir, model_name.replace("/", "__"))
         info(f"[{i}/{len(names)}] {model_name}")
-        snapshot_download(repo_id=model_name, local_dir=local_dir)
+        snapshot_download(repo_id=model_name, local_dir=local_dir, token=False)
         ok(f"Saved → {local_dir}")
 
     done_panel(
