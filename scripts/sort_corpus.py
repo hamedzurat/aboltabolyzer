@@ -62,7 +62,7 @@ def corpus_sort_prompt(text):
     # Truncate text to avoid token limits on very long Wikipedia pages
     truncated_text = str(text)[:1500]
     return (
-        "You are an expert data cleaner and annotator. Your goal is to convert the input text into a list of clean, sorted, atomic, and self-contained factual statements in Bengali, and classify them into their correct category.\n\n"
+        "You are an expert data cleaner and annotator. Your goal is to convert the input text into a list of clean, sorted, atomic, and self-contained factual statements (primarily in Bengali, but you may keep or translate English sentences that contain valid facts), and classify them into their correct category.\n\n"
         "Instructions for Rewording:\n"
         "1. Resolve Pronouns & Context: Replace vague words (e.g., 'তিনি', 'ওনার', 'এটি', 'সেখানে') with the actual names, entities, or concepts they refer to. Every generated fact must be fully understandable on its own without needing external context.\n"
         "2. Prepend Story/Book Context: If the text is from a story, book, or poem (like 'তোতা-কাহিনি' or 'রবীন্দ্রনাথ ঠাকুরের কবিতা'), explicitly add this context to the fact (e.g., 'রবীন্দ্রনাথ ঠাকুরের তোতা-কাহিনি গল্পে রাজা পাখিটিকে শিক্ষা দেওয়ার নির্দেশ দেন।').\n"
@@ -74,7 +74,7 @@ def corpus_sort_prompt(text):
         "- idioms: Bengali idioms, proverbs, or figurative meanings (ভাবার্থ, বাগধারা)\n"
         "- literal: Word translation or literal meanings (শাব্দিক অর্থ, আক্ষরিক অর্থ)\n"
         "- grammar: Bangla grammar rules, definitions, and grammatical examples (সমাস, সন্ধি, কারক)\n"
-        "- skip: Math/equations/numbers, English language, questions, code, noisy or low-quality text\n\n"
+        "- skip: Pure math problems/equations/number-puzzles (do NOT skip facts that just contain dates, years, or quantities), questions or fill-in-the-blanks that do not provide an answer/cannot be resolved to a fact, programming code, and noisy/unreadable/low-quality text (do NOT skip English sentences if they express a valid fact; classify them to their correct category instead)\n\n"
         "Output Format:\n"
         "bucket: <category>\n"
         "reworded:\n"
