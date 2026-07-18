@@ -16,7 +16,7 @@ allow_tf32 = true
 
 [predict]
 use_checkpoints = true
-force_recompute = true
+force_recompute = false
 partial_flush_every = 25
 llm_predictions_path = "generated/processed/test_llm_preds.csv"
 
@@ -28,6 +28,7 @@ submission_output_path = "submissions/submission.csv"
 
 [router]
 enabled = true
+llm_routing = true
 
 [decision]
 threshold = 0.5
@@ -58,13 +59,14 @@ offload_folder = "models/offload/gemma"
 torch_dtype = "bfloat16"
 bnb_4bit_compute_dtype = "bfloat16"
 clear_cuda_before_load = true
-think_conf_low = 0.35
-think_conf_high = 0.65
+think_conf_low = 0.25
+think_conf_high = 0.75
 
 # ── Profile: 16GB (RTX 5060 Ti / P100 / T4-class) — Gemma 4 ──────────────────
 
 [hardware_profiles.16gb.gemma]
-model_name = "google/gemma-4-E4B-it"
+fast_model_name = "google/gemma-4-E4B-it"
+think_model_name = "google/gemma-4-E4B-it"
 model_loader = "multimodal_lm"
 load_in = "4bit"
 device_map = "cuda:0"
@@ -72,9 +74,10 @@ cuda_max_memory = "14GiB"
 cpu_max_memory = "32GiB"
 max_input_tokens = 3072
 enable_think_pass = true
-force_think_all = true
+force_think_all = false
 exemplar_top_k = 3
 max_think_tokens = 1024
+fast_pass_batch_size = 16
 
 [hardware_profiles.16gb.rag]
 batch_size = 128
@@ -83,9 +86,10 @@ query_batch_size = 128
 # ── Profile: 8GB / small GPUs — ungated Qwen3 thinking model ─────────────────
 
 [hardware_profiles.8gb.gemma]
-model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-# model_name = "Qwen/Qwen2.5-7B-Instruct"
-# model_name = "Qwen/Qwen2.5-3B-Instruct"
+think_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+fast_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"  # same model → no reload between passes
+# fast_model_name = "Qwen/Qwen2.5-3B-Instruct"   # faster fast-pass but costs ~2min extra reload
+# fast_model_name = "Qwen/Qwen2.5-7B-Instruct"
 model_loader = "causal_lm"
 load_in = "4bit"
 device_map = "cuda:0"
@@ -93,11 +97,12 @@ cuda_max_memory = "7GiB"
 cpu_max_memory = "16GiB"
 max_input_tokens = 1536
 enable_think_pass = true
-force_think_all = true
+force_think_all = false
 exemplar_top_k = 0
 max_think_tokens = 1024
 chat_template_enable_thinking_fast = false
 chat_template_enable_thinking_think = true
+fast_pass_batch_size = 8
 
 [hardware_profiles.8gb.rag]
 batch_size = 32

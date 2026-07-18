@@ -19,7 +19,7 @@ from transformers import (
 )
 
 from src.config_utils import resolve_quantization_mode, resolve_section
-from src.evidence_policy import map_think_verdict, should_trigger_think, task_instruction
+from src.evidence_policy import should_trigger_think, task_instruction
 from src.router import route_row
 from src.tui import banner, console, info, ok, pipeline_progress, warn
 
@@ -29,9 +29,10 @@ transformers.utils.logging.disable_progress_bar()
 disable_progress_bars()
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-CACHE_VERSION = "verifier-cache-v2"
+CACHE_VERSION = "verifier-cache-v3"
 CACHE_METADATA_FIELDS = (
-    "model_name",
+    "fast_model_name",
+    "think_model_name",
     "model_loader",
     "load_in",
     "max_input_tokens",
@@ -41,6 +42,7 @@ CACHE_METADATA_FIELDS = (
     "think_conf_high",
     "chat_template_enable_thinking_fast",
     "chat_template_enable_thinking_think",
+    "fast_pass_batch_size",
 )
 
 
@@ -158,17 +160,25 @@ class ExemplarRetriever:
             self.embeddings = data["embeddings"]
         return True
 
-    def retrieve_exemplars(self, query, exclude_prompt=None, exclude_response=None, top_k=3):
+    def retrieve_exemplars(
+        self,
+        query,
+        exclude_prompt=None,
+        exclude_response=None,
+        top_k=3,
+        query_emb=None,
+    ):
         """Retrieves top_k nearest exemplars, avoiding target leakage by filtering out exact matching inputs."""
         if self.embeddings is None:
             if not self.load_index():
                 return []
 
-        self.load_model()
+        if query_emb is None:
+            self.load_model()
+            query_emb = self.model.encode(
+                [query], show_progress_bar=False, normalize_embeddings=True
+            )[0]
 
-        query_emb = self.model.encode([query], show_progress_bar=False, normalize_embeddings=True)[
-            0
-        ]
         similarities = np.dot(self.embeddings, query_emb)
 
         top_indices = np.argsort(similarities)[::-1]
@@ -196,7 +206,8 @@ class GemmaVerifier:
             self.config = tomllib.load(f)
         gemma_config = resolve_section(self.config, "gemma")
 
-        self.model_name = gemma_config["model_name"]
+        self.fast_model_name = gemma_config.get("fast_model_name", gemma_config.get("model_name"))
+        self.think_model_name = gemma_config.get("think_model_name", gemma_config.get("model_name"))
         self.model_loader = gemma_config.get("model_loader", "multimodal_lm")
         self.load_in = resolve_quantization_mode(gemma_config)
         self.device_map = gemma_config.get("device_map", "cuda:0")
@@ -226,6 +237,7 @@ class GemmaVerifier:
         self.chat_template_enable_thinking_think = gemma_config.get(
             "chat_template_enable_thinking_think"
         )
+        self.fast_pass_batch_size = int(gemma_config.get("fast_pass_batch_size", 8))
         self.debug_log_path = "logs/debug_llm_verifier.jsonl"
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -241,7 +253,8 @@ class GemmaVerifier:
 
     def cache_metadata(self):
         return {
-            "model_name": self.model_name,
+            "fast_model_name": self.fast_model_name,
+            "think_model_name": self.think_model_name,
             "model_loader": self.model_loader,
             "load_in": self.load_in,
             "max_input_tokens": self.max_input_tokens,
@@ -252,13 +265,21 @@ class GemmaVerifier:
             "think_conf_high": self.conf_high,
             "chat_template_enable_thinking_fast": self.chat_template_enable_thinking_fast,
             "chat_template_enable_thinking_think": self.chat_template_enable_thinking_think,
+            "fast_pass_batch_size": self.fast_pass_batch_size,
         }
 
-    def load_model(self):
+    def load_model(self, model_name=None):
         from src.config_utils import resolve_model_path
 
-        resolved_name = resolve_model_path(self.model_name)
-        info(f"Loading verifier model: {self.model_name}")
+        if model_name is None:
+            model_name = self.fast_model_name
+
+        if self.model is not None and getattr(self, "_loaded_model_name", None) == model_name:
+            return
+
+        resolved_name = resolve_model_path(model_name)
+        info(f"Loading verifier model: {model_name}")
+        self._loaded_model_name = model_name
         info(f"Device={self.device} · load_in={self.load_in} · loader={self.model_loader}")
         if self.clear_cuda_before_load and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -336,7 +357,12 @@ class GemmaVerifier:
                 if self.model_loader == "causal_lm"
                 else AutoModelForMultimodalLM
             )
-            self.model = model_class.from_pretrained(resolved_name, **load_kwargs)
+            try:
+                self.model = model_class.from_pretrained(
+                    resolved_name, attn_implementation="flash_attention_2", **load_kwargs
+                )
+            except Exception:
+                self.model = model_class.from_pretrained(resolved_name, **load_kwargs)
             self.model.eval()
             self.input_device = self._infer_input_device()
             if self.use_language_model_direct and not (
@@ -410,18 +436,51 @@ class GemmaVerifier:
 
     def _think_instruction(self, task_type: str):
         """English reasoning instruction for the think pass."""
+        partial_ok_note = (
+            "A correct partial answer is Faithful — do NOT mark Hallucinated "
+            "just because the answer omits details the evidence did not ask for."
+            if task_type
+            in ("context_grounded_fact", "context_grounded_other", "famous_bn_fact_context")
+            else ""
+        )
+        math_note = (
+            "Show your calculation step by step, then state the verdict."
+            if task_type
+            in (
+                "math_work_rate",
+                "math_speed_distance",
+                "math_profit_loss",
+                "math_average",
+                "calendar_arithmetic",
+                "translation_or_bilingual",
+            )
+            else ""
+        )
+        extra = " ".join(p for p in [partial_ok_note, math_note] if p)
         return (
-            "Instruction: Assess if candidate response 'A' to question 'Q' is correct and faithful (verdict: Faithful) "
-            "or wrong/hallucinated (verdict: Hallucinated) based on the Rule and Evidence.\n"
-            "At the end of your response, write exactly this format:\n"
-            "verdict: Faithful|Hallucinated\n"
-            "confidence: strong|likely|uncertain\n"
-            "reason: <one short English sentence>"
+            "Instruction: Assess if candidate response 'A' to question 'Q' is correct and "
+            "faithful (verdict: Faithful) or wrong/hallucinated (verdict: Hallucinated) "
+            "based on the Rule and Evidence.\n"
+            + (f"{extra}\n" if extra else "")
+            + "Reason briefly, then end with exactly:\n"
+            "verdict: Faithful|Hallucinated"
         )
 
     def _think_token_budget(self, task_type: str, think_reasons: list[str]):
-        """Use the configured cap to ensure the model has enough room to reason and format its verdict."""
-        return int(self.max_think_tokens)
+        """Task-aware token budget — grammar/math need more room to reason step-by-step."""
+        base = int(self.max_think_tokens)
+        # Grammar and math reasoning needs step-by-step work; give extra budget
+        if task_type in (
+            "bangla_grammar",
+            "math_work_rate",
+            "math_speed_distance",
+            "math_profit_loss",
+            "math_average",
+            "calendar_arithmetic",
+            "translation_or_bilingual",
+        ):
+            return min(base * 2, 2048)
+        return base
 
     def _apply_chat_template(self, messages, *, enable_thinking=None):
         kwargs = {
@@ -458,22 +517,13 @@ class GemmaVerifier:
             elif "hallucinated" in last_part or "wrong" in last_part:
                 verdict = "Hallucinated"
 
-        confidence_match = re.search(
-            r"confidence\s*[:=is\s]*\s*(strong|likely|uncertain|high|medium|low)",
-            generated_text,
-            re.IGNORECASE,
-        )
-        confidence = "likely"
-        if confidence_match:
-            val = confidence_match.group(1).lower()
-            if val in ("strong", "high"):
-                confidence = "strong"
-            elif val in ("uncertain", "low"):
-                confidence = "uncertain"
-            else:
-                confidence = "likely"
+        confidence = None
+        score = None
+        if verdict == "Faithful":
+            score = 0.90
+        elif verdict == "Hallucinated":
+            score = 0.10
 
-        score = map_think_verdict(verdict, confidence) if verdict else None
         return verdict, confidence, score
 
     def predict_single(
@@ -486,6 +536,9 @@ class GemmaVerifier:
         has_context=None,
         silent=True,
         write_log=True,
+        query_emb=None,
+        p_fast=None,
+        force_think=None,
     ):
         if self.model is None:
             self.load_model()
@@ -508,6 +561,7 @@ class GemmaVerifier:
                 exclude_prompt=prompt_bn,
                 exclude_response=response_bn,
                 top_k=self.exemplar_top_k,
+                query_emb=query_emb,
             )
         else:
             exemplars = []
@@ -547,34 +601,39 @@ class GemmaVerifier:
         )
         prompt += "V:"
 
-        inputs = self._prepare_inputs(prompt)
+        if p_fast is not None:
+            p_llm = p_fast
+        else:
+            inputs = self._prepare_inputs(prompt)
+            with torch.inference_mode():
+                logits = self._forward_logits(inputs)
 
-        with torch.inference_mode():
-            logits = self._forward_logits(inputs)
+            next_token_logits = logits[0, -1, :]
+            probs = torch.softmax(next_token_logits, dim=-1)
 
-        next_token_logits = logits[0, -1, :]
-        probs = torch.softmax(next_token_logits, dim=-1)
+            prob_f = sum(probs[tid].item() for tid in self.token_f_ids if tid is not None)
+            prob_h = sum(probs[tid].item() for tid in self.token_h_ids if tid is not None)
 
-        prob_f = sum(probs[tid].item() for tid in self.token_f_ids if tid is not None)
-        prob_h = sum(probs[tid].item() for tid in self.token_h_ids if tid is not None)
-
-        sum_prob = prob_f + prob_h
-        p_f = (prob_f / sum_prob) if sum_prob > 0 else 0.5
-        p_llm = p_f
-        p_fast = p_f
+            sum_prob = prob_f + prob_h
+            p_f = (prob_f / sum_prob) if sum_prob > 0 else 0.5
+            p_llm = p_f
+            p_fast = p_f
 
         think_reasons = []
-        triggered_think = should_trigger_think(
-            p_fast=p_llm,
-            task_type=task_type,
-            evidence=evidence,
-            context_original=context_original,
-            prompt_bn=prompt_bn,
-            conf_low=self.conf_low,
-            conf_high=self.conf_high,
-            think_reasons=think_reasons,
-            force_think_all=self.force_think_all,
-        )
+        if force_think is not None:
+            triggered_think = force_think
+        else:
+            triggered_think = should_trigger_think(
+                p_fast=p_llm,
+                task_type=task_type,
+                evidence=evidence,
+                context_original=context_original,
+                prompt_bn=prompt_bn,
+                conf_low=self.conf_low,
+                conf_high=self.conf_high,
+                think_reasons=think_reasons,
+                force_think_all=self.force_think_all,
+            )
         p_llm_no_think = p_llm
         generated_text = ""
         verdict_parsed = None
@@ -671,6 +730,53 @@ class GemmaVerifier:
         except Exception as e:
             warn(f"Partial submission write failed ({e}); continuing")
 
+    def route_single_llm(self, prompt_bn: str, response_bn: str = "") -> str:
+        """Classify a row's task category using a single-token forward pass (LLM routing)."""
+        if self.model is None:
+            self.load_model()
+
+        user_content = (
+            "Classify this Bengali question 'Q' and candidate answer 'A' into one of these categories:\n"
+            "G: Grammar/Syntax/Spelling rules (কারক, বিভক্তি, সন্ধি, সমাস, বানান, ইত্যাদি)\n"
+            "M: Mathematics, numbers, averages, speed, profit, or calendar arithmetic (গড়, লাভ-ক্ষতি, গতিবেগ, কাজ-সময়, ক্যালেন্ডার, ইত্যাদি)\n"
+            "I: Idioms (বাগধারা/প্রবাদ-প্রবচন) or figurative/compositional meaning (শাব্দিক অর্থ, ইত্যাদি)\n"
+            "T: Translation, English-Bengali bilingual terms, or definition comparison\n"
+            "F: Factual knowledge (General knowledge, geography, famous Bengali history/literature/entities)\n"
+            "O: Other general questions/uncategorized\n\n"
+            f"Q: {prompt_bn}\n"
+            f"A: {response_bn}\n\n"
+            "Return exactly one character category code (G, M, I, T, F, or O):\n"
+            "Category:"
+        )
+
+        messages = [{"role": "user", "content": user_content}]
+        prompt = self._apply_chat_template(
+            messages,
+            enable_thinking=False,
+        )
+
+        routing_chars = ["G", "M", "I", "T", "F", "O"]
+        tokenizer = getattr(self.processor, "tokenizer", None) or self.tokenizer
+        char_to_id = {}
+        for char in routing_chars:
+            tids = tokenizer.encode(char, add_special_tokens=False)
+            if tids:
+                char_to_id[char] = tids[-1]
+
+        inputs = self._prepare_inputs(prompt)
+        with torch.inference_mode():
+            logits = self._forward_logits(inputs)
+
+        next_token_logits = logits[0, -1, :]
+        char_logits = {
+            char: next_token_logits[tid].item()
+            for char, tid in char_to_id.items()
+            if tid is not None
+        }
+
+        best_char = max(char_logits, key=char_logits.get) if char_logits else "O"
+        return best_char
+
     def predict_dataset(
         self,
         df,
@@ -679,12 +785,7 @@ class GemmaVerifier:
         on_partial=None,
         partial_every=0,
     ):
-        """Score every row with the verifier.
-
-        on_partial(n_done, preds_so_far) is invoked every `partial_every` rows (and
-        once at the end) so callers can persist partial output; a failure inside it
-        must not kill an in-flight run, so it is called defensively.
-        """
+        """Score every row with the verifier using batched fast pass and sequential think pass."""
         active_log_path = debug_log_path or self.debug_log_path
         original_log_path = self.debug_log_path
         self.debug_log_path = active_log_path
@@ -745,22 +846,194 @@ class GemmaVerifier:
                 str(c).strip() not in ("[NULL]", "", "None", "nan") for c in context_originals
             ]
 
-        preds = []
         total_rows = len(df)
+        query_embs = [None] * total_rows
+        if self.exemplar_top_k > 0:
+            self.exemplar_retriever.load_model()
+            queries = []
+            for _, row in df.iterrows():
+                queries.append(f"{row['prompt_bn']} {row['response_bn']}")
+
+            embs = self.exemplar_retriever.model.encode(
+                queries,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+                batch_size=32,
+            )
+            query_embs = list(embs)
+
+        # 1. Batched Fast Pass computation
+        p_fast_vals = [None] * total_rows
+        triggered_think_vals = [False] * total_rows
+        fast_pass_needed = []
+
+        for i, row in enumerate(df.iterrows()):
+            idx, r = row
+            evidence = str(r["context"])
+            prompt = str(r["prompt_bn"])
+            response = str(r["response_bn"])
+            row_task_type = task_types[i]
+            row_context_original = context_originals[i]
+            key = verifier_case_key(
+                evidence=evidence,
+                prompt=prompt,
+                response=response,
+                task_type=row_task_type,
+                context_original=row_context_original,
+                metadata=cache_metadata,
+            )
+            if use_cache and key in cache:
+                prob, trig = cache[key]
+                p_fast_vals[i] = prob
+                triggered_think_vals[i] = trig
+            else:
+                fast_pass_needed.append((i, r))
+
+        if fast_pass_needed:
+            self.load_model(self.fast_model_name)
+            tokenizer = getattr(self.processor, "tokenizer", None) or self.tokenizer
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.padding_side = "right"
+
+            batch_size = self.fast_pass_batch_size
+            with pipeline_progress() as progress:
+                fast_task = progress.add_task("Verifier (Fast Pass)", total=len(fast_pass_needed))
+                for start_idx in range(0, len(fast_pass_needed), batch_size):
+                    batch = fast_pass_needed[start_idx : start_idx + batch_size]
+                    prompts = []
+                    for orig_i, r in batch:
+                        # Construct prompt same as predict_single fast pass
+                        exemplars = []
+                        if self.exemplar_top_k > 0:
+                            exemplars = self.exemplar_retriever.retrieve_exemplars(
+                                query=f"{r['prompt_bn']} {r['response_bn']}",
+                                exclude_prompt=r["prompt_bn"],
+                                exclude_response=r["response_bn"],
+                                top_k=self.exemplar_top_k,
+                                query_emb=query_embs[orig_i],
+                            )
+                        prompt_exemplars = ""
+                        for idx_ex, ex in enumerate(exemplars):
+                            ex_label_str = "F" if ex["label"] == 1 else "H"
+                            prompt_exemplars += f"Ex {idx_ex + 1}\nE: {ex['context']}\nQ: {ex['prompt_bn']}\nA: {ex['response_bn']}\nV: {ex_label_str}\n\n"
+
+                        evidence_clean = str(r["context"]).strip()
+                        if evidence_clean in ("", "[NULL]", "None", "nan"):
+                            evidence_str = "No evidence provided. Use your internal knowledge to judge the correctness of the answer based on the Rule."
+                        else:
+                            evidence_str = f"<evidence>\n{evidence_clean}\n</evidence>"
+
+                        instruction = task_instruction(task_types[orig_i])
+                        user_content = f"{prompt_exemplars}Task: {task_types[orig_i]}\nRule: {instruction}\n{evidence_str}\nQ: {r['prompt_bn']}\nA: {r['response_bn']}\nReturn one token only: F = faithful/correct/label 1; H = hallucinated/wrong/label 0.\n"
+                        messages = [{"role": "user", "content": user_content}]
+                        prompt = (
+                            self._apply_chat_template(
+                                messages, enable_thinking=self.chat_template_enable_thinking_fast
+                            )
+                            + "V:"
+                        )
+                        prompts.append(prompt)
+
+                    inputs = tokenizer(
+                        prompts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_input_tokens,
+                    )
+                    inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+                    with torch.inference_mode():
+                        logits = self._forward_logits(inputs)
+
+                    for idx_in_batch, (orig_i, r) in enumerate(batch):
+                        seq_len = int(inputs["attention_mask"][idx_in_batch].sum().item())
+                        seq_len_dim = logits.shape[1]
+                        target_seq_idx = 0 if seq_len_dim == 1 else (seq_len - 1)
+                        next_token_logits = logits[idx_in_batch, target_seq_idx, :]
+                        probs = torch.softmax(next_token_logits, dim=-1)
+                        prob_f = sum(
+                            probs[tid].item() for tid in self.token_f_ids if tid is not None
+                        )
+                        prob_h = sum(
+                            probs[tid].item() for tid in self.token_h_ids if tid is not None
+                        )
+                        sum_prob = prob_f + prob_h
+                        p_f = (prob_f / sum_prob) if sum_prob > 0 else 0.5
+                        p_fast_vals[orig_i] = p_f
+
+                        think_reasons = []
+                        trig = should_trigger_think(
+                            p_fast=p_f,
+                            task_type=task_types[orig_i],
+                            evidence=str(r["context"]),
+                            context_original=context_originals[orig_i],
+                            prompt_bn=str(r["prompt_bn"]),
+                            conf_low=self.conf_low,
+                            conf_high=self.conf_high,
+                            think_reasons=think_reasons,
+                            force_think_all=self.force_think_all,
+                        )
+                        triggered_think_vals[orig_i] = trig
+
+                    progress.advance(fast_task, len(batch))
+
+            # If fast model differs from think model, unload fast model to clear VRAM
+            if self.fast_model_name != self.think_model_name:
+                info("Unloading fast model to clear VRAM...")
+                self.model = None
+                self.tokenizer = None
+                self.processor = None
+                import gc
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+
+        # Count how many rows actually need a think pass execution (i.e. not in cache and triggered)
+        think_pass_todo = 0
+        for i in range(total_rows):
+            r = df.iloc[i]
+            evidence = str(r["context"])
+            prompt = str(r["prompt_bn"])
+            response = str(r["response_bn"])
+            row_task_type = task_types[i]
+            row_context_original = context_originals[i]
+            key = verifier_case_key(
+                evidence=evidence,
+                prompt=prompt,
+                response=response,
+                task_type=row_task_type,
+                context_original=row_context_original,
+                metadata=cache_metadata,
+            )
+            if not (use_cache and key in cache) and triggered_think_vals[i]:
+                think_pass_todo += 1
+
+        if think_pass_todo > 0:
+            self.load_model(self.think_model_name)
+
+        preds = [None] * total_rows
         think_count = 0
         cache_hits = 0
 
         try:
             with pipeline_progress() as progress:
-                task = progress.add_task("Verifier", total=total_rows)
+                think_task = None
+                if think_pass_todo > 0:
+                    think_task = progress.add_task(
+                        "Verifier (Thinking Pass)", total=think_pass_todo
+                    )
 
-                for row_num, (idx, row) in enumerate(df.iterrows(), start=1):
-                    evidence = str(row["context"])
-                    prompt = str(row["prompt_bn"])
-                    response = str(row["response_bn"])
-                    row_task_type = task_types[row_num - 1]
-                    row_context_original = context_originals[row_num - 1]
-                    row_has_context = bool(has_context_values[row_num - 1])
+                for i, row in enumerate(df.iterrows()):
+                    idx, r = row
+                    evidence = str(r["context"])
+                    prompt = str(r["prompt_bn"])
+                    response = str(r["response_bn"])
+                    row_task_type = task_types[i]
+                    row_context_original = context_originals[i]
+                    row_has_context = bool(has_context_values[i])
                     key = verifier_case_key(
                         evidence=evidence,
                         prompt=prompt,
@@ -769,13 +1042,11 @@ class GemmaVerifier:
                         context_original=row_context_original,
                         metadata=cache_metadata,
                     )
-
                     if use_cache and key in cache:
-                        prob, triggered_think = cache[key]
+                        prob, trig = cache[key]
+                        preds[i] = prob
                         cache_hits += 1
                     else:
-                        if self.model is None:
-                            self.load_model()
                         prob, triggered_think = self.predict_single(
                             evidence,
                             prompt,
@@ -785,24 +1056,23 @@ class GemmaVerifier:
                             has_context=row_has_context,
                             silent=True,
                             write_log=use_cache,
+                            query_emb=query_embs[i],
+                            p_fast=p_fast_vals[i],
+                            force_think=triggered_think_vals[i],
                         )
+                        preds[i] = prob
+                        if triggered_think:
+                            think_count += 1
+                            if think_task is not None:
+                                progress.advance(think_task)
 
-                    preds.append(prob)
-
-                    if triggered_think:
-                        think_count += 1
-
-                    progress.update(
-                        task,
-                        description=(
-                            f"Verifier · {row_task_type} · think {think_count} · cache {cache_hits}"
-                        ),
-                    )
-                    progress.advance(task)
-
-                    if on_partial and partial_every and row_num % partial_every == 0:
-                        self._emit_partial(on_partial, row_num, preds)
-                        info(f"Partial debug flushed at row {row_num}/{total_rows}")
+                        # Flush intermediate predictions if needed
+                        row_num = i + 1
+                        if on_partial and partial_every and row_num % partial_every == 0:
+                            self._emit_partial(
+                                on_partial, row_num, [p for p in preds if p is not None]
+                            )
+                            info(f"Partial debug flushed at row {row_num}/{total_rows}")
         finally:
             self.debug_log_path = original_log_path
 

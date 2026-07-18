@@ -175,7 +175,8 @@ just first-run      # setup → preprocess → predict for that profile
 hardware_profile = "16gb"
 
 [hardware_profiles.16gb.gemma]
-model_name = "google/gemma-4-E4B-it"
+fast_model_name = "google/gemma-4-E4B-it"
+think_model_name = "google/gemma-4-E4B-it"
 model_loader = "multimodal_lm"
 load_in = "4bit"
 device_map = "cuda:0"
@@ -183,6 +184,7 @@ cuda_max_memory = "14GiB"
 exemplar_top_k = 3
 max_input_tokens = 3072
 enable_think_pass = true
+fast_pass_batch_size = 16
 
 [hardware_profiles.16gb.rag]
 batch_size = 128
@@ -211,7 +213,7 @@ just analyze           # evaluate latest prediction run against test ground trut
 
 ---
 
-### Profile B — 8GB ungated Qwen3 thinking verifier
+### Profile B — 8GB dual-model (Qwen + DeepSeek thinking verifier)
 
 **Machine:** RTX 5060 mobile 8GB or any GPU too small for Gemma 4 E4B.
 
@@ -220,7 +222,8 @@ just analyze           # evaluate latest prediction run against test ground trut
 hardware_profile = "8gb"
 
 [hardware_profiles.8gb.gemma]
-model_name = "Qwen/Qwen3-1.7B"
+fast_model_name = "Qwen/Qwen2.5-3B-Instruct"
+think_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 model_loader = "causal_lm"
 load_in = "4bit"
 device_map = "cuda:0"
@@ -230,6 +233,7 @@ exemplar_top_k = 0
 enable_think_pass = true
 chat_template_enable_thinking_fast = false
 chat_template_enable_thinking_think = true
+fast_pass_batch_size = 8
 
 [hardware_profiles.8gb.rag]
 batch_size = 32
@@ -240,7 +244,7 @@ query_batch_size = 32
 just first-run
 ```
 
-This profile disables dynamic exemplars, but keeps the explicit think pass on. The fast F/H pass uses non-thinking chat-template mode so Qwen3 does not start with `<think>` when the code needs a single F/H token.
+This profile uses `Qwen2.5-3B-Instruct` for the fast pass and `DeepSeek-R1-Distill-Qwen-7B` for the thinking pass. It sequentially unloads the fast model from VRAM to make room before loading the thinking model. The fast F/H pass uses non-thinking chat-template mode so Qwen does not start with `<think>` when the code needs a single F/H token.
 
 ---
 

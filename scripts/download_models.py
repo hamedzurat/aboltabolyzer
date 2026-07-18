@@ -60,7 +60,8 @@ def main():
         "Active profile",
         {
             "hardware_profile": profile["hardware_profile"],
-            "verifier_model": profile["verifier_model"],
+            "fast_verifier": profile["fast_verifier_model"],
+            "think_verifier": profile["think_verifier_model"],
             "load_in": profile["load_in"],
             "rag_embedder": profile["rag_embedder"],
         },
@@ -70,13 +71,19 @@ def main():
 
     if args.include_gemma:
         gemma_config = resolve_section(config, "gemma")
-        model_names.append(gemma_config["model_name"])
+        model_names.append(gemma_config["fast_model_name"])
+        model_names.append(gemma_config["think_model_name"])
         if args.all_profile_gemmas:
             for name, profile_cfg in config.get("hardware_profiles", {}).items():
                 profile_gemma = dict(config.get("gemma", {}))
                 profile_gemma.update(profile_cfg.get("gemma", {}))
-                model_names.append(profile_gemma.get("model_name"))
-                info(f"Also queued profile '{name}' verifier: {profile_gemma.get('model_name')}")
+                if profile_gemma.get("fast_model_name"):
+                    model_names.append(profile_gemma.get("fast_model_name"))
+                if profile_gemma.get("think_model_name"):
+                    model_names.append(profile_gemma.get("think_model_name"))
+                info(
+                    f"Also queued profile '{name}' verifiers: {profile_gemma.get('fast_model_name')}, {profile_gemma.get('think_model_name')}"
+                )
 
     names = unique(model_names)
     info(f"Will download {len(names)} model(s) → {args.models_dir}")

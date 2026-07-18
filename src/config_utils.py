@@ -66,7 +66,9 @@ def describe_active_profile(config):
         load_in = resolve_quantization_mode(gemma)
     return {
         "hardware_profile": profile,
-        "verifier_model": gemma.get("model_name"),
+        "verifier_model": gemma.get("model_name") or gemma.get("fast_model_name"),
+        "fast_verifier_model": gemma.get("fast_model_name") or gemma.get("model_name"),
+        "think_verifier_model": gemma.get("think_model_name") or gemma.get("model_name"),
         "model_loader": gemma.get("model_loader"),
         "load_in": load_in,
         "device_map": gemma.get("device_map"),
@@ -74,6 +76,7 @@ def describe_active_profile(config):
         "max_input_tokens": gemma.get("max_input_tokens"),
         "enable_think_pass": gemma.get("enable_think_pass"),
         "exemplar_top_k": gemma.get("exemplar_top_k"),
+        "fast_pass_batch_size": gemma.get("fast_pass_batch_size"),
         "rag_batch_size": rag.get("batch_size"),
         "rag_query_batch_size": rag.get("query_batch_size"),
         "rag_embedder": rag.get("model_name"),
@@ -100,9 +103,16 @@ def validate_config(config):
         raise ValueError("rag.query_mode must be 'prompt' or 'prompt_response'.")
 
     gemma_config = resolve_section(config, "gemma")
-    if not gemma_config.get("model_name"):
+    fast_model = gemma_config.get("fast_model_name") or gemma_config.get("model_name")
+    think_model = gemma_config.get("think_model_name") or gemma_config.get("model_name")
+    if not fast_model:
         raise ValueError(
-            "Resolved gemma.model_name is missing. "
+            "Resolved gemma.fast_model_name (or model_name) is missing. "
+            f"Set it under [hardware_profiles.{profile}.gemma] (or [gemma])."
+        )
+    if not think_model:
+        raise ValueError(
+            "Resolved gemma.think_model_name (or model_name) is missing. "
             f"Set it under [hardware_profiles.{profile}.gemma] (or [gemma])."
         )
     load_in = resolve_quantization_mode(gemma_config)

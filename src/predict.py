@@ -308,7 +308,7 @@ def _resolve_available_source(config, task_type):
     return None, None
 
 
-def apply_task_evidence_policy(test_df, config):
+def apply_task_evidence_policy(test_df, config, verifier=None):
     """Route rows and apply typed RAG only where the task policy allows it."""
     test_df = test_df.copy()
     if "context_original" not in test_df.columns:
@@ -316,7 +316,38 @@ def apply_task_evidence_policy(test_df, config):
 
     # Always start from original context; old evidence caches may have wrong RAG fills.
     test_df["context"] = test_df["context_original"]
-    test_df["task_type"] = route_dataframe(test_df)
+
+    llm_routing = bool(config.get("router", {}).get("llm_routing", False))
+    if llm_routing and verifier is not None:
+        from src.router import route_dataframe_llm
+
+        test_df["task_type"] = route_dataframe_llm(test_df, verifier)
+
+        static_task_types = route_dataframe(test_df)
+        disagreements = test_df["task_type"] != static_task_types
+        n_disagree = int(disagreements.sum())
+        total = len(test_df)
+
+        info(
+            f"LLM Router vs Static Router Disagreement: {n_disagree}/{total} ({100.0 * n_disagree / total:.1f}%)"
+        )
+        if n_disagree > 0:
+            from collections import Counter
+            from src.tui import kv_table
+
+            mismatches = Counter()
+            for l_type, s_type in zip(
+                test_df["task_type"].tolist(), static_task_types.tolist(), strict=True
+            ):
+                if l_type != s_type:
+                    mismatches[(s_type, l_type)] += 1
+            kv_table(
+                "Router mismatches (Static → LLM)",
+                {f"{s} → {l}": str(count) for (s, l), count in mismatches.most_common(10)},
+            )
+    else:
+        test_df["task_type"] = route_dataframe(test_df)
+
     test_df["n_retrieved"] = 0
     test_df["retrieval_sim_max"] = np.nan
     test_df["retrieval_sim_mean"] = np.nan
@@ -485,7 +516,8 @@ def build_debug_df(test_df, p_llm, threshold, ctx):
             "response_bn": test_df["response_bn"],
             "run_timestamp": ctx["run_ts"],
             "hardware_profile": ctx["hardware_profile"],
-            "gemma_model_name": resolve_section(ctx["config"], "gemma").get("model_name"),
+            "gemma_model_name": resolve_section(ctx["config"], "gemma").get("fast_model_name")
+            or resolve_section(ctx["config"], "gemma").get("model_name"),
             "gemma_load_in": resolve_quantization_mode(resolve_section(ctx["config"], "gemma")),
         }
     )
@@ -547,7 +579,8 @@ def main():
         "Run config",
         {
             "hardware_profile": hardware_profile,
-            "verifier": gemma_config.get("model_name"),
+            "fast_verifier": gemma_config.get("fast_model_name"),
+            "think_verifier": gemma_config.get("think_model_name"),
             "load_in": resolve_quantization_mode(gemma_config),
             "think_pass": gemma_config.get("enable_think_pass"),
             "threshold": threshold,
@@ -571,14 +604,32 @@ def main():
         test_df["context_original"] = test_df["context"]
     info(f"Loaded test set: {len(test_df)} rows from {test_processed_path}")
 
+    # Check if checkpoint exists and we should use it
+    resume_routing = use_checkpoints and not force_recompute and os.path.exists(test_evidence_path)
+
+    # Instantiate verifier early
+    verifier = GemmaVerifier()
+    verifier_cache_metadata = verifier.cache_metadata()
+
+    router_config = config.get("router", {})
+    router_enabled = bool(router_config.get("enabled", True))
+    llm_routing = bool(router_config.get("llm_routing", False))
+    if router_enabled and llm_routing and not resume_routing:
+        info("LLM-based routing enabled — loading verifier model early...")
+        verifier.load_model()
+
     step(1, 3, "Route tasks + select evidence")
-    if not router_enabled:
-        warn("Router disabled in config — using original context only, no typed RAG.")
-        test_df = apply_router_disabled_policy(test_df)
+    if resume_routing:
+        info(f"Resuming routing and RAG evidence from cached file: {test_evidence_path}")
+        test_df = pd.read_csv(test_evidence_path)
     else:
-        test_df = apply_task_evidence_policy(test_df, config)
-    test_df.to_csv(test_evidence_path, index=False)
-    ok(f"Cached evidence frame → {test_evidence_path}")
+        if not router_enabled:
+            warn("Router disabled in config — using original context only, no typed RAG.")
+            test_df = apply_router_disabled_policy(test_df)
+        else:
+            test_df = apply_task_evidence_policy(test_df, config, verifier=verifier)
+        test_df.to_csv(test_evidence_path, index=False)
+        ok(f"Cached evidence frame → {test_evidence_path}")
 
     base_submission_path = config["data"]["submission_output_path"]
     submissions_dir = os.path.dirname(base_submission_path)
@@ -594,8 +645,6 @@ def main():
     partial_flush_every = int(predict_config.get("partial_flush_every", 0))
     write_debug = bool(config.get("debug", {}).get("write_debug", True))
     ids = test_df["id"] if "id" in test_df.columns else None
-    verifier = GemmaVerifier()
-    verifier_cache_metadata = verifier.cache_metadata()
 
     ctx = {
         "config": config,
@@ -629,7 +678,8 @@ def main():
     llm_metadata = {
         "checkpoint_source": "gemma",
         "hardware_profile": hardware_profile,
-        "gemma_model_name": checkpoint_gemma_config.get("model_name"),
+        "gemma_model_name": checkpoint_gemma_config.get("fast_model_name")
+        or checkpoint_gemma_config.get("model_name"),
         "gemma_model_loader": checkpoint_gemma_config.get("model_loader"),
         "gemma_load_in": resolve_quantization_mode(checkpoint_gemma_config),
         "verifier_case_fingerprint": dataframe_cache_fingerprint(test_df),

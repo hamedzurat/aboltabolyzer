@@ -103,17 +103,16 @@ def test_think_pass_verdict_confidence_parser():
     assert map_think_verdict("Faithful", "strong") == 0.90
     assert map_think_verdict("Faithful", "likely") == 0.75
     assert map_think_verdict("Hallucinated", "strong") == 0.10
-    text = "reason: mismatch\nverdict: Hallucinated\nconfidence: likely\n"
+    text = "reason: mismatch\nverdict: Hallucinated\n"
     verdict, confidence, score = GemmaVerifier._parse_think_output(text)
     assert verdict.lower() == "hallucinated"
-    assert confidence.lower() == "likely"
-    assert score == 0.25
+    assert confidence is None
+    assert score == 0.10
 
 
 def test_think_prompt_puts_parseable_fields_first():
     instruction = GemmaVerifier()._think_instruction("general_fact_null")
     assert "verdict: Faithful|Hallucinated" in instruction
-    assert "confidence: strong|likely|uncertain" in instruction
 
 
 def test_grammar_instruction_allows_helpful_evidence_without_requiring_it():
@@ -245,8 +244,10 @@ def test_debug_log_cache_key_includes_evidence_and_task(tmp_path):
         "think_conf_low": 0.35,
         "think_conf_high": 0.65,
     }
+    from src.llm_verifier import CACHE_VERSION
+
     base = {
-        "cache_version": "verifier-cache-v2",
+        "cache_version": CACHE_VERSION,
         "prompt": "একই প্রশ্ন",
         "response": "একই উত্তর",
         "context_original": "[NULL]",
@@ -468,18 +469,18 @@ def test_repo_config_profiles_resolve_complete_settings():
     validate_config(config)
     active_profile = config["runtime"]["hardware_profile"]
     snap = describe_active_profile(config)
-    expected_8gb_model = config["hardware_profiles"]["8gb"]["gemma"]["model_name"]
+    expected_8gb_model = config["hardware_profiles"]["8gb"]["gemma"]["fast_model_name"]
     if active_profile == "16gb":
-        assert snap["verifier_model"] == "google/gemma-4-E4B-it"
+        assert snap["fast_verifier_model"] == "google/gemma-4-E4B-it"
     elif active_profile == "8gb":
-        assert snap["verifier_model"] == expected_8gb_model
+        assert snap["fast_verifier_model"] == expected_8gb_model
     assert config["data"]["processed_dir"] == "generated/processed"
     assert config["predict"]["llm_predictions_path"].startswith("generated/processed/")
 
     config["runtime"]["hardware_profile"] = "8gb"
     validate_config(config)
     snap = describe_active_profile(config)
-    assert snap["verifier_model"] == expected_8gb_model
+    assert snap["fast_verifier_model"] == expected_8gb_model
     assert snap["enable_think_pass"] is True
     assert snap["rag_batch_size"] == 32
 

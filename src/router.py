@@ -42,8 +42,6 @@ MATH_WORK_RATE = (
     "একসাথে কাজ",
     "যৌথভাবে কাজ",
     "একত্রে কাজ",
-    "রহিম",
-    "করিম",
     "নির্মাণ প্রকল্প",
 )
 MATH_SPEED = ("গতিবেগ", "ঘণ্টায়", "ঘণ্টায়", "দূরত্ব")
@@ -108,18 +106,14 @@ def route_row(context: str, prompt_bn: str, response_bn: str = "") -> str:
     response_bn = "" if response_bn is None else str(response_bn)
     context_is_null = context in ("", "[NULL]", "None", "nan")
 
-    if not context_is_null:
-        if _contains_any(prompt_bn, FAMOUS_ENTITY_PATTERNS) and _is_factual(prompt_bn):
-            return "famous_bn_fact_context"
-        if _is_factual(prompt_bn):
-            return "context_grounded_fact"
-        return "context_grounded_other"
-
+    # 1. Domain-specific overrides first
     if "ভাবার্থ" in prompt_bn:
         return "idiom_meaning_null"
     if "শাব্দিক অর্থ" in prompt_bn:
         return "literal_meaning_null"
 
+    if _contains_any(prompt_bn, CALENDAR):
+        return "calendar_arithmetic"
     if (
         _contains_any(prompt_bn, MATH_WORK_RATE)
         and ("কাজ" in prompt_bn or "দিন" in prompt_bn or "ঘণ্টা" in prompt_bn or "ঘন্টা" in prompt_bn)
@@ -135,16 +129,24 @@ def route_row(context: str, prompt_bn: str, response_bn: str = "") -> str:
         return "math_profit_loss"
     if _contains_any(prompt_bn, MATH_AVERAGE):
         return "math_average"
-    if _contains_any(prompt_bn, CALENDAR):
-        return "calendar_arithmetic"
     if _contains_any(prompt_bn, GRAMMAR_PATTERNS):
         return "bangla_grammar"
+
     # Prioritize factual questions over translation/bilingual if prompt is factual and lacks explicit translation keywords
     is_trans = _is_translation_or_bilingual(prompt_bn, response_bn)
     if is_trans and not (
         _is_factual(prompt_bn) and not _contains_any(prompt_bn.lower(), TRANSLATION_PATTERNS)
     ):
         return "translation_or_bilingual"
+
+    # 2. General facts/famous entities - check context presence
+    if not context_is_null:
+        if _contains_any(prompt_bn, FAMOUS_ENTITY_PATTERNS) and _is_factual(prompt_bn):
+            return "famous_bn_fact_context"
+        if _is_factual(prompt_bn):
+            return "context_grounded_fact"
+        return "context_grounded_other"
+
     if _contains_any(prompt_bn, FAMOUS_ENTITY_PATTERNS):
         return "famous_bn_fact_null"
     if _is_factual(prompt_bn):
@@ -172,3 +174,77 @@ def route_dataframe(df: pd.DataFrame, context_col: str = "context") -> pd.Series
         index=df.index,
         name="task_type",
     )
+
+
+def map_llm_category_to_task_type(
+    best_char: str, context: str, prompt_bn: str, response_bn: str = ""
+) -> str:
+    context = "" if context is None else str(context).strip()
+    prompt_bn = "" if prompt_bn is None else str(prompt_bn)
+    context_is_null = context in ("", "[NULL]", "None", "nan")
+
+    if best_char == "G":
+        return "bangla_grammar"
+    elif best_char == "M":
+        if _contains_any(prompt_bn, CALENDAR):
+            return "calendar_arithmetic"
+        if (
+            _contains_any(prompt_bn, MATH_WORK_RATE)
+            and (
+                "কাজ" in prompt_bn or "দিন" in prompt_bn or "ঘণ্টা" in prompt_bn or "ঘন্টা" in prompt_bn
+            )
+        ) or (
+            ("লোক" in prompt_bn or "জন" in prompt_bn)
+            and ("দিন" in prompt_bn or "ঘণ্টা" in prompt_bn or "ঘন্টা" in prompt_bn)
+            and ("কাজ" in prompt_bn or "করতে" in prompt_bn or "সময়" in prompt_bn)
+        ):
+            return "math_work_rate"
+        if _contains_any(prompt_bn, MATH_SPEED):
+            return "math_speed_distance"
+        if _contains_any(prompt_bn, MATH_PROFIT):
+            return "math_profit_loss"
+        if _contains_any(prompt_bn, MATH_AVERAGE):
+            return "math_average"
+        return "math_work_rate"
+    elif best_char == "I":
+        if "ভাবার্থ" in prompt_bn:
+            return "idiom_meaning_null"
+        return "literal_meaning_null"
+    elif best_char == "T":
+        return "translation_or_bilingual"
+    elif best_char == "F":
+        if not context_is_null:
+            if _contains_any(prompt_bn, FAMOUS_ENTITY_PATTERNS) and _is_factual(prompt_bn):
+                return "famous_bn_fact_context"
+            return "context_grounded_fact"
+        else:
+            if _contains_any(prompt_bn, FAMOUS_ENTITY_PATTERNS):
+                return "famous_bn_fact_null"
+            return "general_fact_null"
+    # Default O / Other
+    if not context_is_null:
+        return "context_grounded_other"
+    return "other_null"
+
+
+def route_dataframe_llm(df: pd.DataFrame, verifier, context_col: str = "context") -> pd.Series:
+    """Route every row using LLM classification."""
+    if "context_original" in df.columns:
+        contexts = df["context_original"]
+    else:
+        contexts = df[context_col]
+    responses = df["response_bn"] if "response_bn" in df.columns else pd.Series([""] * len(df))
+
+    from src.tui import pipeline_progress
+
+    task_types = []
+    with pipeline_progress() as progress:
+        route_task = progress.add_task("LLM Router (Classifying)", total=len(df))
+        for ctx, prompt, response in zip(
+            contexts.tolist(), df["prompt_bn"].tolist(), responses.tolist(), strict=True
+        ):
+            best_char = verifier.route_single_llm(prompt, response)
+            task_types.append(map_llm_category_to_task_type(best_char, ctx, prompt, response))
+            progress.advance(route_task)
+
+    return pd.Series(task_types, index=df.index, name="task_type")

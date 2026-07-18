@@ -12,7 +12,7 @@ TASK_RAG_SOURCE = {
     "famous_bn_fact_null": "wiki",
     "idiom_meaning_null": "idioms",
     "literal_meaning_null": "literal",
-    "bangla_grammar": "grammar",
+    "bangla_grammar": None,  # RAG hurt accuracy (17% with RAG vs 50% without) — disabled
     "context_grounded_fact": None,
     "context_grounded_other": None,
     "famous_bn_fact_context": None,
@@ -44,12 +44,15 @@ RAG_SKIP_TASKS = frozenset(
 
 TASK_INSTRUCTIONS = {
     "context_grounded_fact": (
-        "Use only the evidence. Mark H for contradiction, unsupported claims, wrong "
-        "date/person/place, or missing required qualifier."
+        "Use only the evidence. Mark H for clear factual contradictions, wrong "
+        "date/person/place, or claims the evidence directly refutes. "
+        "Accept correct partial answers — a response does not need to list every detail "
+        "the evidence mentions; it only needs to be factually correct for what it states."
     ),
     "context_grounded_other": (
-        "Use only the evidence. Mark H for contradiction, unsupported claims, wrong "
-        "date/person/place, or missing required qualifier."
+        "Use only the evidence. Mark H for clear contradictions or factually wrong claims. "
+        "Accept correct partial answers — do not reject an answer just because it omits "
+        "details the evidence mentions."
     ),
     "famous_bn_fact_context": (
         "Use the evidence first. Watch for Bangladesh/literature swaps that contradict "
@@ -73,8 +76,10 @@ TASK_INSTRUCTIONS = {
         "the fact, rely on your general knowledge to verify if the statement is correct."
     ),
     "bangla_grammar": (
-        "Judge by Bangla grammar rules. Use evidence if helpful, but missing evidence "
-        "alone is not H. Accept minor spelling variants when the category is clear."
+        "Judge strictly by Bangla grammar rules (সমাস, সন্ধি, কারক, বিভক্তি, etc.). "
+        "Missing evidence alone is NOT hallucination — use your internal grammar knowledge. "
+        "Accept minor spelling variants when the grammatical category is unambiguously correct. "
+        "For সন্ধি: apply the actual phonological rule (e.g. আ+ই=এ, giving মহেশ not মহাঈশ)."
     ),
     "translation_or_bilingual": (
         "Judge the English/Bengali translation or term. Watch for antonyms, wrong "
@@ -218,6 +223,18 @@ def should_trigger_think(
         reasons.append("lexical_missing_evidence")
         triggered = True
 
+    # bangla_grammar: high error rate — use wider confidence window (think more aggressively)
+    # but don't always-think every row; that doubles think time on Kaggle
+    if task_type == "bangla_grammar" and not (float(p_fast) < 0.15 or float(p_fast) > 0.85):
+        reasons.append("bangla_grammar_wide_window")
+        triggered = True
+
+    # translation_or_bilingual: model overconfident on calendar/date errors
+    # think whenever p_fast is not extremely confident
+    if task_type == "translation_or_bilingual" and not (float(p_fast) < 0.1 or float(p_fast) > 0.9):
+        reasons.append("translation_wide_window")
+        triggered = True
+
     if should_use_rag(task_type, context_original, prompt_bn) and evidence_looks_irrelevant(
         prompt_bn, evidence
     ):
@@ -230,8 +247,8 @@ def should_trigger_think(
 THINK_SCORE_MAP = {
     ("faithful", "strong"): 0.90,
     ("faithful", "likely"): 0.75,
-    ("faithful", "uncertain"): 0.50,
-    ("hallucinated", "uncertain"): 0.50,
+    ("faithful", "uncertain"): 0.51,
+    ("hallucinated", "uncertain"): 0.49,
     ("hallucinated", "likely"): 0.25,
     ("hallucinated", "strong"): 0.10,
 }
