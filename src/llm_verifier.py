@@ -465,6 +465,7 @@ class GemmaVerifier:
                 "math_speed_distance",
                 "math_profit_loss",
                 "math_average",
+                "math_other",
                 "calendar_arithmetic",
                 "translation_or_bilingual",
             )
@@ -884,6 +885,10 @@ class GemmaVerifier:
         # Ensure logs/ exists immediately so mid-run checkpoints are visible
         os.makedirs(os.path.dirname(active_log_path) or "logs", exist_ok=True)
 
+        # Fresh debug log when not reading cache (force_recompute) so metadata matches.
+        if not use_cache and os.path.exists(active_log_path):
+            open(active_log_path, "w", encoding="utf-8").close()
+
         cache = {}
         cache_metadata = self.cache_metadata()
         if use_cache and os.path.exists(active_log_path):
@@ -1089,6 +1094,11 @@ class GemmaVerifier:
                 nli_task = progress.add_task("NLI-first gate", total=max(len(uncached_indices), 1))
                 if uncached_indices:
                     gate_df = df.iloc[uncached_indices].copy()
+                    # Asymmetric Faithful guard needs fast scores when available.
+                    gate_df["p_fast"] = [
+                        p_fast_vals[i] if p_fast_vals[i] is not None else np.nan
+                        for i in uncached_indices
+                    ]
                     scored = {"n": 0}
 
                     def _adv(n):
@@ -1178,9 +1188,7 @@ class GemmaVerifier:
                     None if pd.isna(row["nli_p_entail"]) else float(row["nli_p_entail"])
                 ),
                 "nli_p_contradict": (
-                    None
-                    if pd.isna(row["nli_p_contradict"])
-                    else float(row["nli_p_contradict"])
+                    None if pd.isna(row["nli_p_contradict"]) else float(row["nli_p_contradict"])
                 ),
                 "nli_p_neutral": (
                     None if pd.isna(row["nli_p_neutral"]) else float(row["nli_p_neutral"])
@@ -1237,29 +1245,28 @@ class GemmaVerifier:
                 p_llm = float(nli_meta["p_nli"])
                 preds[i] = p_llm
                 nli_applied_count += 1
-                if use_cache:
-                    log_entry = {
-                        "cache_version": CACHE_VERSION,
-                        "evidence": evidence,
-                        "context_original": row_context_original,
-                        "prompt": prompt,
-                        "response": response,
-                        "task_type": row_task_type,
-                        "has_context": row_has_context,
-                        "p_fast": float(p_fast),
-                        "p_think": None,
-                        "p_llm_no_think": float(p_fast),
-                        "triggered_think": False,
-                        "think_reasons": ["nli_confident_skip_think"],
-                        "think_max_tokens": None,
-                        "thinking_cot": None,
-                        "verdict_parsed": None,
-                        "confidence_parsed": None,
-                        "p_llm_final": float(p_llm),
-                        **nli_meta,
-                    }
-                    log_entry.update(self.cache_metadata())
-                    self._append_debug_log(log_entry)
+                log_entry = {
+                    "cache_version": CACHE_VERSION,
+                    "evidence": evidence,
+                    "context_original": row_context_original,
+                    "prompt": prompt,
+                    "response": response,
+                    "task_type": row_task_type,
+                    "has_context": row_has_context,
+                    "p_fast": float(p_fast),
+                    "p_think": None,
+                    "p_llm_no_think": float(p_fast),
+                    "triggered_think": False,
+                    "think_reasons": ["nli_confident_skip_think"],
+                    "think_max_tokens": None,
+                    "thinking_cot": None,
+                    "verdict_parsed": None,
+                    "confidence_parsed": None,
+                    "p_llm_final": float(p_llm),
+                    **nli_meta,
+                }
+                log_entry.update(self.cache_metadata())
+                self._append_debug_log(log_entry)
                 return
 
             if generated_text is not None:
@@ -1273,37 +1280,6 @@ class GemmaVerifier:
                     reasons.append("verdict_unparsed")
                 preds[i] = p_llm
                 think_count += 1
-                if use_cache:
-                    log_entry = {
-                        "cache_version": CACHE_VERSION,
-                        "evidence": evidence,
-                        "context_original": row_context_original,
-                        "prompt": prompt,
-                        "response": response,
-                        "task_type": row_task_type,
-                        "has_context": row_has_context,
-                        "p_fast": float(p_fast),
-                        "p_think": float(p_llm),
-                        "p_llm_no_think": float(p_llm_no_think),
-                        "triggered_think": True,
-                        "think_reasons": reasons,
-                        "think_max_tokens": think_max_tokens,
-                        "thinking_cot": generated_text,
-                        "verdict_parsed": verdict,
-                        "confidence_parsed": confidence,
-                        "p_llm_final": float(p_llm),
-                        **nli_meta,
-                    }
-                    log_entry.update(self.cache_metadata())
-                    self._append_debug_log(log_entry)
-                return
-
-            # Fast-only
-            preds[i] = float(p_fast)
-            if use_cache:
-                reasons = []
-                if triggered_think_vals[i] and not self.enable_think_pass:
-                    reasons.append("think_pass_disabled")
                 log_entry = {
                     "cache_version": CACHE_VERSION,
                     "evidence": evidence,
@@ -1313,19 +1289,48 @@ class GemmaVerifier:
                     "task_type": row_task_type,
                     "has_context": row_has_context,
                     "p_fast": float(p_fast),
-                    "p_think": None,
-                    "p_llm_no_think": float(p_fast),
-                    "triggered_think": False,
+                    "p_think": float(p_llm),
+                    "p_llm_no_think": float(p_llm_no_think),
+                    "triggered_think": True,
                     "think_reasons": reasons,
-                    "think_max_tokens": None,
-                    "thinking_cot": None,
-                    "verdict_parsed": None,
-                    "confidence_parsed": None,
-                    "p_llm_final": float(p_fast),
+                    "think_max_tokens": think_max_tokens,
+                    "thinking_cot": generated_text,
+                    "verdict_parsed": verdict,
+                    "confidence_parsed": confidence,
+                    "p_llm_final": float(p_llm),
                     **nli_meta,
                 }
                 log_entry.update(self.cache_metadata())
                 self._append_debug_log(log_entry)
+                return
+
+            # Fast-only
+            preds[i] = float(p_fast)
+            reasons = []
+            if triggered_think_vals[i] and not self.enable_think_pass:
+                reasons.append("think_pass_disabled")
+            log_entry = {
+                "cache_version": CACHE_VERSION,
+                "evidence": evidence,
+                "context_original": row_context_original,
+                "prompt": prompt,
+                "response": response,
+                "task_type": row_task_type,
+                "has_context": row_has_context,
+                "p_fast": float(p_fast),
+                "p_think": None,
+                "p_llm_no_think": float(p_fast),
+                "triggered_think": False,
+                "think_reasons": reasons,
+                "think_max_tokens": None,
+                "thinking_cot": None,
+                "verdict_parsed": None,
+                "confidence_parsed": None,
+                "p_llm_final": float(p_fast),
+                **nli_meta,
+            }
+            log_entry.update(self.cache_metadata())
+            self._append_debug_log(log_entry)
 
         # Finalize non-think rows now so logs/ + partial appear before long think
         think_index_set = {job[0] for job in think_jobs}

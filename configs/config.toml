@@ -28,22 +28,37 @@ submission_output_path = "submissions/submission.csv"
 
 [router]
 enabled = true
+# static | llm | hybrid — hybrid = static veto (grammar/math/calendar/idiom/literal)
+# then LLM only on residual rows. llm_routing kept for backward compat.
+routing_mode = "hybrid"
 llm_routing = true
 
 [decision]
 threshold = 0.5
 
-# NLI-first gate (after fast pass, before think). Confident rows skip think.
+# NLI-first gate (after fast pass, before think). Asymmetric policy:
+#   Hallucinated easier (lower margin); Faithful harder (higher margin + guards).
 # Only configured task types with non-empty premise (context or RAG evidence).
 [nli]
 enabled = true
 model_name = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
 batch_size = 16
-margin = 0.35 # |entail-contradict| ≥ margin → skip think
-hypothesis_style = "qa_en" # qa_en | answer_only | claim_bn | qa_bn
+margin = 0.35                      # legacy fallback if mf/mh unset
+margin_faithful = 0.45             # |entail−contradict| for Faithful auto-accept
+margin_hallucinated = 0.30         # easier contradiction → skip think
+hypothesis_style = "qa_en"         # qa_en | answer_only | claim_bn | qa_bn
 faithful_score = 0.90
 hallucinated_score = 0.10
 max_length = 512
+# Faithful guards (topic-overlap / entity FPs → fall through to think)
+require_faithful_overlap = true
+faithful_overlap_min = 0.4
+require_entail_gt_neutral = true
+# NLI Faithful + fast strongly H → think (not hard “must agree” on all rows)
+block_faithful_on_fast_h = true
+fast_h_max_for_nli_faithful = 0.40
+# Skip NLI when RAG premise similarity is weak (0 = disable this check).
+min_rag_sim_for_nli = 0.55
 tasks = [
     "context_grounded_fact",
     "context_grounded_other",
@@ -65,7 +80,7 @@ model_name = "BAAI/bge-m3"
 index_dtype = "float16"
 top_k = 5
 max_evidence_tokens = 512
-similarity_threshold = 0.5
+similarity_threshold = 0.55
 query_mode = "prompt"                              # "prompt" | "prompt_response"
 batch_size = 32                                    # overridden per profile
 query_batch_size = 32                              # overridden per profile
@@ -77,30 +92,29 @@ offload_folder = "models/offload/gemma"
 torch_dtype = "bfloat16"
 bnb_4bit_compute_dtype = "bfloat16"
 clear_cuda_before_load = true
-think_conf_low = 0.25
-think_conf_high = 0.75
+think_conf_low = 0.30
+think_conf_high = 0.70
 # Fallback when a task is missing from max_think_tokens_by_task
-max_think_tokens = 1024
+max_think_tokens = 768
 
-# Per-task think budgets (tuned on 20260718_133444 COT p95; tighter = faster).
-# Math is low on purpose: short calculate-and-verdict CoTs (~200–450 toks).
-# Grammar/facts ramble longer in English before the verdict line.
+# Per-task think budgets — kept short for 8GB speed; raise if verdict_unparsed rises.
 [gemma.max_think_tokens_by_task]
-bangla_grammar = 1280
-general_fact_null = 1024
-idiom_meaning_null = 896
-translation_or_bilingual = 768
-literal_meaning_null = 576
-context_grounded_fact = 512
-context_grounded_other = 512
-famous_bn_fact_null = 512
-famous_bn_fact_context = 448
-other_null = 512
-math_work_rate = 448
-math_speed_distance = 384
-math_profit_loss = 384
-math_average = 320
-calendar_arithmetic = 384
+bangla_grammar = 768
+general_fact_null = 640
+idiom_meaning_null = 512
+translation_or_bilingual = 384
+literal_meaning_null = 384
+context_grounded_fact = 384
+context_grounded_other = 384
+famous_bn_fact_null = 384
+famous_bn_fact_context = 320
+other_null = 384
+math_work_rate = 320
+math_speed_distance = 288
+math_profit_loss = 288
+math_average = 256
+math_other = 288
+calendar_arithmetic = 288
 
 # ── Profile: 16GB (RTX 5060 Ti / P100 / T4-class) — Gemma 4 ──────────────────
 

@@ -60,18 +60,37 @@ def test_router_classifies_core_task_types():
         route_row("[NULL]", "একটি গাড়ির গতিবেগ ৬০ কিমি/ঘণ্টায়, দূরত্ব কত?", "১২০")
         == "math_speed_distance"
     )
+    assert (
+        route_row(
+            "[NULL]",
+            "কোনো একদিন বুধবার বার হলে, তার ৫১ দিন পরবর্তী দিনটি সপ্তাহের কোন বার হবে?",
+            "বৃহস্পতিবার",
+        )
+        == "calendar_arithmetic"
+    )
+    assert route_row("[NULL]", "দুই সংখ্যার অনুপাত ৩:৫ হলে…", "১৫") == "math_other"
+    # Chemistry ধাতু / স্বর্ণ must not become grammar
+    assert (
+        route_row("[NULL]", "পারমাণবিক চুল্লিতে তাপ পরিবাহক হিসেবে কোন ধাতু ব্যবহৃত হয়?", "সোডিয়াম")
+        == "general_fact_null"
+    )
+    # Latin-only answer on factual Q is not translation
+    assert (
+        route_row("[NULL]", "জাতিসংঘের কোন সংস্থা জনসংখ্যা বিষয়ে কাজ করে?", "UNFPA")
+        == "general_fact_null"
+    )
 
 
 def test_rag_skip_policy_by_task_type():
     assert should_use_rag("math_average", "[NULL]") is False
+    assert should_use_rag("math_other", "[NULL]") is False
     assert should_use_rag("context_grounded_fact", "some context") is False
     assert should_use_rag("translation_or_bilingual", "[NULL]") is False
     assert should_use_rag("general_fact_null", "[NULL]") is True
     assert should_use_rag("famous_bn_fact_null", "[NULL]") is True
     assert should_use_rag("idiom_meaning_null", "[NULL]") is True
     assert should_use_rag("literal_meaning_null", "[NULL]") is True
-    # Grammar RAG disabled — hurt accuracy vs no-RAG
-    assert should_use_rag("bangla_grammar", "[NULL]") is False
+    assert should_use_rag("bangla_grammar", "[NULL]") is True
     assert should_use_rag("other_null", "[NULL]", "বাংলাদেশের রাজধানী কোনটি?") is True
     assert should_use_rag("other_null", "[NULL]", "শুধু একটি অদ্ভুত বাক্য") is False
 
@@ -82,7 +101,7 @@ def test_rag_source_mapping_by_task_type():
     assert rag_source_for_task("famous_bn_fact_null") == "wiki"
     assert rag_source_for_task("idiom_meaning_null") == "idioms"
     assert rag_source_for_task("literal_meaning_null") == "literal"
-    assert rag_source_for_task("bangla_grammar") is None
+    assert rag_source_for_task("bangla_grammar") == "grammar"
     assert rag_source_for_task("math_speed_distance") is None
     assert rag_source_for_task("context_grounded_fact") is None
 
@@ -137,7 +156,7 @@ def test_think_trigger_near_threshold_and_task():
 
     reasons = []
     assert should_trigger_think(
-        p_fast=0.9,
+        p_fast=0.5,
         task_type="famous_bn_fact_null",
         evidence="[NULL]",
         context_original="[NULL]",
@@ -145,6 +164,161 @@ def test_think_trigger_near_threshold_and_task():
         think_reasons=reasons,
     )
     assert "famous_bn_fact" in reasons
+
+    # Overconfident famous: do not always-think
+    reasons = []
+    assert not should_trigger_think(
+        p_fast=0.95,
+        task_type="famous_bn_fact_null",
+        evidence="[NULL]",
+        context_original="[NULL]",
+        prompt_bn="রবীন্দ্রনাথ",
+        think_reasons=reasons,
+    )
+
+    # Sandhi forces think when not extremely confident
+    reasons = []
+    assert should_trigger_think(
+        p_fast=0.7,
+        task_type="bangla_grammar",
+        evidence="[NULL]",
+        context_original="[NULL]",
+        prompt_bn="মহা' ও 'ঈশ' শব্দ দুটির সন্ধিতে কোন শব্দ গঠিত হয়?",
+        think_reasons=reasons,
+    )
+    assert "grammar_rule_check" in reasons
+
+    # Extremely confident sandhi: skip forced grammar think
+    reasons = []
+    assert not should_trigger_think(
+        p_fast=0.99,
+        task_type="bangla_grammar",
+        evidence="evidence about সন্ধি",
+        context_original="[NULL]",
+        prompt_bn="মহা' ও 'ঈশ' শব্দ দুটির সন্ধিতে কোন শব্দ গঠিত হয়?",
+        think_reasons=reasons,
+    )
+
+    # Math: only near-threshold, not when confident H
+    reasons = []
+    assert not should_trigger_think(
+        p_fast=0.05,
+        task_type="math_work_rate",
+        evidence="[NULL]",
+        context_original="[NULL]",
+        prompt_bn="কাজ",
+        think_reasons=reasons,
+    )
+
+
+def test_nli_answer_overlap_guard():
+    from src.nli import answer_premise_overlap
+
+    premise = "পাহাড়পুর বৌদ্ধ বিহার পাল রাজবংশের দ্বিতীয় রাজা ধর্মপাল নির্মাণ করেন।"
+    assert answer_premise_overlap(premise, "ধর্মপাল") is True
+    assert answer_premise_overlap(premise, "দেবপাল") is False
+
+
+def test_nli_asymmetric_override_mask():
+    from src.nli import hybrid_override_mask
+
+    e = np.array([0.70, 0.70, 0.20])
+    c = np.array([0.30, 0.30, 0.70])
+    # Same |delta|=0.40: Faithful needs 0.45 → False; Hallucinated needs 0.30 → True
+    mask = hybrid_override_mask(e, c, margin=0.35, margin_faithful=0.45, margin_hallucinated=0.30)
+    assert list(mask) == [False, False, True]
+
+
+def test_nli_gate_policy_without_model(monkeypatch):
+    """Exercise asymmetric Faithful guards with mocked score_pairs (no GPU/model)."""
+    from src.nli import NLIRefiner
+
+    premise = "পাহাড়পুর বৌদ্ধ বিহার পাল রাজবংশের দ্বিতীয় রাজা ধর্মপাল নির্মাণ করেন।"
+    # One row per policy branch; scores returned in the same candidate order.
+    df = pd.DataFrame(
+        {
+            "task_type": ["context_grounded_fact"] * 6,
+            "context_original": [premise] * 6,
+            "context": [premise] * 6,
+            "prompt_bn": ["কে নির্মাণ করেন?"] * 6,
+            "response_bn": [
+                "ধর্মপাল",  # 0: Faithful OK
+                "ধর্মপাল",  # 1: margin too low for Faithful
+                "দেবপাল",  # 2: low overlap
+                "ধর্মপাল",  # 3: fast strongly H
+                "ধর্মপাল",  # 4: entail <= neutral
+                "ভুল নাম",  # 5: Hallucinated OK (asymmetric margin)
+            ],
+            "p_fast": [0.80, 0.80, 0.80, 0.25, 0.80, 0.20],
+            "rag_used": [False] * 6,
+        }
+    )
+    scores = [
+        {"p_entail": 0.75, "p_contradict": 0.20, "p_neutral": 0.05},  # Δ0.55 F apply
+        {"p_entail": 0.60, "p_contradict": 0.25, "p_neutral": 0.15},  # Δ0.35 < 0.45
+        {"p_entail": 0.75, "p_contradict": 0.20, "p_neutral": 0.05},  # F low overlap
+        {"p_entail": 0.75, "p_contradict": 0.20, "p_neutral": 0.05},  # F fast H
+        {"p_entail": 0.48, "p_contradict": 0.02, "p_neutral": 0.50},  # Δ0.46 F but e≤n
+        {"p_entail": 0.20, "p_contradict": 0.55, "p_neutral": 0.25},  # Δ0.35 H apply
+    ]
+
+    refiner = NLIRefiner(
+        {
+            "enabled": True,
+            "tasks": ["context_grounded_fact"],
+            "margin": 0.35,
+            "margin_faithful": 0.45,
+            "margin_hallucinated": 0.30,
+            "require_faithful_overlap": True,
+            "faithful_overlap_min": 0.4,
+            "require_entail_gt_neutral": True,
+            "block_faithful_on_fast_h": True,
+            "fast_h_max_for_nli_faithful": 0.40,
+            "min_rag_sim_for_nli": 0.55,
+        }
+    )
+    monkeypatch.setattr(refiner, "score_pairs", lambda premises, hyps, on_batch=None: scores)
+
+    debug = refiner.gate(df)
+    reasons = list(debug["nli_skip_reason"])
+    applied = list(debug["nli_applied"])
+
+    assert applied == [True, False, False, False, False, True]
+    assert reasons[0] == ""
+    assert reasons[1] == "margin_too_low"
+    assert reasons[2] == "faithful_low_overlap"
+    assert reasons[3] == "faithful_fast_disagrees"
+    assert reasons[4] == "entail_le_neutral"
+    assert reasons[5] == ""
+    assert debug.loc[0, "p_nli"] == pytest.approx(0.90)
+    assert debug.loc[5, "p_nli"] == pytest.approx(0.10)
+
+
+def test_nli_gate_skips_weak_rag_without_model():
+    from src.nli import NLIRefiner
+
+    refiner = NLIRefiner(
+        {
+            "enabled": True,
+            "tasks": ["general_fact_null"],
+            "min_rag_sim_for_nli": 0.55,
+        }
+    )
+    df = pd.DataFrame(
+        {
+            "task_type": ["general_fact_null"],
+            "context_original": ["[NULL]"],
+            "context": ["weak wiki hit"],
+            "prompt_bn": ["q"],
+            "response_bn": ["a"],
+            "rag_used": [True],
+            "retrieval_sim_max": [0.40],
+        }
+    )
+    debug = refiner.gate(df)
+    assert not debug["nli_applied"].any()
+    assert debug.iloc[0]["nli_skip_reason"] == "weak_rag_premise"
+    assert not debug.iloc[0]["nli_eligible"]
 
 
 def test_apply_threshold_and_submission_validator():
@@ -312,7 +486,19 @@ def test_nli_hybrid_override_mask_and_scores():
     row2 = pd.Series({"context_original": "orig", "context": "rag"})
     assert premise_for_row(row2) == "orig"
     assert nli_cache_tag(None) == "nli_off"
-    assert "nli_first" in nli_cache_tag({"enabled": True, "margin": 0.35, "tasks": ["a"]})
+    tag = nli_cache_tag(
+        {
+            "enabled": True,
+            "margin": 0.35,
+            "margin_faithful": 0.45,
+            "margin_hallucinated": 0.30,
+            "tasks": ["a"],
+        }
+    )
+    assert "nli_first" in tag
+    assert "mf=0.45" in tag
+    assert "mh=0.3" in tag
+    assert "bfh=1" in tag
 
 
 def test_nli_gate_skips_non_configured_tasks_without_model():

@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tomllib
 import warnings
 from datetime import datetime
@@ -141,9 +142,18 @@ def dataframe_cache_fingerprint(df):
 
 
 def build_rag_query(row, query_mode):
+    """Build retrieval query; prefer quoted lemma for idiom/literal prompts."""
+    prompt = str(row["prompt_bn"])
+    task = str(row["task_type"]) if "task_type" in getattr(row, "index", []) else ""
+    if task in ("idiom_meaning_null", "literal_meaning_null"):
+        quoted = re.findall(r'[“"‘\'«](.+?)[”"’\'»]', prompt)
+        if quoted:
+            lemma = max((q.strip() for q in quoted), key=len, default="")
+            if lemma:
+                return lemma
     if query_mode == "prompt_response":
-        return f"{row['prompt_bn']} {row['response_bn']}"
-    return str(row["prompt_bn"])
+        return f"{prompt} {row['response_bn']}"
+    return prompt
 
 
 def apply_threshold(p_llm, threshold=0.5):
@@ -318,11 +328,21 @@ def apply_task_evidence_policy(test_df, config, verifier=None):
     # Always start from original context; old evidence caches may have wrong RAG fills.
     test_df["context"] = test_df["context_original"]
 
-    llm_routing = bool(config.get("router", {}).get("llm_routing", False))
-    if llm_routing and verifier is not None:
-        from src.router import route_dataframe_llm
+    from src.router import (
+        needs_llm_router,
+        resolve_routing_mode,
+        route_dataframe_hybrid,
+        route_dataframe_llm,
+    )
 
-        test_df["task_type"] = route_dataframe_llm(test_df, verifier)
+    routing_mode = resolve_routing_mode(config.get("router", {}))
+    if needs_llm_router(config.get("router", {})) and verifier is not None:
+        if routing_mode == "hybrid":
+            test_df["task_type"] = route_dataframe_hybrid(test_df, verifier)
+            info("Routing mode: hybrid (static veto + LLM residual)")
+        else:
+            test_df["task_type"] = route_dataframe_llm(test_df, verifier)
+            info("Routing mode: llm")
 
         static_task_types = route_dataframe(test_df)
         disagreements = test_df["task_type"] != static_task_types
@@ -330,7 +350,8 @@ def apply_task_evidence_policy(test_df, config, verifier=None):
         total = len(test_df)
 
         info(
-            f"LLM Router vs Static Router Disagreement: {n_disagree}/{total} ({100.0 * n_disagree / total:.1f}%)"
+            f"Final vs Static Router Disagreement: {n_disagree}/{total} "
+            f"({100.0 * n_disagree / total:.1f}%)"
         )
         if n_disagree > 0:
             from collections import Counter
@@ -343,11 +364,12 @@ def apply_task_evidence_policy(test_df, config, verifier=None):
                 if l_type != s_type:
                     mismatches[(s_type, l_type)] += 1
             kv_table(
-                "Router mismatches (Static → LLM)",
+                "Router mismatches (Static → Final)",
                 {f"{s} → {l}": str(count) for (s, l), count in mismatches.most_common(10)},
             )
     else:
         test_df["task_type"] = route_dataframe(test_df)
+        info("Routing mode: static")
 
     test_df["n_retrieved"] = 0
     test_df["retrieval_sim_max"] = np.nan
@@ -446,6 +468,7 @@ def apply_task_evidence_policy(test_df, config, verifier=None):
             hits_by_query = _retrieve_many_fast(rag, queries, progress, task)
 
         filled = 0
+        empty_for_fallback = []
         for idx, hits in zip(idxs, hits_by_query, strict=True):
             evidence, n_hits, max_score, mean_score = rag.format_evidence(hits)
             test_df.at[idx, "context"] = evidence
@@ -458,10 +481,57 @@ def apply_task_evidence_policy(test_df, config, verifier=None):
             test_df.at[idx, "evidence_source"] = f"rag:{source_name}"
             if str(evidence).strip() in ("[NULL]", "", "None", "nan"):
                 test_df.at[idx, "evidence_relevance"] = "retrieval_empty"
+                empty_for_fallback.append(idx)
             else:
                 test_df.at[idx, "evidence_relevance"] = "retrieved"
                 filled += 1
         ok(f"{source_name}: retrieved for {len(idxs)} rows · non-empty evidence {filled}")
+
+        # Typed fallback (e.g. idiom/literal → wiki) when preferred source returned nothing.
+        if empty_for_fallback:
+            from src.evidence_policy import rag_fallback_source as _fallback
+
+            # All rows in this batch share a task family; use first row's task.
+            sample_task = str(test_df.at[empty_for_fallback[0], "task_type"])
+            fb = _fallback(sample_task)
+            if fb and fb != source_name:
+                fb_paths = source_paths(config, fb)
+                fb_index = fb_paths.get("index_path")
+                if fb_index and os.path.exists(fb_index):
+                    info(
+                        f"Fallback RAG '{fb}' for {len(empty_for_fallback)} empty "
+                        f"'{source_name}' hits"
+                    )
+                    fb_rag = BanglaRAG(
+                        config=config,
+                        source_name=fb,
+                        corpus_dir=fb_paths["corpus_dir"],
+                        index_path=fb_index,
+                    )
+                    if fb_rag.load_index():
+                        fb_subset = test_df.loc[empty_for_fallback]
+                        fb_queries = [
+                            build_rag_query(row, query_mode) for _, row in fb_subset.iterrows()
+                        ]
+                        with pipeline_progress() as progress:
+                            task = progress.add_task(
+                                f"Retrieving fallback ({fb})", total=len(fb_queries)
+                            )
+                            fb_hits = _retrieve_many_fast(fb_rag, fb_queries, progress, task)
+                        fb_filled = 0
+                        for idx, hits in zip(empty_for_fallback, fb_hits, strict=True):
+                            evidence, n_hits, max_score, mean_score = fb_rag.format_evidence(hits)
+                            if str(evidence).strip() in ("[NULL]", "", "None", "nan"):
+                                continue
+                            test_df.at[idx, "context"] = evidence
+                            test_df.at[idx, "n_retrieved"] = n_hits
+                            test_df.at[idx, "retrieval_sim_max"] = max_score
+                            test_df.at[idx, "retrieval_sim_mean"] = mean_score
+                            test_df.at[idx, "rag_source"] = fb
+                            test_df.at[idx, "evidence_source"] = f"rag:{fb}(fallback)"
+                            test_df.at[idx, "evidence_relevance"] = "retrieved"
+                            fb_filled += 1
+                        ok(f"fallback {fb}: filled {fb_filled}/{len(empty_for_fallback)}")
 
     ok("Task-aware typed evidence selection complete")
     return test_df
@@ -654,9 +724,11 @@ def main():
 
     router_config = config.get("router", {})
     router_enabled = bool(router_config.get("enabled", True))
-    llm_routing = bool(router_config.get("llm_routing", False))
-    if router_enabled and llm_routing and not resume_routing:
-        info("LLM-based routing enabled — loading verifier model early...")
+    from src.router import needs_llm_router, resolve_routing_mode
+
+    routing_mode = resolve_routing_mode(router_config)
+    if router_enabled and needs_llm_router(router_config) and not resume_routing:
+        info(f"Routing mode={routing_mode} — loading verifier model early...")
         verifier.load_model()
 
     total_steps = 3
@@ -714,16 +786,14 @@ def main():
         )
         if len(vals) != len(test_df):
             # legacy: compact list of completed scores only
-            partial_df = build_debug_df(
-                test_df.iloc[: len(vals)].copy(), vals, threshold, ctx
-            )
+            partial_df = build_debug_df(test_df.iloc[: len(vals)].copy(), vals, threshold, ctx)
         else:
             partial_df = build_debug_df(test_df.copy(), vals, threshold, ctx)
             partial_df = partial_df[np.isfinite(partial_df["p_llm"])]
         if partial_df.empty:
             return
         partial_df.to_csv(partial_debug_path, index=False)
-        info(f"Partial debug flushed · {len(partial_df)} rows → {partial_debug_path}")
+        info(f"Partial debug flushed · {len(partial_df)} rows")
 
     llm_checkpoint_path = ctx["llm_checkpoint_path"]
     p_llm = None

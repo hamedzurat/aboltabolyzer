@@ -1,4 +1,4 @@
-"""Task-specific evidence and prompt policies for the routed Gemma verifier."""
+"""Task-specific evidence and prompt policies for the routed verifier."""
 
 from __future__ import annotations
 
@@ -6,13 +6,15 @@ import re
 
 # Task type → typed corpus source under corpus/<source>/ and indexes/<source>.pkl.
 # None means no retrieval for that task.
+# Fill corpus/{idioms,literal,grammar} then `just make-rag --source <name>`.
+# Empty/weak hits fall back via TASK_RAG_FALLBACK or stay [NULL].
 TASK_RAG_SOURCE = {
     "general_fact_null": "wiki",
     "other_null": "wiki",
     "famous_bn_fact_null": "wiki",
     "idiom_meaning_null": "idioms",
     "literal_meaning_null": "literal",
-    "bangla_grammar": None,  # RAG hurt accuracy (17% with RAG vs 50% without) — disabled
+    "bangla_grammar": "grammar",
     "context_grounded_fact": None,
     "context_grounded_other": None,
     "famous_bn_fact_context": None,
@@ -21,11 +23,15 @@ TASK_RAG_SOURCE = {
     "math_speed_distance": None,
     "math_profit_loss": None,
     "math_average": None,
+    "math_other": None,
     "calendar_arithmetic": None,
 }
 
-# If the preferred source index is missing, try this fallback (still typed).
-TASK_RAG_FALLBACK = {}
+# Prefer typed corpus; if index missing or all hits empty, try fallback.
+TASK_RAG_FALLBACK = {
+    "idiom_meaning_null": "wiki",
+    "literal_meaning_null": "wiki",
+}
 
 # Never retrieve for these even if a source mapping exists.
 RAG_SKIP_TASKS = frozenset(
@@ -38,6 +44,7 @@ RAG_SKIP_TASKS = frozenset(
         "math_speed_distance",
         "math_profit_loss",
         "math_average",
+        "math_other",
         "calendar_arithmetic",
     }
 )
@@ -59,11 +66,13 @@ TASK_INSTRUCTIONS = {
         "well-known facts."
     ),
     "idiom_meaning_null": (
-        "Judge the Bengali ভাবার্থ. Missing evidence alone is not H. Mark F only for "
-        "the correct figurative meaning."
+        "Judge the Bengali ভাবার্থ / বাগধারা. Missing or irrelevant evidence alone is "
+        "NOT H — use your knowledge of the figurative meaning. Mark F only if the "
+        "response matches the true ভাবার্থ."
     ),
     "literal_meaning_null": (
-        "Judge the শাব্দিক/compositional meaning. Missing evidence alone is not H."
+        "Judge the শাব্দিক/compositional meaning. Missing or irrelevant evidence alone "
+        "is NOT H — use compositional knowledge. Mark F only if the literal gloss is correct."
     ),
     "general_fact_null": (
         "Check the fact carefully. Watch for swapped people, dates, places, nearby "
@@ -77,9 +86,11 @@ TASK_INSTRUCTIONS = {
     ),
     "bangla_grammar": (
         "Judge strictly by Bangla grammar rules (সমাস, সন্ধি, কারক, বিভক্তি, etc.). "
-        "Missing evidence alone is NOT hallucination — use your internal grammar knowledge. "
+        "Use evidence when it states the rule or correct form; missing evidence alone "
+        "is NOT hallucination — use your internal grammar knowledge. "
         "Accept minor spelling variants when the grammatical category is unambiguously correct. "
-        "For সন্ধি: apply the actual phonological rule (e.g. আ+ই=এ, giving মহেশ not মহাঈশ)."
+        "For সন্ধি: apply the actual phonological rule (e.g. আ+ঈ→এ, giving মহেশ not মহাঈশ; "
+        "আ+আ→া, বিদ্যালয় not বিদ্যাআলয়). Reject naive concatenation."
     ),
     "translation_or_bilingual": (
         "Judge the English/Bengali translation or term. Watch for antonyms, wrong "
@@ -97,6 +108,10 @@ TASK_INSTRUCTIONS = {
     "math_average": (
         "Calculate internally. Mark F only if the computed answer matches the response."
     ),
+    "math_other": (
+        "Calculate internally (ratio, interest, area, mixture, etc.). "
+        "Mark F only if the computed answer matches the response."
+    ),
     "calendar_arithmetic": (
         "Calculate internally. Mark F only if the computed answer matches the response."
     ),
@@ -112,6 +127,7 @@ MATH_TASKS = frozenset(
         "math_speed_distance",
         "math_profit_loss",
         "math_average",
+        "math_other",
         "calendar_arithmetic",
     }
 )
@@ -192,51 +208,63 @@ def should_trigger_think(
     think_reasons: list[str] | None = None,
     force_think_all: bool = False,
 ) -> bool:
-    """Decide whether to run the think pass for a routed row."""
+    """Decide whether to run the think pass for a routed row.
+
+    Bias toward fewer thinks (speed): most extra triggers only fire inside the
+    near-threshold band. Math/grammar still get a slightly wider band.
+    """
     reasons = think_reasons if think_reasons is not None else []
+    prompt_bn = "" if prompt_bn is None else str(prompt_bn)
+    p = float(p_fast)
 
     if force_think_all:
         reasons.append("force_think_all")
         return True
 
     triggered = False
+    near = conf_low <= p <= conf_high
 
-    if conf_low <= float(p_fast) <= conf_high:
+    if near:
         reasons.append("near_threshold")
         triggered = True
 
-    if task_type in ("famous_bn_fact_null", "famous_bn_fact_context"):
+    if task_type in ("famous_bn_fact_null", "famous_bn_fact_context") and near:
         reasons.append("famous_bn_fact")
         triggered = True
 
-    if task_type == "context_grounded_fact" and context_has_multiple_entities(context_original):
+    # Multi-entity context: only when uncertain (was always-on → slow + mixed).
+    if (
+        task_type == "context_grounded_fact"
+        and near
+        and context_has_multiple_entities(context_original)
+    ):
         reasons.append("multi_entity_context")
         triggered = True
 
-    if task_type in MATH_TASKS:
+    # Math/calendar: only near-threshold (always-think flipped confident-H → F).
+    if task_type in MATH_TASKS and near:
         reasons.append("math_needs_check")
         triggered = True
 
-    if task_type in ("idiom_meaning_null", "literal_meaning_null") and evidence_looks_irrelevant(
-        prompt_bn, evidence
-    ):
-        reasons.append("lexical_missing_evidence")
+    # Grammar: slightly wider band; সন্ধি/সমাস inside that band.
+    if task_type == "bangla_grammar":
+        grammar_near = not (p < 0.2 or p > 0.8)
+        if ("সন্ধি" in prompt_bn or "সমাস" in prompt_bn or "ব্যাসবাক্য" in prompt_bn) and grammar_near:
+            reasons.append("grammar_rule_check")
+            triggered = True
+        elif grammar_near:
+            reasons.append("bangla_grammar_wide_window")
+            triggered = True
+
+    # Translation: routing is fixed — no wide window (saves thinks).
+    if task_type == "translation_or_bilingual" and near:
+        reasons.append("translation_check")
         triggered = True
 
-    # bangla_grammar: high error rate — use wider confidence window (think more aggressively)
-    # but don't always-think every row; that doubles think time on Kaggle
-    if task_type == "bangla_grammar" and not (float(p_fast) < 0.15 or float(p_fast) > 0.85):
-        reasons.append("bangla_grammar_wide_window")
-        triggered = True
-
-    # translation_or_bilingual: model overconfident on calendar/date errors
-    # think whenever p_fast is not extremely confident
-    if task_type == "translation_or_bilingual" and not (float(p_fast) < 0.1 or float(p_fast) > 0.9):
-        reasons.append("translation_wide_window")
-        triggered = True
-
-    if should_use_rag(task_type, context_original, prompt_bn) and evidence_looks_irrelevant(
-        prompt_bn, evidence
+    if (
+        should_use_rag(task_type, context_original, prompt_bn)
+        and evidence_looks_irrelevant(prompt_bn, evidence)
+        and near
     ):
         reasons.append("evidence_missing_keyphrase")
         triggered = True
