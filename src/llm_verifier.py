@@ -3,6 +3,7 @@ import logging
 import os
 import pickle
 import re
+import time
 import tomllib
 
 import numpy as np
@@ -861,15 +862,27 @@ class GemmaVerifier:
         debug_log_path=None,
         on_partial=None,
         partial_every=0,
+        partial_every_seconds=0,
         nli_config=None,
     ):
         """Score rows: batched fast → NLI-first gate → think fallback."""
         from src.nli import NLIRefiner, empty_nli_debug, nli_cache_tag, release_cuda_for_nli
 
+        # Prefer seconds; legacy partial_every (row count) → once a minute
+        if partial_every_seconds and float(partial_every_seconds) > 0:
+            flush_every_s = float(partial_every_seconds)
+        elif partial_every and int(partial_every) > 0:
+            flush_every_s = 60.0
+        else:
+            flush_every_s = 0.0
+        partial_state = {"last_at": time.monotonic()}
+
         self._nli_cache_tag = nli_cache_tag(nli_config)
         active_log_path = debug_log_path or self.debug_log_path
         original_log_path = self.debug_log_path
         self.debug_log_path = active_log_path
+        # Ensure logs/ exists immediately so mid-run checkpoints are visible
+        os.makedirs(os.path.dirname(active_log_path) or "logs", exist_ok=True)
 
         cache = {}
         cache_metadata = self.cache_metadata()
@@ -1142,6 +1155,19 @@ class GemmaVerifier:
         cache_hits = 0
         nli_applied_count = 0
 
+        def _maybe_partial(*, force=False):
+            if not on_partial or flush_every_s <= 0:
+                return
+            now = time.monotonic()
+            if not force and (now - partial_state["last_at"]) < flush_every_s:
+                return
+            n_ready = sum(1 for p in preds if p is not None)
+            if n_ready == 0:
+                return
+            # Pass full-length preds (None = not ready) so the writer can align by row
+            self._emit_partial(on_partial, n_ready, preds)
+            partial_state["last_at"] = now
+
         def _nli_fields(idx):
             row = nli_debug.loc[idx]
             return {
@@ -1152,7 +1178,9 @@ class GemmaVerifier:
                     None if pd.isna(row["nli_p_entail"]) else float(row["nli_p_entail"])
                 ),
                 "nli_p_contradict": (
-                    None if pd.isna(row["nli_p_contradict"]) else float(row["nli_p_contradict"])
+                    None
+                    if pd.isna(row["nli_p_contradict"])
+                    else float(row["nli_p_contradict"])
                 ),
                 "nli_p_neutral": (
                     None if pd.isna(row["nli_p_neutral"]) else float(row["nli_p_neutral"])
@@ -1161,7 +1189,154 @@ class GemmaVerifier:
                 "p_nli": None if pd.isna(row["p_nli"]) else float(row["p_nli"]),
             }
 
-        think_results = {}
+        def _finalize_row(i, *, generated_text=None, think_max_tokens=None, think_reasons=None):
+            """Fill preds[i], append jsonl, for one uncached row."""
+            nonlocal think_count, cache_hits, nli_applied_count
+            r = df.iloc[i]
+            evidence = str(r["context"])
+            prompt = str(r["prompt_bn"])
+            response = str(r["response_bn"])
+            row_task_type = task_types[i]
+            row_context_original = context_originals[i]
+            row_has_context = bool(has_context_values[i])
+            idx = df.index[i]
+            key = verifier_case_key(
+                evidence=evidence,
+                prompt=prompt,
+                response=response,
+                task_type=row_task_type,
+                context_original=row_context_original,
+                metadata=cache_metadata,
+            )
+            if use_cache and key in cache:
+                preds[i] = cache[key][0]
+                cache_hits += 1
+                return
+
+            p_fast = p_fast_vals[i]
+            nli_meta = _nli_fields(idx)
+
+            if p_fast is None:
+                prob, triggered_think = self.predict_single(
+                    evidence,
+                    prompt,
+                    response,
+                    task_type=row_task_type,
+                    context_original=row_context_original,
+                    has_context=row_has_context,
+                    silent=True,
+                    write_log=use_cache,
+                    query_emb=query_embs[i],
+                )
+                preds[i] = prob
+                if triggered_think:
+                    think_count += 1
+                return
+
+            if nli_meta["nli_applied"] and nli_meta["p_nli"] is not None:
+                p_llm = float(nli_meta["p_nli"])
+                preds[i] = p_llm
+                nli_applied_count += 1
+                if use_cache:
+                    log_entry = {
+                        "cache_version": CACHE_VERSION,
+                        "evidence": evidence,
+                        "context_original": row_context_original,
+                        "prompt": prompt,
+                        "response": response,
+                        "task_type": row_task_type,
+                        "has_context": row_has_context,
+                        "p_fast": float(p_fast),
+                        "p_think": None,
+                        "p_llm_no_think": float(p_fast),
+                        "triggered_think": False,
+                        "think_reasons": ["nli_confident_skip_think"],
+                        "think_max_tokens": None,
+                        "thinking_cot": None,
+                        "verdict_parsed": None,
+                        "confidence_parsed": None,
+                        "p_llm_final": float(p_llm),
+                        **nli_meta,
+                    }
+                    log_entry.update(self.cache_metadata())
+                    self._append_debug_log(log_entry)
+                return
+
+            if generated_text is not None:
+                p_llm = float(p_fast)
+                p_llm_no_think = p_llm
+                reasons = list(think_reasons or [])
+                verdict, confidence, think_score = self._parse_think_output(generated_text)
+                if think_score is not None:
+                    p_llm = think_score
+                else:
+                    reasons.append("verdict_unparsed")
+                preds[i] = p_llm
+                think_count += 1
+                if use_cache:
+                    log_entry = {
+                        "cache_version": CACHE_VERSION,
+                        "evidence": evidence,
+                        "context_original": row_context_original,
+                        "prompt": prompt,
+                        "response": response,
+                        "task_type": row_task_type,
+                        "has_context": row_has_context,
+                        "p_fast": float(p_fast),
+                        "p_think": float(p_llm),
+                        "p_llm_no_think": float(p_llm_no_think),
+                        "triggered_think": True,
+                        "think_reasons": reasons,
+                        "think_max_tokens": think_max_tokens,
+                        "thinking_cot": generated_text,
+                        "verdict_parsed": verdict,
+                        "confidence_parsed": confidence,
+                        "p_llm_final": float(p_llm),
+                        **nli_meta,
+                    }
+                    log_entry.update(self.cache_metadata())
+                    self._append_debug_log(log_entry)
+                return
+
+            # Fast-only
+            preds[i] = float(p_fast)
+            if use_cache:
+                reasons = []
+                if triggered_think_vals[i] and not self.enable_think_pass:
+                    reasons.append("think_pass_disabled")
+                log_entry = {
+                    "cache_version": CACHE_VERSION,
+                    "evidence": evidence,
+                    "context_original": row_context_original,
+                    "prompt": prompt,
+                    "response": response,
+                    "task_type": row_task_type,
+                    "has_context": row_has_context,
+                    "p_fast": float(p_fast),
+                    "p_think": None,
+                    "p_llm_no_think": float(p_fast),
+                    "triggered_think": False,
+                    "think_reasons": reasons,
+                    "think_max_tokens": None,
+                    "thinking_cot": None,
+                    "verdict_parsed": None,
+                    "confidence_parsed": None,
+                    "p_llm_final": float(p_fast),
+                    **nli_meta,
+                }
+                log_entry.update(self.cache_metadata())
+                self._append_debug_log(log_entry)
+
+        # Finalize non-think rows now so logs/ + partial appear before long think
+        think_index_set = {job[0] for job in think_jobs}
+        for i in range(total_rows):
+            if i in think_index_set:
+                continue
+            if preds[i] is not None:
+                continue
+            _finalize_row(i)
+        _maybe_partial(force=True)
+
         try:
             with pipeline_progress() as progress:
                 think_task = None
@@ -1200,148 +1375,24 @@ class GemmaVerifier:
                             prompts = [p for _n, p, _job in batch]
                             texts = self._batched_think_generate(prompts, budget)
                             for (_n, _p, (i, _r, reasons)), text in zip(batch, texts):
-                                think_results[i] = (text, budget, list(reasons))
+                                _finalize_row(
+                                    i,
+                                    generated_text=text,
+                                    think_max_tokens=budget,
+                                    think_reasons=list(reasons),
+                                )
                             if think_task is not None:
                                 progress.advance(think_task, len(batch))
+                            _maybe_partial()
 
-                for i, (_idx, r) in enumerate(df.iterrows()):
-                    evidence = str(r["context"])
-                    prompt = str(r["prompt_bn"])
-                    response = str(r["response_bn"])
-                    row_task_type = task_types[i]
-                    row_context_original = context_originals[i]
-                    row_has_context = bool(has_context_values[i])
-                    idx = df.index[i]
-                    key = verifier_case_key(
-                        evidence=evidence,
-                        prompt=prompt,
-                        response=response,
-                        task_type=row_task_type,
-                        context_original=row_context_original,
-                        metadata=cache_metadata,
-                    )
-                    if use_cache and key in cache:
-                        preds[i] = cache[key][0]
-                        cache_hits += 1
-                        continue
-
-                    p_fast = p_fast_vals[i]
-                    nli_meta = _nli_fields(idx)
-
-                    if p_fast is None:
-                        prob, triggered_think = self.predict_single(
-                            evidence,
-                            prompt,
-                            response,
-                            task_type=row_task_type,
-                            context_original=row_context_original,
-                            has_context=row_has_context,
-                            silent=True,
-                            write_log=use_cache,
-                            query_emb=query_embs[i],
-                        )
-                        preds[i] = prob
-                        if triggered_think:
-                            think_count += 1
-                    elif nli_meta["nli_applied"] and nli_meta["p_nli"] is not None:
-                        p_llm = float(nli_meta["p_nli"])
-                        preds[i] = p_llm
-                        nli_applied_count += 1
-                        if use_cache:
-                            log_entry = {
-                                "cache_version": CACHE_VERSION,
-                                "evidence": evidence,
-                                "context_original": row_context_original,
-                                "prompt": prompt,
-                                "response": response,
-                                "task_type": row_task_type,
-                                "has_context": row_has_context,
-                                "p_fast": float(p_fast),
-                                "p_think": None,
-                                "p_llm_no_think": float(p_fast),
-                                "triggered_think": False,
-                                "think_reasons": ["nli_confident_skip_think"],
-                                "think_max_tokens": None,
-                                "thinking_cot": None,
-                                "verdict_parsed": None,
-                                "confidence_parsed": None,
-                                "p_llm_final": float(p_llm),
-                                **nli_meta,
-                            }
-                            log_entry.update(self.cache_metadata())
-                            self._append_debug_log(log_entry)
-                    elif i in think_results:
-                        generated_text, think_max_tokens, think_reasons = think_results[i]
-                        p_llm = float(p_fast)
-                        p_llm_no_think = p_llm
-                        verdict, confidence, think_score = self._parse_think_output(generated_text)
-                        if think_score is not None:
-                            p_llm = think_score
-                        else:
-                            think_reasons.append("verdict_unparsed")
-                        preds[i] = p_llm
-                        think_count += 1
-                        if use_cache:
-                            log_entry = {
-                                "cache_version": CACHE_VERSION,
-                                "evidence": evidence,
-                                "context_original": row_context_original,
-                                "prompt": prompt,
-                                "response": response,
-                                "task_type": row_task_type,
-                                "has_context": row_has_context,
-                                "p_fast": float(p_fast),
-                                "p_think": float(p_llm),
-                                "p_llm_no_think": float(p_llm_no_think),
-                                "triggered_think": True,
-                                "think_reasons": think_reasons,
-                                "think_max_tokens": think_max_tokens,
-                                "thinking_cot": generated_text,
-                                "verdict_parsed": verdict,
-                                "confidence_parsed": confidence,
-                                "p_llm_final": float(p_llm),
-                                **nli_meta,
-                            }
-                            log_entry.update(self.cache_metadata())
-                            self._append_debug_log(log_entry)
-                    else:
-                        preds[i] = float(p_fast)
-                        if use_cache:
-                            think_reasons = []
-                            if triggered_think_vals[i] and not self.enable_think_pass:
-                                think_reasons.append("think_pass_disabled")
-                            log_entry = {
-                                "cache_version": CACHE_VERSION,
-                                "evidence": evidence,
-                                "context_original": row_context_original,
-                                "prompt": prompt,
-                                "response": response,
-                                "task_type": row_task_type,
-                                "has_context": row_has_context,
-                                "p_fast": float(p_fast),
-                                "p_think": None,
-                                "p_llm_no_think": float(p_fast),
-                                "triggered_think": False,
-                                "think_reasons": think_reasons,
-                                "think_max_tokens": None,
-                                "thinking_cot": None,
-                                "verdict_parsed": None,
-                                "confidence_parsed": None,
-                                "p_llm_final": float(p_fast),
-                                **nli_meta,
-                            }
-                            log_entry.update(self.cache_metadata())
-                            self._append_debug_log(log_entry)
-
-                    row_num = i + 1
-                    if on_partial and partial_every and row_num % partial_every == 0:
-                        self._emit_partial(on_partial, row_num, [p for p in preds if p is not None])
-                        info(f"Partial debug flushed at row {row_num}/{total_rows}")
+                # Any leftover (shouldn't happen) + cached rows
+                for i in range(total_rows):
+                    if preds[i] is None:
+                        _finalize_row(i)
         finally:
             self.debug_log_path = original_log_path
 
-        if on_partial and partial_every:
-            self._emit_partial(on_partial, len(preds), preds)
+        _maybe_partial(force=True)
 
         self.last_nli_debug = nli_debug
         ok(

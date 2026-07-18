@@ -684,7 +684,7 @@ def main():
     partial_debug_path = os.path.join(run_dir, "submission_partial_debug.csv")
     info(f"Run folder: {run_dir}")
 
-    partial_flush_every = int(predict_config.get("partial_flush_every", 0))
+    partial_flush_seconds = float(predict_config.get("partial_flush_seconds", 60))
     write_debug = bool(config.get("debug", {}).get("write_debug", True))
     ids = test_df["id"] if "id" in test_df.columns else None
 
@@ -708,8 +708,22 @@ def main():
     def _write_partial(n_done, preds_so_far):
         if not write_debug:
             return
-        partial_df = build_debug_df(test_df.iloc[:n_done].copy(), preds_so_far, threshold, ctx)
+        vals = np.asarray(
+            [np.nan if p is None else float(p) for p in preds_so_far],
+            dtype=float,
+        )
+        if len(vals) != len(test_df):
+            # legacy: compact list of completed scores only
+            partial_df = build_debug_df(
+                test_df.iloc[: len(vals)].copy(), vals, threshold, ctx
+            )
+        else:
+            partial_df = build_debug_df(test_df.copy(), vals, threshold, ctx)
+            partial_df = partial_df[np.isfinite(partial_df["p_llm"])]
+        if partial_df.empty:
+            return
         partial_df.to_csv(partial_debug_path, index=False)
+        info(f"Partial debug flushed · {len(partial_df)} rows → {partial_debug_path}")
 
     llm_checkpoint_path = ctx["llm_checkpoint_path"]
     p_llm = None
@@ -741,7 +755,10 @@ def main():
     if p_llm is not None:
         ok("Using complete verifier checkpoint — skipping model load")
     else:
-        info(f"Loading verifier: {checkpoint_gemma_config.get('model_name')}")
+        info(
+            f"Loading verifier: "
+            f"{checkpoint_gemma_config.get('fast_model_name') or checkpoint_gemma_config.get('model_name')}"
+        )
         verifier.load_model()
         if verifier.exemplar_top_k > 0 and not verifier.exemplar_retriever.load_index():
             train_evidence_path = os.path.join(
@@ -758,13 +775,13 @@ def main():
                 if "label" in train_df.columns:
                     warn(f"Exemplar index missing — rebuilding from {exemplar_source}")
                     verifier.exemplar_retriever.build_index(train_df)
-        if partial_flush_every:
-            info(f"Partial debug flush every {partial_flush_every} rows")
+        if partial_flush_seconds > 0:
+            info(f"Partial debug flush every {partial_flush_seconds:.0f}s")
         p_llm = verifier.predict_dataset(
             test_df,
             use_cache=use_checkpoints and not force_recompute,
             on_partial=_write_partial,
-            partial_every=partial_flush_every,
+            partial_every_seconds=partial_flush_seconds,
             nli_config=nli_config if nli_enabled else None,
         )
         # Attach NLI debug columns for submission_debug.csv

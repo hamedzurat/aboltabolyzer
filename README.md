@@ -392,7 +392,7 @@ Run `just` to list recipes.
 | `generated/processed/test_with_preds.csv`      | Test with `p_llm` + `task_type`           |
 | `logs/debug_llm_verifier.jsonl`                | Per-row verifier debug at inference       |
 
-Partial mid-run debug (if enabled) is written as `submission_partial_debug.csv` and removed when the final submission is complete. Never upload a partial/debug file.
+Partial mid-run debug (if enabled) is written as `submission_partial_debug.csv` about once per minute (`[predict].partial_flush_seconds`, default `60`) and removed when the final submission is complete. Never upload a partial/debug file. Fast/NLI rows are flushed before the long think pass so the run folder is not empty mid-run.
 
 ### `submission_debug.csv` columns
 

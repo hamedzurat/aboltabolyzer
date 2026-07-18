@@ -17,7 +17,7 @@ allow_tf32 = true
 [predict]
 use_checkpoints = true
 force_recompute = false
-partial_flush_every = 25
+partial_flush_seconds = 60
 llm_predictions_path = "generated/processed/test_llm_preds.csv"
 
 [data]
@@ -39,8 +39,8 @@ threshold = 0.5
 enabled = true
 model_name = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
 batch_size = 16
-margin = 0.35                       # |entail-contradict| ≥ margin → skip think
-hypothesis_style = "qa_en"          # qa_en | answer_only | claim_bn | qa_bn
+margin = 0.35 # |entail-contradict| ≥ margin → skip think
+hypothesis_style = "qa_en" # qa_en | answer_only | claim_bn | qa_bn
 faithful_score = 0.90
 hallucinated_score = 0.10
 max_length = 512
@@ -48,7 +48,7 @@ tasks = [
     "context_grounded_fact",
     "context_grounded_other",
     "famous_bn_fact_context",
-    "general_fact_null",            # uses RAG evidence as premise when present
+    "general_fact_null",      # uses RAG evidence as premise when present
 ]
 
 [debug]
@@ -82,24 +82,25 @@ think_conf_high = 0.75
 # Fallback when a task is missing from max_think_tokens_by_task
 max_think_tokens = 1024
 
-# Per-task think budgets (tuned from 20260718_133444 COT lengths / unparsed rates).
-# Math finishes early; grammar/facts need more room. Batching groups by this value.
+# Per-task think budgets (tuned on 20260718_133444 COT p95; tighter = faster).
+# Math is low on purpose: short calculate-and-verdict CoTs (~200–450 toks).
+# Grammar/facts ramble longer in English before the verdict line.
 [gemma.max_think_tokens_by_task]
-bangla_grammar = 1536
-general_fact_null = 1280
-famous_bn_fact_null = 768
-famous_bn_fact_context = 768
-context_grounded_fact = 768
-context_grounded_other = 768
-idiom_meaning_null = 1024
-literal_meaning_null = 1024
-translation_or_bilingual = 1024
-other_null = 768
-math_work_rate = 512
-math_speed_distance = 512
-math_profit_loss = 512
-math_average = 512
-calendar_arithmetic = 512
+bangla_grammar = 1280
+general_fact_null = 1024
+idiom_meaning_null = 896
+translation_or_bilingual = 768
+literal_meaning_null = 576
+context_grounded_fact = 512
+context_grounded_other = 512
+famous_bn_fact_null = 512
+famous_bn_fact_context = 448
+other_null = 512
+math_work_rate = 448
+math_speed_distance = 384
+math_profit_loss = 384
+math_average = 320
+calendar_arithmetic = 384
 
 # ── Profile: 16GB (RTX 5060 Ti / P100 / T4-class) — Gemma 4 ──────────────────
 
@@ -126,8 +127,8 @@ query_batch_size = 128
 
 [hardware_profiles.8gb.gemma]
 think_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-fast_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"  # same model → no reload between passes
-# fast_model_name = "Qwen/Qwen2.5-3B-Instruct"   # faster fast-pass but costs ~2min extra reload
+# fast_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+fast_model_name = "Qwen/Qwen2.5-3B-Instruct"
 # fast_model_name = "Qwen/Qwen2.5-7B-Instruct"
 model_loader = "causal_lm"
 load_in = "4bit"
