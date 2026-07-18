@@ -32,6 +32,7 @@ from src.llm_verifier import (
     verifier_case_key,
     verifier_log_matches_metadata,
 )
+from src.nli import nli_cache_tag
 from src.rag import BanglaRAG, resolve_rag_sources, source_paths
 from src.router import route_dataframe
 from src.tui import (
@@ -488,6 +489,14 @@ def build_debug_df(test_df, p_llm, threshold, ctx):
             "confidence_parsed": pd.Series(None, index=test_df.index, dtype="object"),
             "think_changed_label": False,
             "thinking_cot": "",
+            "nli_eligible": False,
+            "nli_applied": False,
+            "nli_skip_reason": "",
+            "nli_p_entail": np.nan,
+            "nli_p_contradict": np.nan,
+            "nli_p_neutral": np.nan,
+            "nli_margin": np.nan,
+            "p_nli": np.nan,
             "rag_used": test_df["rag_used"] if "rag_used" in test_df.columns else False,
             "rag_source": test_df["rag_source"] if "rag_source" in test_df.columns else "",
             "rag_skipped_reason": (
@@ -552,6 +561,32 @@ def build_debug_df(test_df, p_llm, threshold, ctx):
                 debug_df.at[i, "think_changed_label"] = (float(p_llm[row_pos]) >= threshold) != (
                     float(p_fast) >= threshold
                 )
+            for ncol in (
+                "nli_eligible",
+                "nli_applied",
+                "nli_skip_reason",
+                "nli_p_entail",
+                "nli_p_contradict",
+                "nli_p_neutral",
+                "nli_margin",
+                "p_nli",
+            ):
+                if ncol in meta:
+                    debug_df.at[i, ncol] = meta.get(ncol)
+
+    # Prefer live NLI frame from this run when present
+    for col in (
+        "nli_eligible",
+        "nli_applied",
+        "nli_skip_reason",
+        "nli_p_entail",
+        "nli_p_contradict",
+        "nli_p_neutral",
+        "nli_margin",
+        "p_nli",
+    ):
+        if col in test_df.columns:
+            debug_df[col] = test_df[col].values
 
     return debug_df
 
@@ -573,8 +608,9 @@ def main():
 
     banner(
         "Routed Gemma / Qwen Inference",
-        "router → typed RAG → verifier → submission.csv",
+        "router → typed RAG → fast → NLI-first → think fallback → submission",
     )
+    nli_config_preview = config.get("nli", {})
     kv_table(
         "Run config",
         {
@@ -583,6 +619,7 @@ def main():
             "think_verifier": gemma_config.get("think_model_name"),
             "load_in": resolve_quantization_mode(gemma_config),
             "think_pass": gemma_config.get("enable_think_pass"),
+            "nli_first": bool(nli_config_preview.get("enabled", False)),
             "threshold": threshold,
             "router": router_enabled,
             "checkpoints": use_checkpoints,
@@ -609,6 +646,10 @@ def main():
 
     # Instantiate verifier early
     verifier = GemmaVerifier()
+    nli_config = config.get("nli", {})
+    nli_enabled = bool(nli_config.get("enabled", False))
+    # Fingerprint NLI into verifier cache metadata before any log matching
+    verifier._nli_cache_tag = nli_cache_tag(nli_config if nli_enabled else None)
     verifier_cache_metadata = verifier.cache_metadata()
 
     router_config = config.get("router", {})
@@ -618,7 +659,8 @@ def main():
         info("LLM-based routing enabled — loading verifier model early...")
         verifier.load_model()
 
-    step(1, 3, "Route tasks + select evidence")
+    total_steps = 3
+    step(1, total_steps, "Route tasks + select evidence")
     if resume_routing:
         info(f"Resuming routing and RAG evidence from cached file: {test_evidence_path}")
         test_df = pd.read_csv(test_evidence_path)
@@ -669,7 +711,6 @@ def main():
         partial_df = build_debug_df(test_df.iloc[:n_done].copy(), preds_so_far, threshold, ctx)
         partial_df.to_csv(partial_debug_path, index=False)
 
-    step(2, 3, "Verifier inference")
     llm_checkpoint_path = ctx["llm_checkpoint_path"]
     p_llm = None
     llm_from_checkpoint = False
@@ -686,6 +727,8 @@ def main():
         "pipeline": "routed_gemma",
     }
     llm_metadata.update({f"verifier_{k}": v for k, v in verifier_cache_metadata.items()})
+    llm_metadata["nli_cache_tag"] = nli_cache_tag(nli_config)
+    step(2, total_steps, "Verifier · fast → NLI-first → think fallback")
     if use_checkpoints and not force_recompute:
         p_llm = _load_prediction_checkpoint(
             llm_checkpoint_path,
@@ -722,7 +765,13 @@ def main():
             use_cache=use_checkpoints and not force_recompute,
             on_partial=_write_partial,
             partial_every=partial_flush_every,
+            nli_config=nli_config if nli_enabled else None,
         )
+        # Attach NLI debug columns for submission_debug.csv
+        nli_debug = getattr(verifier, "last_nli_debug", None)
+        if nli_debug is not None:
+            for col in nli_debug.columns:
+                test_df[col] = nli_debug[col].values
         if use_checkpoints:
             _save_prediction_checkpoint(
                 llm_checkpoint_path,
@@ -737,7 +786,7 @@ def main():
         os.path.join(config["data"]["processed_dir"], "test_with_preds.csv"), index=False
     )
 
-    step(3, 3, "Threshold + write submission")
+    step(3, total_steps, "Threshold + write submission")
     info(f"Applying threshold={threshold}")
     p_final, preds = apply_threshold(p_llm, threshold)
 
@@ -770,11 +819,16 @@ def main():
     n1 = int(sum(preds == 1))
     rag_used_n = int(test_df["rag_used"].sum()) if "rag_used" in test_df.columns else 0
     think_n = 0
+    nli_n = 0
     if write_debug and os.path.exists(ctx["debug_path"]):
         try:
-            think_n = int(pd.read_csv(ctx["debug_path"])["triggered_think"].fillna(False).sum())
+            _dbg = pd.read_csv(ctx["debug_path"])
+            think_n = int(_dbg["triggered_think"].fillna(False).sum())
+            if "nli_applied" in _dbg.columns:
+                nli_n = int(_dbg["nli_applied"].fillna(False).sum())
         except Exception:
             think_n = 0
+            nli_n = 0
 
     count_table(
         "Label distribution",
@@ -782,17 +836,21 @@ def main():
         key_header="label",
     )
 
-    done_panel(
-        "Prediction complete",
+    done_lines = [
+        f"Rows: [bold]{len(preds)}[/bold]",
+        f"Labels: [cyan]0={n0}[/cyan] · [green]1={n1}[/green]",
+        f"RAG filled: [bold]{rag_used_n}[/bold]",
+        f"Think triggered: [bold]{think_n}[/bold]",
+    ]
+    if nli_enabled:
+        done_lines.append(f"NLI skip-think: [bold]{nli_n}[/bold]")
+    done_lines.extend(
         [
-            f"Rows: [bold]{len(preds)}[/bold]",
-            f"Labels: [cyan]0={n0}[/cyan] · [green]1={n1}[/green]",
-            f"RAG filled: [bold]{rag_used_n}[/bold]",
-            f"Think triggered: [bold]{think_n}[/bold]",
             f"Submission: [bold white]{submission_path}[/bold white]",
             f"Latest link: [bold white]{latest_link}[/bold white]",
-        ],
+        ]
     )
+    done_panel("Prediction complete", done_lines)
 
 
 if __name__ == "__main__":

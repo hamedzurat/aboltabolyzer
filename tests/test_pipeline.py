@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 from scripts.sort_corpus import parse_bucket
 from src.config_utils import resolve_quantization_mode, resolve_section, validate_config
@@ -69,7 +70,8 @@ def test_rag_skip_policy_by_task_type():
     assert should_use_rag("famous_bn_fact_null", "[NULL]") is True
     assert should_use_rag("idiom_meaning_null", "[NULL]") is True
     assert should_use_rag("literal_meaning_null", "[NULL]") is True
-    assert should_use_rag("bangla_grammar", "[NULL]") is True
+    # Grammar RAG disabled — hurt accuracy vs no-RAG
+    assert should_use_rag("bangla_grammar", "[NULL]") is False
     assert should_use_rag("other_null", "[NULL]", "বাংলাদেশের রাজধানী কোনটি?") is True
     assert should_use_rag("other_null", "[NULL]", "শুধু একটি অদ্ভুত বাক্য") is False
 
@@ -80,7 +82,7 @@ def test_rag_source_mapping_by_task_type():
     assert rag_source_for_task("famous_bn_fact_null") == "wiki"
     assert rag_source_for_task("idiom_meaning_null") == "idioms"
     assert rag_source_for_task("literal_meaning_null") == "literal"
-    assert rag_source_for_task("bangla_grammar") == "grammar"
+    assert rag_source_for_task("bangla_grammar") is None
     assert rag_source_for_task("math_speed_distance") is None
     assert rag_source_for_task("context_grounded_fact") is None
 
@@ -118,7 +120,7 @@ def test_think_prompt_puts_parseable_fields_first():
 def test_grammar_instruction_allows_helpful_evidence_without_requiring_it():
     instruction = task_instruction("bangla_grammar")
     assert "not RAG" not in instruction
-    assert "missing evidence alone is not H" in instruction
+    assert "missing evidence alone is not" in instruction.lower()
 
 
 def test_think_trigger_near_threshold_and_task():
@@ -208,6 +210,14 @@ def test_debug_df_has_compact_tuning_schema():
         "confidence_parsed",
         "think_changed_label",
         "thinking_cot",
+        "nli_eligible",
+        "nli_applied",
+        "nli_skip_reason",
+        "nli_p_entail",
+        "nli_p_contradict",
+        "nli_p_neutral",
+        "nli_margin",
+        "p_nli",
         "rag_used",
         "rag_source",
         "rag_skipped_reason",
@@ -270,16 +280,87 @@ def test_debug_log_cache_key_includes_evidence_and_task(tmp_path):
     assert {entry["p_fast"] for entry in cache.values()} == {0.1, 0.9}
 
 
-def test_think_token_budget_uses_full_cap_only_for_harder_tasks():
+def test_nli_hybrid_override_mask_and_scores():
+    from src.nli import (
+        build_hypothesis,
+        hybrid_override_mask,
+        nli_cache_tag,
+        nli_scores_to_p,
+        premise_for_row,
+    )
+
+    e = np.array([0.8, 0.55, 0.1])
+    c = np.array([0.1, 0.45, 0.8])
+    mask = hybrid_override_mask(e, c, margin=0.35)
+    assert list(mask) == [True, False, True]
+
+    p = nli_scores_to_p(e, c)
+    assert np.allclose(p, [0.90, 0.90, 0.10])
+
+    assert "The answer to the question" in build_hypothesis("Q?", "A", "qa_en")
+    assert build_hypothesis("Q?", "A only", "answer_only") == "A only"
+
+    row = pd.Series(
+        {
+            "context_original": "[NULL]",
+            "context": "retrieved wiki blurb",
+            "prompt_bn": "প্রশ্ন",
+            "response_bn": "উত্তর",
+        }
+    )
+    assert premise_for_row(row) == "retrieved wiki blurb"
+    row2 = pd.Series({"context_original": "orig", "context": "rag"})
+    assert premise_for_row(row2) == "orig"
+    assert nli_cache_tag(None) == "nli_off"
+    assert "nli_first" in nli_cache_tag({"enabled": True, "margin": 0.35, "tasks": ["a"]})
+
+
+def test_nli_gate_skips_non_configured_tasks_without_model():
+    from src.nli import NLIRefiner
+
+    refiner = NLIRefiner(
+        {
+            "enabled": True,
+            "tasks": ["context_grounded_fact"],
+            "margin": 0.35,
+        }
+    )
+    df = pd.DataFrame(
+        {
+            "task_type": ["bangla_grammar", "idiom_meaning_null"],
+            "context_original": ["[NULL]", "[NULL]"],
+            "context": ["[NULL]", "[NULL]"],
+            "prompt_bn": ["q1", "q2"],
+            "response_bn": ["a1", "a2"],
+        }
+    )
+    debug = refiner.gate(df)
+    assert not debug["nli_applied"].any()
+    assert set(debug["nli_skip_reason"]) == {"task_not_in_nli_list"}
+
+
+def test_think_token_budget_uses_per_task_config():
     verifier = GemmaVerifier()
     verifier.max_think_tokens = 512
+    verifier.max_think_tokens_by_task = {
+        "math_speed_distance": 256,
+        "bangla_grammar": 768,
+        "context_grounded_fact": 384,
+    }
 
-    assert verifier._think_token_budget("math_speed_distance", ["math_needs_check"]) == 512
-    assert verifier._think_token_budget("famous_bn_fact_null", ["famous_bn_fact_null"]) == 512
-    assert verifier._think_token_budget("context_grounded_fact", ["multi_entity_context"]) == 512
-    assert verifier._think_token_budget("idiom_meaning_null", ["lexical_missing_evidence"]) == 512
+    assert verifier._think_token_budget("math_speed_distance", ["math_needs_check"]) == 256
+    assert verifier._think_token_budget("bangla_grammar", ["bangla_grammar_wide_window"]) == 768
+    assert verifier._think_token_budget("context_grounded_fact", ["multi_entity_context"]) == 384
+    # Unlisted tasks fall back to max_think_tokens
+    assert verifier._think_token_budget("famous_bn_fact_null", ["famous_bn_fact"]) == 512
     assert verifier._think_token_budget("general_fact_null", ["near_threshold"]) == 512
-    assert verifier._think_token_budget("general_fact_null", ["evidence_missing_keyphrase"]) == 512
+    assert verifier._think_token_budget("idiom_meaning_null", ["lexical_missing_evidence"]) == 512
+
+
+def test_position_ids_from_mask_left_padding():
+    mask = torch.tensor([[0, 0, 1, 1, 1], [0, 1, 1, 1, 1]])
+    pos = GemmaVerifier._position_ids_from_mask(mask)
+    assert pos.tolist() == [[0, 0, 0, 1, 2], [0, 0, 1, 2, 3]]
 
 
 def test_router_disabled_policy_uses_original_context_without_rag():

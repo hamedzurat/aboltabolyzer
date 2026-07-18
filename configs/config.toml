@@ -33,6 +33,24 @@ llm_routing = true
 [decision]
 threshold = 0.5
 
+# NLI-first gate (after fast pass, before think). Confident rows skip think.
+# Only configured task types with non-empty premise (context or RAG evidence).
+[nli]
+enabled = true
+model_name = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7"
+batch_size = 16
+margin = 0.35                       # |entail-contradict| ≥ margin → skip think
+hypothesis_style = "qa_en"          # qa_en | answer_only | claim_bn | qa_bn
+faithful_score = 0.90
+hallucinated_score = 0.10
+max_length = 512
+tasks = [
+    "context_grounded_fact",
+    "context_grounded_other",
+    "famous_bn_fact_context",
+    "general_fact_null",            # uses RAG evidence as premise when present
+]
+
 [debug]
 write_debug = true
 
@@ -61,6 +79,27 @@ bnb_4bit_compute_dtype = "bfloat16"
 clear_cuda_before_load = true
 think_conf_low = 0.25
 think_conf_high = 0.75
+# Fallback when a task is missing from max_think_tokens_by_task
+max_think_tokens = 1024
+
+# Per-task think budgets (tuned from 20260718_133444 COT lengths / unparsed rates).
+# Math finishes early; grammar/facts need more room. Batching groups by this value.
+[gemma.max_think_tokens_by_task]
+bangla_grammar = 1536
+general_fact_null = 1280
+famous_bn_fact_null = 768
+famous_bn_fact_context = 768
+context_grounded_fact = 768
+context_grounded_other = 768
+idiom_meaning_null = 1024
+literal_meaning_null = 1024
+translation_or_bilingual = 1024
+other_null = 768
+math_work_rate = 512
+math_speed_distance = 512
+math_profit_loss = 512
+math_average = 512
+calendar_arithmetic = 512
 
 # ── Profile: 16GB (RTX 5060 Ti / P100 / T4-class) — Gemma 4 ──────────────────
 
@@ -76,8 +115,8 @@ max_input_tokens = 3072
 enable_think_pass = true
 force_think_all = false
 exemplar_top_k = 3
-max_think_tokens = 1024
 fast_pass_batch_size = 16
+think_pass_batch_size = 4
 
 [hardware_profiles.16gb.rag]
 batch_size = 128
@@ -99,10 +138,11 @@ max_input_tokens = 1536
 enable_think_pass = true
 force_think_all = false
 exemplar_top_k = 0
-max_think_tokens = 1024
 chat_template_enable_thinking_fast = false
 chat_template_enable_thinking_think = true
 fast_pass_batch_size = 8
+# Long CoT greedy can diverge under bf16 when left-padded; keep 1 on 8GB, bump on 16GB/5090
+think_pass_batch_size = 1
 
 [hardware_profiles.8gb.rag]
 batch_size = 32

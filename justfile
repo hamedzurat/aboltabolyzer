@@ -124,10 +124,11 @@ test:
 lint:
     uv run ruff check .
 
-[doc('Ruff format')]
+[doc('Format Python, TOML, Markdown, and JSON files')]
 [group('dev')]
 format:
     uv run ruff format .
+    bunx prettier --write "**/*.{json,md,yml,yaml}" --ignore-path .gitignore
 
 [doc('lint + test')]
 [group('dev')]

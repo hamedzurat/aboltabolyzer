@@ -69,6 +69,10 @@ def main():
 
     model_names = [config["rag"]["model_name"]]
 
+    nli_config = config.get("nli", {})
+    if nli_config.get("enabled") and nli_config.get("model_name"):
+        model_names.append(nli_config["model_name"])
+
     if args.include_gemma:
         gemma_config = resolve_section(config, "gemma")
         model_names.append(gemma_config["fast_model_name"])

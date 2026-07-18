@@ -10,7 +10,7 @@ Bangla hallucination detection for competition submission.
 | **label 0**   | Hallucinated, unsupported, or wrong |
 | **label 1**   | Faithful, supported, correct        |
 
-**Architecture:** deterministic task router → typed evidence policy (per-corpus RAG) → Gemma/Qwen verifier (fast + optional think) → fixed threshold on `p_llm` (`decision.threshold`, default `0.5`).
+**Architecture:** deterministic task router → typed evidence policy (per-corpus RAG) → fast pass → **NLI-first gate** (skip think when confident) → think fallback → fixed threshold on `p_llm` (`decision.threshold`, default `0.5`).
 
 No training. Inference only.
 
@@ -108,16 +108,20 @@ flowchart TD
 
     M --> N["Fast pass<br/>next-token logits F / H<br/>p_fast = P Faithful"]
 
-    N --> O{"Think? OR of triggers<br/>and enable_think_pass<br/>near threshold 0.35–0.65<br/>famous_bn_fact_null<br/>multi-entity context_grounded_fact<br/>math_* / calendar<br/>idiom/literal + irrelevant evidence"}
+    N --> NLI{"NLI-first gate?<br/>task in [nli].tasks<br/>+ non-empty premise<br/>+ |entail−contradict| ≥ margin"}
 
-    O -->|"No triggers or think disabled<br/>8GB: enable_think_pass = false"| P["p_llm = p_fast"]
-    O -->|"Yes"| Q["Think pass CoT English<br/>reason · verdict · confidence"]
+    NLI -->|"Yes · confident"| NLI_OUT["p_llm = NLI score<br/>skip think"]
+    NLI -->|"No / uncertain / other tasks"| O{"Think? OR of triggers<br/>and enable_think_pass<br/>near threshold · famous_bn<br/>multi-entity context<br/>math / grammar / …"}
+
+    O -->|"No triggers or think disabled"| P["p_llm = p_fast"]
+    O -->|"Yes"| Q["Think pass CoT<br/>verdict: Faithful|Hallucinated"]
 
     Q --> R{"Parse verdict?"}
-    R -->|"Faithful/Hallucinated<br/>+ strong/likely/uncertain"| S["Map to soft score<br/>0.90 / 0.75 / 0.50 / 0.25 / 0.10"]
+    R -->|"Faithful / Hallucinated"| S["Map to soft score<br/>0.90 / 0.10"]
     R -->|"unparsed"| T["Keep p_fast<br/>think_reasons += verdict_unparsed"]
 
-    P --> U["decision.threshold default 0.5<br/>label = 1 if p_llm ≥ threshold else 0"]
+    NLI_OUT --> U["decision.threshold default 0.5<br/>label = 1 if p_llm ≥ threshold else 0"]
+    P --> U
     S --> U
     T --> U
 
@@ -279,16 +283,19 @@ This profile uses `Qwen2.5-3B-Instruct` for the fast pass and `DeepSeek-R1-Disti
 
 ### Performance tuning
 
-| Knob                                 | Where                         | Effect                                  |
-| ------------------------------------ | ----------------------------- | --------------------------------------- |
-| `query_batch_size`                   | `[hardware_profiles.*.rag]`   | Faster RAG queries until embed OOM      |
-| `index_dtype`                        | `[rag]`                       | Compact RAG indexes; default `float16`  |
-| `load_in` / `device_map`             | `[hardware_profiles.*.gemma]` | Quantization and placement              |
-| `max_input_tokens`                   | `[hardware_profiles.*.gemma]` | Memory vs truncation                    |
-| `enable_think_pass`                  | `[hardware_profiles.*.gemma]` | Explicit think pass toggle              |
-| `think_conf_low` / `think_conf_high` | `[gemma]`                     | Near-threshold think band               |
-| `exemplar_top_k`                     | `[hardware_profiles.*.gemma]` | Few-shot; `0` skips exemplar embedder   |
-| `decision.threshold`                 | `[decision]`                  | Label cutoff on `p_llm` (default `0.5`) |
+| Knob                                   | Where                         | Effect                                    |
+| -------------------------------------- | ----------------------------- | ----------------------------------------- |
+| `query_batch_size`                     | `[hardware_profiles.*.rag]`   | Faster RAG queries until embed OOM        |
+| `index_dtype`                          | `[rag]`                       | Compact RAG indexes; default `float16`    |
+| `load_in` / `device_map`               | `[hardware_profiles.*.gemma]` | Quantization and placement                |
+| `max_input_tokens`                     | `[hardware_profiles.*.gemma]` | Memory vs truncation                      |
+| `enable_think_pass`                    | `[hardware_profiles.*.gemma]` | Explicit think pass toggle                |
+| `think_pass_batch_size`                | `[hardware_profiles.*.gemma]` | Batched think generate (1 on 8GB)         |
+| `max_think_tokens_by_task`             | `[gemma]`                     | Per-task CoT token budgets                |
+| `think_conf_low` / `think_conf_high`   | `[gemma]`                     | Near-threshold think band                 |
+| `nli.enabled` / `nli.tasks` / `margin` | `[nli]`                       | NLI-first gate; skip think when confident |
+| `exemplar_top_k`                       | `[hardware_profiles.*.gemma]` | Few-shot; `0` skips exemplar embedder     |
+| `decision.threshold`                   | `[decision]`                  | Label cutoff on `p_llm` (default `0.5`)   |
 
 ---
 
@@ -318,7 +325,7 @@ confidence: strong|likely|uncertain
 reason: <one short English sentence>
 ```
 
-Token budget is dynamic: hard cases can use the configured cap, while simple lexical or near-threshold cases use smaller caps.
+Token budget is per-task via `[gemma.max_think_tokens_by_task]` (math short, grammar longer). Think is skipped when the NLI-first gate is confident on configured tasks.
 
 ---
 
@@ -396,6 +403,7 @@ Fixed schema for checking mistakes and tuning thresholds:
 | Decision   | `id`, `label`, `p_llm`, `threshold`, `threshold_margin`                                                                                                   |
 | Routing    | `task_type`                                                                                                                                               |
 | Verifier   | `p_fast`, `p_think`, `triggered_think`, `think_max_tokens`, `think_reasons`, `verdict_parsed`, `confidence_parsed`, `think_changed_label`, `thinking_cot` |
+| NLI-first  | `nli_eligible`, `nli_applied`, `nli_skip_reason`, `nli_p_entail`, `nli_p_contradict`, `nli_p_neutral`, `nli_margin`, `p_nli`                              |
 | Evidence   | `rag_used`, `rag_source`, `rag_skipped_reason`, `evidence_source`, `evidence_relevance`, `n_retrieved`, `retrieval_sim_max`, `retrieval_sim_mean`         |
 | Text       | `context_original`, `context`, `prompt_bn`, `response_bn`                                                                                                 |
 | Provenance | `run_timestamp`, `hardware_profile`, `gemma_model_name`, `gemma_load_in`                                                                                  |
@@ -489,7 +497,8 @@ Label file: `dataset/analysis/testset_audit_200.csv` — fill `gold_label` (`1` 
 | `router.py`          | Deterministic `task_type` classification                              |
 | `evidence_policy.py` | Task→corpus map, prompts, think triggers, think score map             |
 | `rag.py`             | Typed corpora, per-source BGE-M3 indexes, scored retrieval            |
-| `llm_verifier.py`    | Gemma/Qwen verifier — task prompts, fast/think passes                 |
+| `llm_verifier.py`    | Gemma/Qwen verifier — fast pass, NLI-first gate, think fallback       |
+| `nli.py`             | Multilingual NLI gate (confident → skip think)                        |
 | `predict.py`         | Route → typed evidence → verifier → threshold → submission + debug    |
 | `tui.py`             | Shared Rich banners / progress / tables                               |
 | `config_utils.py`    | Hardware profile resolution, model path cache, runtime torch settings |

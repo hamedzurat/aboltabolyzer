@@ -32,11 +32,14 @@ raw row
   -> maybe retrieve typed RAG evidence
   -> build verifier prompt
   -> fast F/H next-token score
-  -> maybe think pass
+  -> NLI-first gate (configured tasks + premise; confident → skip think)
+  -> think pass only if still needed
   -> threshold to label
 ```
 
 The important idea: `context` means "the evidence the verifier sees." If original context exists, it stays. If original context is `[NULL]` and RAG is allowed, retrieved text overwrites `context`.
+
+**NLI-first:** for tasks listed in `[nli].tasks` with non-empty premise (original context or RAG), if `|P(entail)−P(contradict)| ≥ margin`, the row uses the NLI score and **skips** the think pass. Uncertain / other tasks keep the normal think triggers.
 
 ## Router Rules
 
@@ -165,7 +168,7 @@ Think pass may run if enabled and one of these triggers fires:
 | idiom/literal with missing-looking evidence                     | `lexical_missing_evidence`   |
 | RAG-eligible task but evidence lacks key prompt tokens          | `evidence_missing_keyphrase` |
 
-Default 16GB and 8GB profiles enable the explicit think pass.
+Default 16GB and 8GB profiles enable the explicit think pass. When `[nli].enabled = true`, confident NLI rows skip think (`think_reasons` may include `nli_confident_skip_think`).
 
 Think prompt shape:
 

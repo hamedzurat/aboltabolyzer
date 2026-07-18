@@ -77,6 +77,8 @@ def describe_active_profile(config):
         "enable_think_pass": gemma.get("enable_think_pass"),
         "exemplar_top_k": gemma.get("exemplar_top_k"),
         "fast_pass_batch_size": gemma.get("fast_pass_batch_size"),
+        "think_pass_batch_size": gemma.get("think_pass_batch_size"),
+        "max_think_tokens": gemma.get("max_think_tokens"),
         "rag_batch_size": rag.get("batch_size"),
         "rag_query_batch_size": rag.get("query_batch_size"),
         "rag_embedder": rag.get("model_name"),
